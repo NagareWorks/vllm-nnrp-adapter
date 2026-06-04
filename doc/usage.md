@@ -65,6 +65,43 @@ def make_backend():
 
 The vLLM wrapper converts profile request bodies into `ChatCompletionRequest` at runtime and calls `create_chat_completion`.
 
+## Embedded vLLM Process Server
+
+Run the NNRP profile server beside the vLLM serving stack when a factory can return the active
+`OpenAIServingChat`-compatible object:
+
+```bash
+vllm-nnrp-adapter serve-tcp \
+  --serving-factory my_vllm_app.serving:make_serving_chat \
+  --host 0.0.0.0 \
+  --port 7766 \
+  --active-model-name example-model
+```
+
+For in-process integration, call the embedded runner from the code that already owns the vLLM serving object:
+
+```python
+import asyncio
+
+from vllm_nnrp_adapter import EmbeddedTcpServerConfig, run_embedded_tcp_server
+
+
+async def start_nnrp_profile_server(serving_chat):
+    await run_embedded_tcp_server(
+        serving_chat,
+        config=EmbeddedTcpServerConfig(
+            host="0.0.0.0",
+            port=7766,
+            active_model_name="example-model",
+        ),
+    )
+
+
+asyncio.create_task(start_nnrp_profile_server(openai_serving_chat))
+```
+
+The normal streaming chat path prefers vLLM engine output directly and falls back to vLLM OpenAI serving chunks for complex features that still need vLLM's OpenAI stream machinery.
+
 ## NNRP Server Binding
 
 Use `nnrp-py` server sessions for transport and frame ownership. The adapter bridge only translates the OpenAI profile event stream into `RESULT_PUSH` frames:

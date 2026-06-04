@@ -7,6 +7,7 @@ from vllm_nnrp_adapter import BenchmarkConfig
 from vllm_nnrp_adapter.benchmark import run_benchmark
 from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.conformance import MockChatCompletionBackend
+from vllm_nnrp_adapter.embedded import EmbeddedTcpServerConfig
 
 
 @pytest.mark.asyncio
@@ -51,6 +52,65 @@ def test_cli_writes_benchmark_report_file(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["adapter"] == "vllm-nnrp-adapter"
     assert report["scenarios"][0]["name"] == "chat.non_streaming.roundtrip"
+
+
+def test_cli_starts_embedded_tcp_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, EmbeddedTcpServerConfig]] = []
+
+    def fake_run_embedded_tcp_server_sync(
+        serving_factory_spec: str,
+        *,
+        config: EmbeddedTcpServerConfig,
+    ) -> int:
+        calls.append((serving_factory_spec, config))
+        return 0
+
+    monkeypatch.setattr("vllm_nnrp_adapter.cli.run_embedded_tcp_server_sync", fake_run_embedded_tcp_server_sync)
+
+    assert main(
+        [
+            "serve-tcp",
+            "--serving-factory",
+            "pkg.module:factory",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8899",
+            "--active-model-name",
+            "llama",
+            "--session-id",
+            "77",
+            "--accept-timeout",
+            "3.5",
+            "--receive-timeout",
+            "2.5",
+            "--max-sessions",
+            "4",
+            "--max-requests-per-session",
+            "5",
+            "--idle-timeout",
+            "6.5",
+            "--no-no-delay",
+        ]
+    ) == 0
+
+    assert calls == [
+        (
+            "pkg.module:factory",
+            EmbeddedTcpServerConfig(
+                host="0.0.0.0",
+                port=8899,
+                active_model_name="llama",
+                session_id=77,
+                accept_timeout=3.5,
+                receive_timeout=2.5,
+                max_sessions=4,
+                max_requests_per_session=5,
+                idle_timeout=6.5,
+                no_delay=False,
+            ),
+        )
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,13 @@
 from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark
+from .embedded import (
+    EmbeddedTcpServerConfig,
+    create_embedded_openai_adapter,
+    load_serving_chat_factory,
+    run_embedded_tcp_server,
+    run_embedded_tcp_server_sync,
+    serve_embedded_tcp_listener,
+)
 from .nnrp_runtime import (
     EmittedNnrpResult,
     NnrpFrameContext,
@@ -33,6 +41,7 @@ __all__ = [
     "OPENAI_COMPATIBLE_SCHEMA_VERSION",
     "BenchmarkConfig",
     "EmittedNnrpResult",
+    "EmbeddedTcpServerConfig",
     "NnrpFrameContext",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
@@ -46,6 +55,7 @@ __all__ = [
     "build_text_delta_event",
     "build_usage_event",
     "create_chat_completion_request",
+    "create_embedded_openai_adapter",
     "create_vllm_backend",
     "decode_profile_event",
     "decode_submit_profile_request",
@@ -54,6 +64,10 @@ __all__ = [
     "encode_profile_event",
     "frame_context_from_submit",
     "handle_openai_profile_submit",
+    "load_serving_chat_factory",
     "run_benchmark",
+    "run_embedded_tcp_server",
+    "run_embedded_tcp_server_sync",
+    "serve_embedded_tcp_listener",
     "serve_openai_profile_session",
 ]

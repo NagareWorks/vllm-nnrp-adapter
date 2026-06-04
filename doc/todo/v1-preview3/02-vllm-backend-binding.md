@@ -5,7 +5,7 @@
 - [x] Bind against the selected vLLM `0.18.x` OpenAI serving classes in an integration test environment.
 - [ ] Replace HTTP/SSE relay benchmarking with a true in-process vLLM NNRP serving path.
 - [x] Add an in-process streaming bridge that consumes vLLM OpenAI serving chunks without starting the OpenAI HTTP server.
-- [ ] Add a vLLM process entrypoint or patch hook that registers the NNRP profile server beside the existing OpenAI serving stack.
+- [x] Add a vLLM process entrypoint or patch hook that registers the NNRP profile server beside the existing OpenAI serving stack.
 - [x] Preserve vLLM streaming chunk usage and tool-call data without flattening them into text-only events.
 - [x] Add cancellation propagation from NNRP frame cancellation into the active vLLM request path.
 - [x] Propagate NNRP cancellation to the active vLLM request id through the serving engine abort path.
