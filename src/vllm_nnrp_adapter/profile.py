@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, NotRequired, TypedDict
+
+OPENAI_COMPATIBLE_PROFILE = "openai-compatible"
+OPENAI_COMPATIBLE_SCHEMA_VERSION = "openai-compatible/1"
+CHAT_COMPLETIONS_CREATE = "chat.completions.create"
+
+
+class OpenAiNnrpError(Exception):
+    def __init__(self, error_type: str, code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.code = code
+        self.message = message
+
+    def to_event(self) -> dict[str, Any]:
+        return build_error_event(error_type=self.error_type, code=self.code, message=self.message)
+
+
+class OpenAiNnrpPolicy(TypedDict, total=False):
+    timeout_ms: int
+    diagnostics: bool
+
+
+class OpenAiNnrpRequest(TypedDict):
+    schema_version: str
+    operation: str
+    body: dict[str, Any]
+    request_id: NotRequired[str]
+    nnrp: NotRequired[OpenAiNnrpPolicy]
+
+
+class ProfileEvent(TypedDict):
+    type: str
+
+
+@dataclass(frozen=True)
+class OpenAiNnrpCapabilityDocument:
+    compatibility_levels: tuple[int, ...]
+    operations: tuple[dict[str, Any], ...]
+    models: tuple[dict[str, Any], ...] = ()
+
+    @classmethod
+    def level1(cls, models: tuple[str, ...] = ()) -> OpenAiNnrpCapabilityDocument:
+        return cls(
+            compatibility_levels=(1,),
+            operations=(
+                {
+                    "name": CHAT_COMPLETIONS_CREATE,
+                    "streaming": True,
+                    "non_streaming": True,
+                    "tool_calls": True,
+                },
+            ),
+            models=tuple({"id": model, "owned_by": "adapter"} for model in models),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile": OPENAI_COMPATIBLE_PROFILE,
+            "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+            "compatibility_levels": list(self.compatibility_levels),
+            "operations": list(self.operations),
+            "models": list(self.models),
+        }
+
+    def supports_operation(self, operation: str) -> bool:
+        return any(item.get("name") == operation for item in self.operations)
+
+
+def validate_request(request: Mapping[str, Any], capabilities: OpenAiNnrpCapabilityDocument) -> OpenAiNnrpRequest:
+    schema_version = request.get("schema_version")
+    if schema_version != OPENAI_COMPATIBLE_SCHEMA_VERSION:
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "unsupported_schema_version",
+            f"Expected schema_version {OPENAI_COMPATIBLE_SCHEMA_VERSION!r}.",
+        )
+
+    operation = request.get("operation")
+    if not isinstance(operation, str) or not capabilities.supports_operation(operation):
+        raise OpenAiNnrpError("invalid_request_error", "unsupported_operation", "Unsupported profile operation.")
+
+    body = request.get("body")
+    if not isinstance(body, dict):
+        raise OpenAiNnrpError("invalid_request_error", "invalid_body", "Request body must be a JSON object.")
+
+    if operation == CHAT_COMPLETIONS_CREATE:
+        _validate_chat_body(body)
+
+    validated: OpenAiNnrpRequest = {
+        "schema_version": schema_version,
+        "operation": operation,
+        "body": body,
+    }
+    if isinstance(request.get("request_id"), str):
+        validated["request_id"] = request["request_id"]
+    if isinstance(request.get("nnrp"), dict):
+        validated["nnrp"] = request["nnrp"]
+    return validated
+
+
+def _validate_chat_body(body: Mapping[str, Any]) -> None:
+    if not isinstance(body.get("model"), str) or not body["model"]:
+        raise OpenAiNnrpError("invalid_request_error", "missing_model", "Chat completion body must include model.")
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "missing_messages",
+            "Chat completion body must include messages.",
+        )
+
+
+def build_text_delta_event(
+    delta: str,
+    *,
+    index: int = 0,
+    openai_chunk: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "response.output_text.delta", "index": index, "delta": delta}
+    if openai_chunk is not None:
+        event["openai_chunk"] = dict(openai_chunk)
+    return event
+
+
+def build_tool_call_delta_event(
+    tool_call: Mapping[str, Any],
+    *,
+    index: int = 0,
+    openai_chunk: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "response.tool_call.delta", "index": index, "tool_call": dict(tool_call)}
+    if openai_chunk is not None:
+        event["openai_chunk"] = dict(openai_chunk)
+    return event
+
+
+def build_usage_event(usage: Mapping[str, Any]) -> dict[str, Any]:
+    return {"type": "response.usage", "usage": dict(usage)}
+
+
+def build_completed_event(body: Mapping[str, Any]) -> dict[str, Any]:
+    return {"type": "response.completed", "body": dict(body)}
+
+
+def build_error_event(error_type: str, code: str, message: str) -> dict[str, Any]:
+    return {
+        "type": "response.error",
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+        },
+    }

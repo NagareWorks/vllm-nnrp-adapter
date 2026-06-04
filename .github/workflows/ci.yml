@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - release/**
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  commit-policy:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Enforce single-commit PR policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          head_ref="${{ github.head_ref }}"
+          base_ref="${{ github.base_ref }}"
+
+          if [[ "$head_ref" == "develop" && "$base_ref" == "main" ]]; then
+            echo "Develop-to-main integration PR detected; multi-commit history is allowed."
+            exit 0
+          fi
+
+          if [[ "$head_ref" =~ ^release/ ]] || [[ "$base_ref" =~ ^release/ ]]; then
+            echo "Release/version branch PR detected; multi-commit history is allowed when needed."
+            exit 0
+          fi
+
+          commit_count='${{ github.event.pull_request.commits }}'
+          if [ "$commit_count" -ne 1 ]; then
+            echo "Normal PRs from feature/fix/docs/chore branches must contain exactly one commit before review. Current PR has $commit_count commits. Squash the history before requesting review."
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev] build
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check
+        run: mypy
+
+      - name: Test with coverage
+        run: |
+          pytest \
+            --cov=src/vllm_nnrp_adapter \
+            --cov-report=xml:artifacts/coverage/coverage.xml \
+            --cov-fail-under=90 \
+            -q
+
+      - name: Build package
+        run: python -m build
+
+  required-checks:
+    needs:
+      - commit-policy
+      - test
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Enforce required CI path
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ needs.commit-policy.result }}" != "success" ]; then
+            echo "PR commit policy validation failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Lint, type check, test, coverage, or package build validation failed."
+            exit 1
+          fi
+
