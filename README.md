@@ -98,6 +98,20 @@ vllm-nnrp-adapter run-conformance-plan `
 
 Use `--backend module.path:factory_name` when running against a real vLLM serving object. The factory must return an object that exposes the adapter backend protocol.
 
+## Benchmark Smoke
+
+The adapter includes a small profile-level benchmark runner for the same backend boundary used by conformance. The default mock backend is useful for CI and regression checks; a real vLLM backend factory can be supplied with the same `module.path:factory_name` syntax.
+
+```powershell
+vllm-nnrp-adapter run-benchmark `
+  --output artifacts/openai-profile-benchmark.json `
+  --backend mock `
+  --iterations 200 `
+  --warmup 20
+```
+
+The report records non-streaming roundtrip p50/p95 latency, streaming event p50/p95 latency and event throughput, plus cancellation latency.
+
 ## Contributors
 
 <a href="https://github.com/NagareWorks/vllm-nnrp-adapter/graphs/contributors" title="Open the contributors graph for individual GitHub profiles and IDs.">
