@@ -59,6 +59,8 @@ Install the vLLM extra only in an environment that can actually host vLLM:
 python -m pip install -e .[dev,vllm]
 ```
 
+See [doc/usage.md](doc/usage.md) for host installation, vLLM container installation, backend factory setup, conformance, benchmark, and request-envelope examples.
+
 ## Adapter Shape
 
 ```python
