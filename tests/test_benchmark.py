@@ -342,7 +342,7 @@ def test_benchmark_helpers_build_expected_shapes() -> None:
     assert request["body"]["max_tokens"] == 7
     assert _openai_chunk_text_deltas({"choices": [{"delta": {"content": "x"}}, {"delta": {}}]}) == ["x"]
     assert _openai_chunk_text_deltas({"choices": "bad"}) == []
-    assert synthetic_prompt(3).count("benchmark token") == 3
+    assert synthetic_prompt(3).split() == ["a", "a", "a"]
     assert estimate_token_count("") == 0
     assert estimate_token_count("one two") == 2
     assert _successful_sample(1, None, None, 0)["ok"] is True

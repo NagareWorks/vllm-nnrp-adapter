@@ -478,9 +478,9 @@ def _openai_chunk_text_deltas(chunk: Mapping[str, Any]) -> list[str]:
 
 
 def synthetic_prompt(target_tokens: int) -> str:
-    # Use a stable, tokenizer-agnostic approximation so the benchmark matrix can
-    # be generated before the target model tokenizer is available.
-    unit = "benchmark token "
+    # Use a single-token word for common OpenAI-compatible LLM tokenizers so the
+    # matrix labels stay close to the requested context length.
+    unit = "a "
     return (unit * target_tokens).strip()
 
 
