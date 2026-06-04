@@ -8,6 +8,6 @@
 - [ ] Add a vLLM process entrypoint or patch hook that registers the NNRP profile server beside the existing OpenAI serving stack.
 - [x] Preserve vLLM streaming chunk usage and tool-call data without flattening them into text-only events.
 - [x] Add cancellation propagation from NNRP frame cancellation into the active vLLM request path.
-- [ ] Propagate NNRP cancellation to the active vLLM request id through the serving engine abort path.
+- [x] Propagate NNRP cancellation to the active vLLM request id through the serving engine abort path.
 - [x] Add overload and scheduler-rejection mapping into OpenAI-compatible profile error bodies.
 - [ ] Keep HTTP/SSE relay mode as a compatibility smoke path only, not as the optimized Level 1 runtime.

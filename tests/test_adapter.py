@@ -1,5 +1,7 @@
 import asyncio
+import sys
 from collections.abc import AsyncIterator, Mapping
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -57,6 +59,121 @@ class PydanticLikeCompletion:
     def model_dump(self, *, mode: str = "python") -> Mapping[str, Any]:
         assert mode == "json"
         return {"id": "chatcmpl-model", "choices": [{"message": {"content": "hello"}}]}
+
+
+class FakeRequestOutput:
+    def __init__(self, *, outputs: list[object], finished: bool = False) -> None:
+        self.request_id = "chatcmpl-nnrp-test"
+        self.prompt_token_ids = [1, 2, 3]
+        self.encoder_prompt_token_ids = None
+        self.outputs = outputs
+        self.finished = finished
+
+
+class FakeCompletionOutput:
+    def __init__(
+        self,
+        *,
+        text: str,
+        token_ids: list[int],
+        finish_reason: str | None = None,
+    ) -> None:
+        self.index = 0
+        self.text = text
+        self.token_ids = token_ids
+        self.finish_reason = finish_reason
+        self.stop_reason = None
+
+
+class FakeSamplingRequest:
+    stream = True
+    use_beam_search = False
+    request_id = "test"
+    priority = 0
+    max_completion_tokens = None
+    max_tokens = 16
+
+    def to_sampling_params(self, max_tokens: int, default_sampling_params: Mapping[str, Any]) -> dict[str, Any]:
+        return {"max_tokens": max_tokens, **default_sampling_params}
+
+
+class FakeModelConfig:
+    max_model_len = 1024
+
+
+class FakeModels:
+    def model_name(self, lora_request: object) -> str:
+        assert lora_request is None
+        return "llama"
+
+
+class FakeEngineClient:
+    def __init__(self) -> None:
+        self.aborted: list[str] = []
+
+    def generate(
+        self,
+        engine_prompt: object,
+        sampling_params: object,
+        request_id: str,
+        **kwargs: object,
+    ) -> AsyncIterator[FakeRequestOutput]:
+        assert engine_prompt == {"prompt_token_ids": [1, 2, 3]}
+        assert sampling_params == {"max_tokens": 16, "temperature": 0.2}
+        assert kwargs["priority"] == 0
+
+        async def outputs() -> AsyncIterator[FakeRequestOutput]:
+            yield FakeRequestOutput(outputs=[FakeCompletionOutput(text="hello", token_ids=[10])])
+            yield FakeRequestOutput(
+                outputs=[FakeCompletionOutput(text=" world", token_ids=[11], finish_reason="stop")],
+                finished=True,
+            )
+
+        return outputs()
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
+class FakeDirectServingChat:
+    model_config = FakeModelConfig()
+    default_sampling_params = {"temperature": 0.2}
+    override_max_tokens = None
+    reasoning_parser_cls = None
+    use_harmony = False
+    models = FakeModels()
+
+    def __init__(self) -> None:
+        self.engine_client = FakeEngineClient()
+        self.fallback_calls = 0
+
+    async def render_chat_request(
+        self,
+        request: FakeSamplingRequest,
+    ) -> tuple[list[dict[str, str]], list[dict[str, list[int]]]]:
+        return ([{"role": "user", "content": "hello"}], [{"prompt_token_ids": [1, 2, 3]}])
+
+    def _extract_prompt_components(self, engine_prompt: Mapping[str, list[int]]) -> object:
+        return object()
+
+    def _extract_prompt_len(self, engine_prompt: Mapping[str, list[int]]) -> int:
+        return len(engine_prompt["prompt_token_ids"])
+
+    def create_chat_completion(self, request: object, raw_request: object | None = None) -> Mapping[str, Any]:
+        self.fallback_calls += 1
+        return {"choices": [{"message": {"content": "fallback"}}]}
+
+
+class FakeErrorServingChat(FakeDirectServingChat):
+    async def render_chat_request(self, request: FakeSamplingRequest) -> object:
+        return type("ErrorResponse", (), {"error": "bad model"})()
+
+
+class FakeNoUsageRequestOutput(FakeRequestOutput):
+    def __init__(self) -> None:
+        super().__init__(outputs=[FakeCompletionOutput(text="", token_ids=[])], finished=False)
+        self.prompt_token_ids = None
+        self.encoder_prompt_token_ids = [4, 5]
 
 
 class ClosableStreamingBackend:
@@ -412,6 +529,150 @@ async def test_vllm_backend_normalizes_pydantic_like_completion() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        _module_with_get_max_tokens(),
+    )
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    adapter = OpenAiNnrpAdapter(backend)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                },
+            }
+        )
+    ]
+
+    assert serving_chat.fallback_calls == 0
+    assert [event["type"] for event in events] == [
+        "response.output_text.delta",
+        "response.usage",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert events[0]["delta"] == "hello"
+    assert events[1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    assert events[2]["delta"] == " world"
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        _module_with_get_max_tokens(),
+    )
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    adapter = OpenAiNnrpAdapter(backend)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "nnrp": {"cancel_after_events": 1},
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            }
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
+    assert serving_chat.engine_client.aborted == ["chatcmpl-nnrp-test"]
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_direct_path_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        _module_with_get_max_tokens(),
+    )
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(
+        serving_chat,
+        request_factory=lambda body: FakeSamplingRequest(),
+        prefer_engine_direct=False,
+    )
+
+    assert await backend.create_chat_completion({"model": "llama", "stream": True}) == {
+        "choices": [{"message": {"content": "fallback"}}]
+    }
+    assert serving_chat.fallback_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_falls_back_when_direct_render_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        _module_with_get_max_tokens(),
+    )
+    serving_chat = FakeErrorServingChat()
+    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+
+    assert await backend.create_chat_completion({"model": "llama", "stream": True}) == {
+        "choices": [{"message": {"content": "fallback"}}]
+    }
+    assert serving_chat.fallback_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_skips_direct_path_for_complex_chat_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        _module_with_get_max_tokens(),
+    )
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+
+    assert await backend.create_chat_completion(
+        {"model": "llama", "stream": True, "tools": [{"type": "function"}]}
+    ) == {
+        "choices": [{"message": {"content": "fallback"}}]
+    }
+    assert serving_chat.fallback_calls == 1
+
+
 def test_vllm_backend_rejects_unknown_serving_object() -> None:
     with pytest.raises(TypeError):
         VllmBackend(object())
+
+
+def _module_with_get_max_tokens() -> ModuleType:
+    module = ModuleType("vllm.entrypoints.utils")
+
+    def get_max_tokens(
+        max_model_len: int,
+        request_max_tokens: int | None,
+        prompt_len: int,
+        default_sampling_params: Mapping[str, Any],
+        override_max_tokens: int | None,
+    ) -> int:
+        assert max_model_len == 1024
+        assert prompt_len == 3
+        assert default_sampling_params == {"temperature": 0.2}
+        assert override_max_tokens is None
+        return request_max_tokens or 32
+
+    module.get_max_tokens = get_max_tokens
+    return module
