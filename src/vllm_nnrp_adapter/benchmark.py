@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter
-from .conformance import load_backend
+from .conformance import load_backend_async
 from .profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
 
 
@@ -28,11 +28,33 @@ class BenchmarkConfig:
 
 
 def run_benchmark_sync(output_path: Path, backend_spec: str, config: BenchmarkConfig) -> dict[str, Any]:
-    return asyncio.run(run_benchmark_file(output_path, backend=load_backend(backend_spec), config=config))
+    return asyncio.run(run_benchmark_file_with_backend_spec(output_path, backend_spec=backend_spec, config=config))
 
 
 def run_comparison_benchmark_sync(output_path: Path, backend_spec: str, config: BenchmarkConfig) -> dict[str, Any]:
-    return asyncio.run(run_comparison_benchmark_file(output_path, backend=load_backend(backend_spec), config=config))
+    return asyncio.run(
+        run_comparison_benchmark_file_with_backend_spec(output_path, backend_spec=backend_spec, config=config)
+    )
+
+
+async def run_benchmark_file_with_backend_spec(
+    output_path: Path,
+    *,
+    backend_spec: str,
+    config: BenchmarkConfig,
+) -> dict[str, Any]:
+    backend = await load_backend_async(backend_spec)
+    return await run_benchmark_file(output_path, backend=backend, config=config)
+
+
+async def run_comparison_benchmark_file_with_backend_spec(
+    output_path: Path,
+    *,
+    backend_spec: str,
+    config: BenchmarkConfig,
+) -> dict[str, Any]:
+    backend = await load_backend_async(backend_spec)
+    return await run_comparison_benchmark_file(output_path, backend=backend, config=config)
 
 
 async def run_benchmark_file(

@@ -57,6 +57,23 @@ def load_backend(spec: str) -> ChatCompletionBackend:
     if spec == "mock":
         return MockChatCompletionBackend()
 
+    backend = _call_backend_factory(spec)
+    if inspect.isawaitable(backend):
+        raise TypeError("backend factory returned an awaitable; use load_backend_async from async callers")
+    return cast(ChatCompletionBackend, backend)
+
+
+async def load_backend_async(spec: str) -> ChatCompletionBackend:
+    if spec == "mock":
+        return MockChatCompletionBackend()
+
+    backend = _call_backend_factory(spec)
+    if inspect.isawaitable(backend):
+        backend = await backend
+    return cast(ChatCompletionBackend, backend)
+
+
+def _call_backend_factory(spec: str) -> object:
     module_name, separator, factory_name = spec.partition(":")
     if not separator or not module_name or not factory_name:
         raise ValueError("backend spec must be 'mock' or 'module.path:factory_name'")
@@ -65,11 +82,7 @@ def load_backend(spec: str) -> ChatCompletionBackend:
     factory = getattr(module, factory_name)
     if not callable(factory):
         raise TypeError(f"backend factory is not callable: {spec}")
-
-    backend = factory()
-    if inspect.isawaitable(backend):
-        raise TypeError("backend factory must return a backend synchronously")
-    return cast(ChatCompletionBackend, backend)
+    return factory()
 
 
 class MockChatCompletionBackend:

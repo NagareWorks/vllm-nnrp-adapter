@@ -18,12 +18,17 @@ from vllm_nnrp_adapter.benchmark import (
     estimate_token_count,
     run_benchmark,
     run_comparison_benchmark_file,
+    run_comparison_benchmark_file_with_backend_spec,
     run_in_process_comparison_benchmark,
     synthetic_prompt,
 )
 from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.conformance import MockChatCompletionBackend
 from vllm_nnrp_adapter.embedded import EmbeddedTcpServerConfig
+
+
+async def make_async_mock_backend() -> MockChatCompletionBackend:
+    return MockChatCompletionBackend()
 
 
 @pytest.mark.asyncio
@@ -68,6 +73,21 @@ def test_cli_writes_benchmark_report_file(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["adapter"] == "vllm-nnrp-adapter"
     assert report["scenarios"][0]["name"] == "chat.non_streaming.roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_comparison_benchmark_loads_async_backend_factory(tmp_path: Path) -> None:
+    output = tmp_path / "comparison.json"
+
+    report = await run_comparison_benchmark_file_with_backend_spec(
+        output,
+        backend_spec=f"{__name__}:make_async_mock_backend",
+        config=BenchmarkConfig(iterations=1, warmup=0, prompt_tokens=(4,), concurrency=(1,)),
+    )
+
+    assert output.exists()
+    assert report["scenarios"][0]["success_count"] == 1
+    assert json.loads(output.read_text(encoding="utf-8"))["benchmark_kind"] == "in_process_comparison"
 
 
 @pytest.mark.asyncio
