@@ -172,6 +172,22 @@ vllm-nnrp-adapter run-benchmark \
 
 The report includes non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency. Mock reports and HTTP-relay reports are smoke checks, not release-readiness evidence for the NNRP transport path.
 
+Run the release-readiness comparison matrix with the engine-direct NNRP path and, when an OpenAI HTTP endpoint is available, the HTTP SSE baseline:
+
+```bash
+vllm-nnrp-adapter run-benchmark \
+  --comparison \
+  --output artifacts/openai-nnrp-comparison.json \
+  --backend module.path:make_backend \
+  --model example-model \
+  --prompt-tokens 4096,8192,16384,20480 \
+  --concurrency 1,2,4 \
+  --max-completion-tokens 128 \
+  --http-url http://127.0.0.1:8000/v1/chat/completions
+```
+
+The comparison report records TTFT, TPOT, RTT, output-token throughput, request throughput, error rate, and sampled error families for each prompt-size/concurrency pair. The NNRP path uses the in-process engine-direct adapter path; the HTTP path consumes OpenAI-compatible SSE chunks from the configured endpoint.
+
 ## Request Envelope
 
 ```json
