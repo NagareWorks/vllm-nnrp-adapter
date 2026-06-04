@@ -146,6 +146,12 @@ vllm-nnrp-adapter run-benchmark `
 
 The report records non-streaming roundtrip p50/p95 latency, streaming event p50/p95 latency and event throughput, plus cancellation latency. Mock benchmark reports are adapter-shape smoke tests only; release-readiness numbers must use the in-process vLLM NNRP path.
 
+The first release-readiness baseline is recorded in
+[doc/benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md](doc/benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).
+It exercises vLLM `0.18.1` on a Tesla T4 with 4K/8K/16K/20K prompts and concurrency 1/2/4 through the engine-direct
+NNRP profile path and the OpenAI-compatible HTTP/SSE endpoint. HTTP/SSE-to-NNRP relay measurements remain smoke evidence
+only.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Resolution |

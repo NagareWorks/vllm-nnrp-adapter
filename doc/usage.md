@@ -188,6 +188,11 @@ vllm-nnrp-adapter run-benchmark \
 
 The comparison report records TTFT, TPOT, RTT, output-token throughput, request throughput, error rate, and sampled error families for each prompt-size/concurrency pair. The NNRP path uses the in-process engine-direct adapter path; the HTTP path consumes OpenAI-compatible SSE chunks from the configured endpoint.
 
+The first recorded release-readiness baseline is
+[openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).
+It should be treated as the current NNRP direct-path baseline. HTTP/SSE-to-NNRP relay data is useful only as smoke
+evidence and should not be used to justify the optimized runtime path.
+
 ## Request Envelope
 
 ```json
