@@ -39,6 +39,8 @@ The adapter declares compatibility with `vllm>=0.18.0,<0.23`. The first CI basel
 - `src/vllm_nnrp_adapter/profile.py`: frozen profile constants, request envelope validation, event builders, and capability document helpers.
 - `src/vllm_nnrp_adapter/adapter.py`: profile-level async request handler that maps backend responses to NNRP profile events.
 - `src/vllm_nnrp_adapter/vllm_backend.py`: vLLM serving-object wrapper and method probing.
+- `src/vllm_nnrp_adapter/conformance.py`: OpenAI NNRP API conformance plan executor and result writer.
+- `conformance/openai-api-capabilities.json`: Level 1 capability declaration consumed by `nnrp-conformance`.
 - `tests/`: profile and adapter mapping tests that do not require a GPU runtime.
 - `doc/todo/v1-preview3/`: preview3 implementation checklist for the adapter.
 
@@ -57,7 +59,7 @@ Install the vLLM extra only in an environment that can actually host vLLM:
 python -m pip install -e .[dev,vllm]
 ```
 
-## Minimal Adapter Shape
+## Adapter Shape
 
 ```python
 from vllm_nnrp_adapter import OpenAiNnrpAdapter, OpenAiNnrpCapabilityDocument
@@ -83,6 +85,19 @@ events = [
 
 The adapter consumes and emits JSON-compatible profile objects. The NNRP server integration owns frame submission, result push delivery, and cancellation plumbing.
 
+## Conformance Smoke
+
+`nnrp-conformance` owns OpenAI NNRP API profile plan and result schemas. This adapter consumes the generated plan and writes the result report:
+
+```powershell
+vllm-nnrp-adapter run-conformance-plan `
+  --plan tests/fixtures/api-profile-execution-plan.json `
+  --output artifacts/api-profile-results.json `
+  --backend mock
+```
+
+Use `--backend module.path:factory_name` when running against a real vLLM serving object. The factory must return an object that exposes the adapter backend protocol.
+
 ## Contributors
 
 <a href="https://github.com/NagareWorks/vllm-nnrp-adapter/graphs/contributors" title="Open the contributors graph for individual GitHub profiles and IDs.">
@@ -90,4 +105,3 @@ The adapter consumes and emits JSON-compatible profile objects. The NNRP server 
 </a>
 
 The avatar wall above updates automatically from the repository contributor list.
-

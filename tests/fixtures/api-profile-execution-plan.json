@@ -1,0 +1,105 @@
+{
+  "$schema": "https://github.com/NagareWorks/nnrp-conformance/schemas/api-profile-execution-plan.schema.json",
+  "profile": "openai-compatible",
+  "schema_version": "openai-compatible/1",
+  "adapter": "vllm-nnrp-adapter",
+  "artifacts": {
+    "results_path": "artifacts/api-profile-results.json",
+    "evidence_dir": "artifacts/api-profile-evidence"
+  },
+  "cases": [
+    {
+      "id": "openai-compatible.chat.streaming-text",
+      "operation": "chat.completions.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.chat.completions.create",
+        "api.streaming"
+      ],
+      "request": {
+        "body": {
+          "model": "mock-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say hello."
+            }
+          ],
+          "stream": true
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.output_text.delta",
+            "min_count": 1
+          },
+          {
+            "type": "response.usage",
+            "optional": true
+          }
+        ],
+        "terminal": "success"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.non-streaming",
+      "operation": "chat.completions.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.chat.completions.create",
+        "api.non_streaming"
+      ],
+      "request": {
+        "body": {
+          "model": "mock-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say hello."
+            }
+          ],
+          "stream": false
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.completed",
+            "min_count": 1
+          }
+        ],
+        "terminal": "success"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.backend-error",
+      "operation": "chat.completions.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.chat.completions.create"
+      ],
+      "request": {
+        "body": {
+          "model": "backend-error",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Trigger backend error."
+            }
+          ],
+          "stream": false
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.error",
+            "min_count": 1
+          }
+        ],
+        "terminal": "error"
+      }
+    }
+  ]
+}

@@ -28,6 +28,9 @@ dependencies = [
   "nnrp-py>=1.0.0rc3.post2",
 ]
 
+[project.scripts]
+vllm-nnrp-adapter = "vllm_nnrp_adapter.cli:main"
+
 [project.optional-dependencies]
 vllm = [
   "vllm>=0.18.0,<0.23",
@@ -66,4 +69,3 @@ python_version = "3.11"
 warn_unused_configs = true
 strict = true
 packages = ["vllm_nnrp_adapter"]
-

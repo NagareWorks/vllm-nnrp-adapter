@@ -1,0 +1,25 @@
+{
+  "$schema": "https://github.com/NagareWorks/nnrp-conformance/schemas/api-profile-capabilities.schema.json",
+  "adapter": "vllm-nnrp-adapter",
+  "profile": "openai-compatible",
+  "schema_version": "openai-compatible/1",
+  "compatibility_levels": [
+    1
+  ],
+  "operations": [
+    {
+      "name": "chat.completions.create",
+      "streaming": true,
+      "non_streaming": true,
+      "tool_calls": true,
+      "cancellation": false
+    }
+  ],
+  "extensions": [
+    {
+      "name": "diagnostics",
+      "critical": false,
+      "description": "Adapter may include NNRP diagnostics in case result diagnostics without changing baseline pass/fail."
+    }
+  ]
+}
