@@ -12,7 +12,7 @@
       "streaming": true,
       "non_streaming": true,
       "tool_calls": true,
-      "cancellation": false
+      "cancellation": true
     }
   ],
   "extensions": [

@@ -8,6 +8,7 @@ from .profile import (
     CHAT_COMPLETIONS_CREATE,
     OpenAiNnrpCapabilityDocument,
     OpenAiNnrpError,
+    build_cancelled_event,
     build_completed_event,
     build_error_event,
     build_text_delta_event,
@@ -52,8 +53,14 @@ class OpenAiNnrpAdapter:
                 result = await result
 
             if _is_async_iterator(result):
+                emitted_events = 0
+                cancel_after_events = _cancel_after_events(envelope.get("nnrp"))
                 async for event in self._map_streaming_chunks(cast(AsyncIterator[Mapping[str, Any]], result)):
                     yield event
+                    emitted_events += 1
+                    if cancel_after_events is not None and emitted_events >= cancel_after_events:
+                        yield build_cancelled_event()
+                        return
                 return
 
             yield build_completed_event(cast(Mapping[str, Any], result))
@@ -114,3 +121,13 @@ def _as_mapping(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
     return {"value": value}
+
+
+def _cancel_after_events(policy: object) -> int | None:
+    if not isinstance(policy, Mapping):
+        return None
+
+    value = policy.get("cancel_after_events")
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None

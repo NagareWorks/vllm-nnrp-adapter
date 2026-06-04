@@ -138,15 +138,24 @@ async def _run_case(
     request = _case_request(schema_version, case)
     events = [event async for event in adapter.handle_request(request)]
     terminal = _terminal_from_events(events)
-    expected_terminal = _as_str(_as_mapping(case.get("expect"), "expect").get("terminal"), "expect.terminal")
-    outcome: Outcome = "passed" if terminal == expected_terminal else "failed"
+    expect = _as_mapping(case.get("expect"), "expect")
+    expected_terminal = _as_str(expect.get("terminal"), "expect.terminal")
+    expected_events = _as_list(expect.get("events"), "expect.events")
+    messages: list[str] = []
+    if terminal != expected_terminal:
+        messages.append(f"terminal mismatch: expected {expected_terminal}, got {terminal}")
+    messages.extend(_event_expectation_failures(events, expected_events))
+    outcome: Outcome = "passed" if not messages else "failed"
 
-    return {
+    result: dict[str, Any] = {
         "id": _as_str(case.get("id"), "case.id"),
         "outcome": outcome,
         "terminal": terminal,
         "events": events,
     }
+    if messages:
+        result["message"] = "; ".join(messages)
+    return result
 
 
 def _case_request(schema_version: str, case: Mapping[str, Any]) -> dict[str, Any]:
@@ -163,9 +172,43 @@ def _case_request(schema_version: str, case: Mapping[str, Any]) -> dict[str, Any
 
 
 def _terminal_from_events(events: list[dict[str, Any]]) -> Terminal:
+    if any(event.get("type") == "response.cancelled" for event in events):
+        return "cancelled"
     if any(event.get("type") == "response.error" for event in events):
         return "error"
     return "success"
+
+
+def _event_expectation_failures(events: list[dict[str, Any]], expected_events: list[Any]) -> list[str]:
+    failures: list[str] = []
+    for expectation_value in expected_events:
+        expectation = _as_mapping(expectation_value, "expect.events[]")
+        event_type = _as_str(expectation.get("type"), "expect.events[].type")
+        matching_events = [event for event in events if event.get("type") == event_type]
+        min_count = _as_non_negative_int(expectation.get("min_count"), default=0 if expectation.get("optional") else 1)
+        fields = expectation.get("fields")
+        if isinstance(fields, Mapping):
+            matching_events = [event for event in matching_events if _mapping_contains(event, fields)]
+
+        if len(matching_events) < min_count:
+            failures.append(f"{event_type} count mismatch: expected at least {min_count}, got {len(matching_events)}")
+
+    return failures
+
+
+def _mapping_contains(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    for key, expected_value in expected.items():
+        if key not in actual:
+            return False
+
+        actual_value = actual[key]
+        if isinstance(expected_value, Mapping):
+            if not isinstance(actual_value, Mapping) or not _mapping_contains(actual_value, expected_value):
+                return False
+        elif actual_value != expected_value:
+            return False
+
+    return True
 
 
 def _load_json_object(path: Path) -> Mapping[str, Any]:
@@ -188,6 +231,14 @@ def _as_list(value: object, field: str) -> list[Any]:
 def _as_str(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise TypeError(f"{field} must be a non-empty string")
+    return value
+
+
+def _as_non_negative_int(value: object, *, default: int) -> int:
+    if value is None:
+        return default
+    if not isinstance(value, int) or value < 0:
+        raise TypeError("min_count must be a non-negative integer")
     return value
 
 

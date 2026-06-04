@@ -66,6 +66,29 @@ async def test_adapter_maps_streaming_chat_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_maps_streaming_cancellation_policy() -> None:
+    adapter = OpenAiNnrpAdapter(StreamingBackend())
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+                "nnrp": {"cancel_after_events": 1},
+            }
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
+
+
+@pytest.mark.asyncio
 async def test_adapter_maps_non_streaming_chat_body() -> None:
     adapter = OpenAiNnrpAdapter(NonStreamingBackend())
 
@@ -172,6 +195,18 @@ async def test_vllm_backend_probes_supported_method() -> None:
     backend = VllmBackend(ServingChat())
 
     assert await backend.create_chat_completion({"model": "llama"}) == {"echo": "llama"}
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_uses_request_factory_and_raw_request_fallback() -> None:
+    class ServingChat:
+        async def create_chat_completion(self, request: object, raw_request: object | None = None) -> dict[str, Any]:
+            assert raw_request is None
+            return {"request": request}
+
+    backend = VllmBackend(ServingChat(), request_factory=lambda body: ("request", body["model"]))
+
+    assert await backend.create_chat_completion({"model": "llama"}) == {"request": ("request", "llama")}
 
 
 def test_vllm_backend_rejects_unknown_serving_object() -> None:

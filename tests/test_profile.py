@@ -16,6 +16,7 @@ def test_level1_capability_document_shape() -> None:
     assert document["schema_version"] == OPENAI_COMPATIBLE_SCHEMA_VERSION
     assert document["compatibility_levels"] == [1]
     assert document["operations"][0]["name"] == CHAT_COMPLETIONS_CREATE
+    assert document["operations"][0]["cancellation"] is True
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
 
 
@@ -68,4 +69,3 @@ def test_validate_rejects_missing_messages() -> None:
         )
 
     assert error.value.code == "missing_messages"
-

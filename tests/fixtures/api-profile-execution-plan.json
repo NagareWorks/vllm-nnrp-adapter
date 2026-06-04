@@ -7,6 +7,59 @@
     "results_path": "artifacts/api-profile-results.json",
     "evidence_dir": "artifacts/api-profile-evidence"
   },
+  "coverage_matrix": [
+    {
+      "feature": "chat.completions.create",
+      "required_capabilities": [
+        "api.cancellation",
+        "api.chat.completions.create",
+        "api.level1",
+        "api.non_streaming",
+        "api.streaming",
+        "api.tool_calls"
+      ],
+      "summary": {
+        "selected_cases": 7,
+        "not_claimed_cases": 0,
+        "informational_cases": 0
+      },
+      "statuses": {
+        "mandatory_cases": 5,
+        "optional_cases": 2,
+        "experimental_cases": 0,
+        "deprecated_cases": 0
+      },
+      "case_ids": [
+        "openai-compatible.chat.backend-error",
+        "openai-compatible.chat.cancellation",
+        "openai-compatible.chat.invalid-body",
+        "openai-compatible.chat.non-streaming",
+        "openai-compatible.chat.streaming-text",
+        "openai-compatible.chat.tool-call-delta",
+        "openai-compatible.chat.usage"
+      ]
+    },
+    {
+      "feature": "responses.create",
+      "required_capabilities": [
+        "api.level1"
+      ],
+      "summary": {
+        "selected_cases": 1,
+        "not_claimed_cases": 0,
+        "informational_cases": 0
+      },
+      "statuses": {
+        "mandatory_cases": 1,
+        "optional_cases": 0,
+        "experimental_cases": 0,
+        "deprecated_cases": 0
+      },
+      "case_ids": [
+        "openai-compatible.chat.unsupported-operation"
+      ]
+    }
+  ],
   "cases": [
     {
       "id": "openai-compatible.chat.streaming-text",
@@ -14,17 +67,18 @@
       "status": "mandatory",
       "required_capabilities": [
         "api.chat.completions.create",
+        "api.level1",
         "api.streaming"
       ],
       "request": {
         "body": {
-          "model": "mock-model",
           "messages": [
             {
-              "role": "user",
-              "content": "Say hello."
+              "content": "Say hello.",
+              "role": "user"
             }
           ],
+          "model": "example-model",
           "stream": true
         }
       },
@@ -33,10 +87,6 @@
           {
             "type": "response.output_text.delta",
             "min_count": 1
-          },
-          {
-            "type": "response.usage",
-            "optional": true
           }
         ],
         "terminal": "success"
@@ -48,17 +98,18 @@
       "status": "mandatory",
       "required_capabilities": [
         "api.chat.completions.create",
+        "api.level1",
         "api.non_streaming"
       ],
       "request": {
         "body": {
-          "model": "mock-model",
           "messages": [
             {
-              "role": "user",
-              "content": "Say hello."
+              "content": "Say hello.",
+              "role": "user"
             }
           ],
+          "model": "example-model",
           "stream": false
         }
       },
@@ -73,21 +124,16 @@
       }
     },
     {
-      "id": "openai-compatible.chat.backend-error",
+      "id": "openai-compatible.chat.invalid-body",
       "operation": "chat.completions.create",
       "status": "mandatory",
       "required_capabilities": [
-        "api.chat.completions.create"
+        "api.chat.completions.create",
+        "api.level1"
       ],
       "request": {
         "body": {
-          "model": "backend-error",
-          "messages": [
-            {
-              "role": "user",
-              "content": "Trigger backend error."
-            }
-          ],
+          "model": "example-model",
           "stream": false
         }
       },
@@ -95,7 +141,196 @@
         "events": [
           {
             "type": "response.error",
+            "min_count": 1,
+            "fields": {
+              "error": {
+                "code": "missing_messages"
+              }
+            }
+          }
+        ],
+        "terminal": "error"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.unsupported-operation",
+      "operation": "responses.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.level1"
+      ],
+      "request": {
+        "body": {
+          "input": "Say hello.",
+          "model": "example-model"
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.error",
+            "min_count": 1,
+            "fields": {
+              "error": {
+                "code": "unsupported_operation"
+              }
+            }
+          }
+        ],
+        "terminal": "error"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.usage",
+      "operation": "chat.completions.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.chat.completions.create",
+        "api.level1",
+        "api.streaming"
+      ],
+      "request": {
+        "body": {
+          "messages": [
+            {
+              "content": "Say hello.",
+              "role": "user"
+            }
+          ],
+          "model": "example-model",
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.output_text.delta",
+            "optional": true
+          },
+          {
+            "type": "response.usage",
             "min_count": 1
+          }
+        ],
+        "terminal": "success"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.tool-call-delta",
+      "operation": "chat.completions.create",
+      "status": "optional",
+      "required_capabilities": [
+        "api.chat.completions.create",
+        "api.level1",
+        "api.streaming",
+        "api.tool_calls"
+      ],
+      "request": {
+        "body": {
+          "messages": [
+            {
+              "content": "Call the lookup tool.",
+              "role": "user"
+            }
+          ],
+          "model": "example-model",
+          "stream": true,
+          "tools": [
+            {
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "properties": {},
+                  "type": "object"
+                }
+              },
+              "type": "function"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.tool_call.delta",
+            "min_count": 1
+          }
+        ],
+        "terminal": "success"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.cancellation",
+      "operation": "chat.completions.create",
+      "status": "optional",
+      "required_capabilities": [
+        "api.cancellation",
+        "api.chat.completions.create",
+        "api.level1",
+        "api.streaming"
+      ],
+      "request": {
+        "body": {
+          "messages": [
+            {
+              "content": "Start a long answer.",
+              "role": "user"
+            }
+          ],
+          "model": "example-model",
+          "stream": true
+        },
+        "nnrp": {
+          "cancel_after_events": 1
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.output_text.delta",
+            "optional": true
+          },
+          {
+            "type": "response.cancelled",
+            "min_count": 1
+          }
+        ],
+        "terminal": "cancelled"
+      }
+    },
+    {
+      "id": "openai-compatible.chat.backend-error",
+      "operation": "chat.completions.create",
+      "status": "mandatory",
+      "required_capabilities": [
+        "api.chat.completions.create",
+        "api.level1"
+      ],
+      "request": {
+        "body": {
+          "messages": [
+            {
+              "content": "Trigger backend error.",
+              "role": "user"
+            }
+          ],
+          "model": "backend-error",
+          "stream": false
+        }
+      },
+      "expect": {
+        "events": [
+          {
+            "type": "response.error",
+            "min_count": 1,
+            "fields": {
+              "error": {
+                "code": "backend_error"
+              }
+            }
           }
         ],
         "terminal": "error"

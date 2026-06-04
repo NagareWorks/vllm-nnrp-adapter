@@ -23,6 +23,7 @@ class OpenAiNnrpError(Exception):
 class OpenAiNnrpPolicy(TypedDict, total=False):
     timeout_ms: int
     diagnostics: bool
+    cancel_after_events: int
 
 
 class OpenAiNnrpRequest(TypedDict):
@@ -53,6 +54,7 @@ class OpenAiNnrpCapabilityDocument:
                     "streaming": True,
                     "non_streaming": True,
                     "tool_calls": True,
+                    "cancellation": True,
                 },
             ),
             models=tuple({"id": model, "owned_by": "adapter"} for model in models),
@@ -157,3 +159,7 @@ def build_error_event(error_type: str, code: str, message: str) -> dict[str, Any
             "message": message,
         },
     }
+
+
+def build_cancelled_event(reason: str = "client_cancelled") -> dict[str, Any]:
+    return {"type": "response.cancelled", "reason": reason}

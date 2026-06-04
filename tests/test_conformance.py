@@ -22,9 +22,18 @@ async def test_conformance_runner_executes_plan_with_mock_backend() -> None:
     assert report["profile"] == "openai-compatible"
     assert report["schema_version"] == "openai-compatible/1"
     assert report["adapter"] == "vllm-nnrp-adapter"
-    assert [result["outcome"] for result in report["results"]] == ["passed", "passed", "passed"]
-    assert report["results"][0]["terminal"] == "success"
-    assert report["results"][2]["terminal"] == "error"
+    assert len(report["results"]) == 8
+    assert {result["outcome"] for result in report["results"]} == {"passed"}
+
+    terminals = {result["id"]: result["terminal"] for result in report["results"]}
+    assert terminals["openai-compatible.chat.streaming-text"] == "success"
+    assert terminals["openai-compatible.chat.non-streaming"] == "success"
+    assert terminals["openai-compatible.chat.invalid-body"] == "error"
+    assert terminals["openai-compatible.chat.unsupported-operation"] == "error"
+    assert terminals["openai-compatible.chat.usage"] == "success"
+    assert terminals["openai-compatible.chat.tool-call-delta"] == "success"
+    assert terminals["openai-compatible.chat.cancellation"] == "cancelled"
+    assert terminals["openai-compatible.chat.backend-error"] == "error"
 
 
 def test_cli_writes_conformance_result_file(tmp_path: Path) -> None:
@@ -44,7 +53,7 @@ def test_cli_writes_conformance_result_file(tmp_path: Path) -> None:
 
     assert exit_code == 0
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert len(report["results"]) == 3
+    assert len(report["results"]) == 8
     assert report["results"][1]["events"][0]["type"] == "response.completed"
 
 
@@ -84,3 +93,15 @@ async def test_conformance_runner_rejects_bad_plan_shape() -> None:
             },
             backend=MockChatCompletionBackend(),
         )
+
+
+@pytest.mark.asyncio
+async def test_conformance_runner_fails_when_expected_field_is_absent() -> None:
+    plan = json.loads(FIXTURE_PLAN.read_text(encoding="utf-8"))
+    plan["cases"] = [case for case in plan["cases"] if case["id"] == "openai-compatible.chat.backend-error"]
+    plan["cases"][0]["expect"]["events"][0]["fields"]["error"]["code"] = "different"
+
+    report = await run_conformance_plan(plan, backend=MockChatCompletionBackend())
+
+    assert report["results"][0]["outcome"] == "failed"
+    assert "response.error count mismatch" in report["results"][0]["message"]
