@@ -69,3 +69,7 @@ python_version = "3.11"
 warn_unused_configs = true
 strict = true
 packages = ["vllm_nnrp_adapter"]
+
+[[tool.mypy.overrides]]
+module = "nnrp.*"
+ignore_missing_imports = true

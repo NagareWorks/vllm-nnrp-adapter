@@ -80,6 +80,7 @@ class OpenAiNnrpAdapter:
                 except TimeoutError as error:
                     await _close_async_iterator(chunks)
                     raise error
+                yield build_completed_event({"object": "chat.completion.stream", "status": "completed"})
                 return
 
             yield build_completed_event(cast(Mapping[str, Any], result))

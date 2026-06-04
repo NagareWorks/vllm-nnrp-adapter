@@ -97,6 +97,7 @@ async def test_adapter_maps_streaming_chat_chunks() -> None:
     assert events[0]["type"] == "response.output_text.delta"
     assert events[0]["delta"] == "hello"
     assert events[1]["type"] == "response.usage"
+    assert events[2]["type"] == "response.completed"
 
 
 @pytest.mark.asyncio

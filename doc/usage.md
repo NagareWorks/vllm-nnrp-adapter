@@ -65,6 +65,44 @@ def make_backend():
 
 The vLLM wrapper converts profile request bodies into `ChatCompletionRequest` at runtime and calls `create_chat_completion`.
 
+## NNRP Server Binding
+
+Use `nnrp-py` server sessions for transport and frame ownership. The adapter bridge only translates the OpenAI profile event stream into `RESULT_PUSH` frames:
+
+```python
+import json
+
+from nnrp.client import TypedPayload
+from vllm_nnrp_adapter import NnrpFrameContext, OpenAiNnrpAdapter, decode_profile_event
+from vllm_nnrp_adapter import emit_openai_profile_results
+
+
+async def handle_submit(server_session, backend):
+    adapter = OpenAiNnrpAdapter(backend)
+    submit = await server_session.receive_submit()
+    request = json.loads(submit.request.typed_payloads[0].payload.decode("utf-8"))
+
+    await emit_openai_profile_results(
+        adapter,
+        server_session,
+        request,
+        frame=NnrpFrameContext(
+            frame_id=submit.request.frame_id,
+            view_id=submit.request.view_id,
+            route_id=submit.request.route_id,
+            trace_id=submit.packet.header.trace_id,
+        ),
+    )
+
+
+async def consume_result(client_session):
+    result = await client_session.receive_result()
+    event = decode_profile_event(result.structured_events[0])
+    return event
+```
+
+The submit payload is the request envelope shown below, encoded as a `TypedPayload.structured_event(...)` by the caller. Streaming deltas, usage events, tool-call deltas, errors, cancellation, and completion are returned as structured result payloads. Terminal profile events are emitted as complete NNRP results.
+
 ## Conformance
 
 Run against the shared OpenAI API profile plan:
