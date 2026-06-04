@@ -44,6 +44,20 @@ The delta column reports `NNRP TTFT - HTTP TTFT`; negative values mean the NNRP 
 | 20480 | 2 | 4 / 0 | 4 / 0 | 469.51 ms | 469.91 ms | 209.79 ms | 209.83 ms | 3616.32 ms | 3614.57 ms | 9.12 | 9.12 | -0.40 ms |
 | 20480 | 4 | 4 / 0 | 4 / 0 | 634.65 ms | 636.42 ms | 220.72 ms | 220.85 ms | 3834.35 ms | 3837.74 ms | 10.46 | 10.45 | -1.78 ms |
 
+## Conclusion
+
+This benchmark shows release-readiness parity for the Level 1 vLLM adapter path, not a token-stream performance win over
+OpenAI-compatible HTTP/SSE. In long-context vLLM generation, prefill and decode dominate the request timeline, so protocol
+overhead is too small to produce a meaningful TTFT, TPOT, RTT, or throughput gap. The NNRP path is therefore useful here
+as a compatibility and server-side integration path that prevents OpenAI-profile workloads from blocking NNRP adoption,
+not as the primary performance story.
+
+The performance narrative should move to heavy-transport runtime scenarios where NNRP can avoid JSON token-profile
+overhead and carry large typed payloads or control-plane events directly. Examples include AI coding subagents, tool
+results, multimodal payloads, large tensor transfer, cancellation/recovery storms, IPC, and scheduler-to-worker
+coordination. Those scenarios need preview4 protocol work around dedicated control frames and typed/binary payload paths
+instead of reusing the Level 1 token profile as a generic JSON transport.
+
 ## Notes
 
 - The NNRP columns exercise the in-process engine-direct adapter path. The HTTP columns exercise vLLM's
