@@ -134,6 +134,7 @@ vllm-nnrp-adapter run-benchmark \
 ```
 
 The report includes non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency.
+The current release-readiness baseline is recorded in [benchmark-baseline.md](benchmark-baseline.md).
 
 ## Request Envelope
 
