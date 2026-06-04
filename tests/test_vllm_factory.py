@@ -44,6 +44,19 @@ def test_create_chat_completion_request_uses_vllm_model_validate(fake_vllm_proto
     assert request.payload["model"] == "llama"
 
 
+def test_create_chat_completion_request_falls_back_to_legacy_vllm_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("vllm.entrypoints.openai.protocol")
+    module.ChatCompletionRequest = FakeChatCompletionRequest
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.openai.protocol", module)
+
+    request = create_chat_completion_request({"model": "llama", "messages": []})
+
+    assert isinstance(request, FakeChatCompletionRequest)
+    assert request.payload["model"] == "llama"
+
+
 @pytest.mark.asyncio
 async def test_create_backend_from_serving_factory_wraps_real_request_factory(
     fake_vllm_protocol_module: None,

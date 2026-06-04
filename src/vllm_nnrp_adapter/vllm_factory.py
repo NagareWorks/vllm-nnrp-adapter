@@ -6,7 +6,10 @@ from typing import Any, Protocol, cast
 
 from .vllm_backend import VllmBackend
 
-CHAT_COMPLETION_REQUEST_PATH = "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest"
+CHAT_COMPLETION_REQUEST_PATHS = (
+    "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest",
+    "vllm.entrypoints.openai.protocol:ChatCompletionRequest",
+)
 
 
 class RequestConstructor(Protocol):
@@ -15,7 +18,7 @@ class RequestConstructor(Protocol):
 
 
 def create_chat_completion_request(body: Mapping[str, Any]) -> object:
-    request_type = _load_symbol(CHAT_COMPLETION_REQUEST_PATH)
+    request_type = _load_first_symbol(CHAT_COMPLETION_REQUEST_PATHS)
     payload = dict(body)
     model_validate = getattr(request_type, "model_validate", None)
     if callable(model_validate):
@@ -42,3 +45,13 @@ def _load_symbol(spec: str) -> object:
 
     module = importlib.import_module(module_name)
     return getattr(module, symbol_name)
+
+
+def _load_first_symbol(specs: tuple[str, ...]) -> object:
+    errors: list[str] = []
+    for spec in specs:
+        try:
+            return _load_symbol(spec)
+        except (AttributeError, ModuleNotFoundError) as error:
+            errors.append(f"{spec}: {error}")
+    raise ModuleNotFoundError("could not load vLLM ChatCompletionRequest from supported paths: " + "; ".join(errors))
