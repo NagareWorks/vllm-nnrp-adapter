@@ -4,9 +4,13 @@ from .nnrp_runtime import (
     EmittedNnrpResult,
     NnrpFrameContext,
     decode_profile_event,
+    decode_submit_profile_request,
     emit_openai_profile_results,
     emit_profile_event,
     encode_profile_event,
+    frame_context_from_submit,
+    handle_openai_profile_submit,
+    serve_openai_profile_session,
 )
 from .profile import (
     OPENAI_COMPATIBLE_PROFILE,
@@ -44,8 +48,12 @@ __all__ = [
     "create_chat_completion_request",
     "create_vllm_backend",
     "decode_profile_event",
+    "decode_submit_profile_request",
     "emit_openai_profile_results",
     "emit_profile_event",
     "encode_profile_event",
+    "frame_context_from_submit",
+    "handle_openai_profile_submit",
     "run_benchmark",
+    "serve_openai_profile_session",
 ]

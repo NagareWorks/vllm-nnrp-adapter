@@ -35,6 +35,14 @@ class NnrpResultSession(Protocol):
         pass
 
 
+class NnrpSubmitSession(NnrpResultSession, Protocol):
+    async def receive_submit(self, timeout: float | None = None) -> object:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+
 @dataclass(frozen=True, slots=True)
 class NnrpFrameContext:
     frame_id: int
@@ -50,6 +58,39 @@ class EmittedNnrpResult:
     stream_id: int
     terminal: bool
     status_code: int
+
+
+async def serve_openai_profile_session(
+    adapter: OpenAiNnrpAdapter,
+    session: NnrpSubmitSession,
+    *,
+    max_requests: int | None = None,
+    receive_timeout: float | None = None,
+    close_on_exit: bool = False,
+) -> int:
+    handled = 0
+    try:
+        while max_requests is None or handled < max_requests:
+            submit = await session.receive_submit(timeout=receive_timeout)
+            await handle_openai_profile_submit(adapter, session, submit)
+            handled += 1
+    finally:
+        if close_on_exit:
+            await session.close()
+    return handled
+
+
+async def handle_openai_profile_submit(
+    adapter: OpenAiNnrpAdapter,
+    session: NnrpResultSession,
+    submit: object,
+) -> list[EmittedNnrpResult]:
+    return await emit_openai_profile_results(
+        adapter,
+        session,
+        decode_submit_profile_request(submit),
+        frame=frame_context_from_submit(submit),
+    )
 
 
 async def emit_openai_profile_results(
@@ -86,6 +127,31 @@ async def emit_profile_event(
         active_profile_id=frame.active_profile_id,
     )
     return EmittedNnrpResult(event=event, stream_id=stream_id, terminal=terminal, status_code=status_code)
+
+
+def decode_submit_profile_request(submit: object) -> dict[str, Any]:
+    request = _required_attr(submit, "request")
+    typed_payloads = _required_attr(request, "typed_payloads")
+    if not typed_payloads:
+        raise ValueError("NNRP submit must carry an OpenAI profile request payload")
+    payload = _required_attr(typed_payloads[0], "payload")
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("OpenAI profile request payload must decode to a JSON object")
+    return value
+
+
+def frame_context_from_submit(submit: object) -> NnrpFrameContext:
+    request = _required_attr(submit, "request")
+    packet = _required_attr(submit, "packet")
+    header = _required_attr(packet, "header")
+    return NnrpFrameContext(
+        frame_id=int(_required_attr(request, "frame_id")),
+        view_id=int(getattr(header, "view_id", 0)),
+        route_id=int(getattr(header, "route_id", 0)),
+        trace_id=int(getattr(header, "trace_id", 0)),
+        active_profile_id=int(getattr(header, "active_profile_id", 0)),
+    )
 
 
 def encode_profile_event(event: Mapping[str, Any]) -> bytes:
@@ -125,3 +191,9 @@ def status_code_for_profile_event(event: Mapping[str, Any]) -> int:
     if event_type == "response.cancelled":
         return 499
     return 200
+
+
+def _required_attr(value: object, name: str) -> Any:
+    if not hasattr(value, name):
+        raise ValueError(f"NNRP submit is missing required {name!r} field")
+    return getattr(value, name)

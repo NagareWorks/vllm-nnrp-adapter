@@ -53,6 +53,12 @@ class OverloadedBackend:
         raise RuntimeError("backend overload: too many queued requests")
 
 
+class PydanticLikeCompletion:
+    def model_dump(self, *, mode: str = "python") -> Mapping[str, Any]:
+        assert mode == "json"
+        return {"id": "chatcmpl-model", "choices": [{"message": {"content": "hello"}}]}
+
+
 class ClosableStreamingBackend:
     def __init__(self) -> None:
         self.closed = False
@@ -350,6 +356,60 @@ async def test_vllm_backend_uses_request_factory_and_raw_request_fallback() -> N
     backend = VllmBackend(ServingChat(), request_factory=lambda body: ("request", body["model"]))
 
     assert await backend.create_chat_completion({"model": "llama"}) == {"request": ("request", "llama")}
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_normalizes_in_process_sse_stream() -> None:
+    class ServingChat:
+        async def create_chat_completion(
+            self,
+            request: object,
+            raw_request: object | None = None,
+        ) -> AsyncIterator[str]:
+            async def chunks() -> AsyncIterator[str]:
+                yield 'data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n'
+                yield "data: [DONE]\n\n"
+
+            return chunks()
+
+    backend = VllmBackend(ServingChat(), request_factory=lambda body: ("request", body["model"]))
+    adapter = OpenAiNnrpAdapter(backend)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            }
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["response.output_text.delta", "response.completed"]
+    assert events[0]["delta"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_normalizes_pydantic_like_completion() -> None:
+    class ServingChat:
+        async def create_chat_completion(
+            self,
+            request: object,
+            raw_request: object | None = None,
+        ) -> PydanticLikeCompletion:
+            return PydanticLikeCompletion()
+
+    backend = VllmBackend(ServingChat())
+
+    assert await backend.create_chat_completion({"model": "llama"}) == {
+        "id": "chatcmpl-model",
+        "choices": [{"message": {"content": "hello"}}],
+    }
 
 
 def test_vllm_backend_rejects_unknown_serving_object() -> None:

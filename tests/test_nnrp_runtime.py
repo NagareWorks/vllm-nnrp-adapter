@@ -16,10 +16,14 @@ from vllm_nnrp_adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.nnrp_runtime import (
     NnrpFrameContext,
     decode_profile_event,
+    decode_submit_profile_request,
     emit_openai_profile_results,
     emit_profile_event,
     encode_profile_event,
+    frame_context_from_submit,
+    handle_openai_profile_submit,
     is_terminal_profile_event,
+    serve_openai_profile_session,
     status_code_for_profile_event,
 )
 from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
@@ -94,6 +98,50 @@ class RecordingResultSession:
         return len(self.sent) * 4 + 2
 
 
+class SubmitSession(RecordingResultSession):
+    def __init__(self, submits: list[object]) -> None:
+        super().__init__()
+        self.submits = submits
+        self.closed = False
+
+    async def receive_submit(self, timeout: float | None = None) -> object:
+        assert timeout == 0.25
+        return self.submits.pop(0)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@dataclass(frozen=True)
+class FakeTypedPayload:
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class FakeRequest:
+    frame_id: int
+    typed_payloads: tuple[FakeTypedPayload, ...]
+
+
+@dataclass(frozen=True)
+class FakeHeader:
+    view_id: int
+    route_id: int
+    trace_id: int
+    active_profile_id: int
+
+
+@dataclass(frozen=True)
+class FakePacket:
+    header: FakeHeader
+
+
+@dataclass(frozen=True)
+class FakeSubmit:
+    request: FakeRequest
+    packet: FakePacket
+
+
 @pytest.mark.asyncio
 async def test_emit_profile_event_writes_structured_result_push_shape() -> None:
     session = RecordingResultSession()
@@ -151,12 +199,8 @@ async def test_emit_openai_profile_results_streams_through_real_nnrp_tcp_session
             try:
                 submit = await session.receive_submit(timeout=5.0)
                 payload = json.loads(submit.request.typed_payloads[0].payload.decode("utf-8"))
-                await emit_openai_profile_results(
-                    adapter,
-                    session,
-                    payload,
-                    frame=NnrpFrameContext(frame_id=submit.request.frame_id, trace_id=submit.packet.header.trace_id),
-                )
+                assert payload == _chat_request()
+                await handle_openai_profile_submit(adapter, session, submit)
                 await asyncio.sleep(0.05)
             finally:
                 await session.close()
@@ -194,6 +238,67 @@ async def test_emit_openai_profile_results_streams_through_real_nnrp_tcp_session
         finally:
             await server_task
             await asyncio.wait_for(server_done.wait(), timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_serve_openai_profile_session_handles_embedded_submit_loop() -> None:
+    submit = FakeSubmit(
+        request=FakeRequest(
+            frame_id=41,
+            typed_payloads=(FakeTypedPayload(json.dumps(_chat_request()).encode("utf-8")),),
+        ),
+        packet=FakePacket(FakeHeader(view_id=7, route_id=8, trace_id=9, active_profile_id=10)),
+    )
+    session = SubmitSession([submit])
+
+    handled = await serve_openai_profile_session(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        session,
+        max_requests=1,
+        receive_timeout=0.25,
+        close_on_exit=True,
+    )
+
+    assert handled == 1
+    assert session.closed is True
+    assert len(session.sent) == 3
+    assert session.sent[0].frame_id == 41
+    assert session.sent[0].view_id == 7
+    assert session.sent[0].route_id == 8
+    assert session.sent[0].trace_id == 9
+    assert session.sent[0].active_profile_id == 10
+
+
+def test_submit_helpers_decode_payload_and_frame_context() -> None:
+    submit = FakeSubmit(
+        request=FakeRequest(
+            frame_id=51,
+            typed_payloads=(FakeTypedPayload(json.dumps(_chat_request(stream=False)).encode("utf-8")),),
+        ),
+        packet=FakePacket(FakeHeader(view_id=11, route_id=12, trace_id=13, active_profile_id=14)),
+    )
+
+    assert decode_submit_profile_request(submit)["body"]["stream"] is False
+    assert frame_context_from_submit(submit) == NnrpFrameContext(
+        frame_id=51,
+        view_id=11,
+        route_id=12,
+        trace_id=13,
+        active_profile_id=14,
+    )
+
+
+def test_decode_submit_profile_request_rejects_invalid_submit_shape() -> None:
+    with pytest.raises(ValueError, match="payload"):
+        decode_submit_profile_request(FakeSubmit(FakeRequest(1, ()), FakePacket(FakeHeader(0, 0, 0, 0))))
+
+    with pytest.raises(ValueError, match="JSON object"):
+        decode_submit_profile_request(
+            FakeSubmit(
+                FakeRequest(1, (FakeTypedPayload(b"[]"),)),
+                FakePacket(FakeHeader(0, 0, 0, 0)),
+            )
+        )
 
 
 def test_profile_event_payload_roundtrip_and_terminal_status_codes() -> None:
