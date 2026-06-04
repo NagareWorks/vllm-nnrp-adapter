@@ -7,11 +7,14 @@ from .profile import (
     OpenAiNnrpError,
     OpenAiNnrpRequest,
     ProfileEvent,
+    build_cancelled_event,
+    build_diagnostics_event,
     build_error_event,
     build_text_delta_event,
     build_usage_event,
 )
 from .vllm_backend import VllmBackend
+from .vllm_factory import create_chat_completion_request, create_vllm_backend
 
 __all__ = [
     "OPENAI_COMPATIBLE_PROFILE",
@@ -23,8 +26,12 @@ __all__ = [
     "OpenAiNnrpRequest",
     "ProfileEvent",
     "VllmBackend",
+    "build_cancelled_event",
+    "build_diagnostics_event",
     "build_error_event",
     "build_text_delta_event",
     "build_usage_event",
+    "create_chat_completion_request",
+    "create_vllm_backend",
     "run_benchmark",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from typing import Any, Protocol, cast
@@ -10,6 +11,7 @@ from .profile import (
     OpenAiNnrpError,
     build_cancelled_event,
     build_completed_event,
+    build_diagnostics_event,
     build_error_event,
     build_text_delta_event,
     build_tool_call_delta_event,
@@ -48,29 +50,59 @@ class OpenAiNnrpAdapter:
                     "Unsupported profile operation.",
                 )
 
+            policy = envelope.get("nnrp")
+            timeout_s = _timeout_seconds(policy)
+            if _diagnostics_enabled(policy):
+                yield build_diagnostics_event(
+                    {
+                        "selected_model": envelope["body"].get("model"),
+                        "operation": envelope["operation"],
+                        "backend_family": type(self._backend).__name__,
+                    }
+                )
+
             result = self._backend.create_chat_completion(envelope["body"])
             if inspect.isawaitable(result):
-                result = await result
+                result = await _await_with_timeout(result, timeout_s)
 
             if _is_async_iterator(result):
                 emitted_events = 0
                 cancel_after_events = _cancel_after_events(envelope.get("nnrp"))
-                async for event in self._map_streaming_chunks(cast(AsyncIterator[Mapping[str, Any]], result)):
-                    yield event
-                    emitted_events += 1
-                    if cancel_after_events is not None and emitted_events >= cancel_after_events:
-                        yield build_cancelled_event()
-                        return
+                chunks = cast(AsyncIterator[Mapping[str, Any]], result)
+                try:
+                    async for event in self._map_streaming_chunks(chunks, timeout_s=timeout_s):
+                        yield event
+                        emitted_events += 1
+                        if cancel_after_events is not None and emitted_events >= cancel_after_events:
+                            await _close_async_iterator(chunks)
+                            yield build_cancelled_event()
+                            return
+                except TimeoutError as error:
+                    await _close_async_iterator(chunks)
+                    raise error
                 return
 
             yield build_completed_event(cast(Mapping[str, Any], result))
         except OpenAiNnrpError as error:
             yield error.to_event()
+        except TimeoutError as error:
+            yield build_error_event("timeout_error", "request_timeout", str(error))
         except Exception as error:
-            yield build_error_event("server_error", "backend_error", str(error))
+            error_type, code = classify_backend_error(error)
+            yield build_error_event(
+                error_type,
+                code,
+                str(error),
+                diagnostics={"backend_error_family": type(error).__name__},
+            )
 
-    async def _map_streaming_chunks(self, chunks: AsyncIterator[Mapping[str, Any]]) -> AsyncIterator[dict[str, Any]]:
-        async for chunk in chunks:
+    async def _map_streaming_chunks(
+        self,
+        chunks: AsyncIterator[Mapping[str, Any]],
+        *,
+        timeout_s: float | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        async for chunk in _iterate_with_timeout(chunks, timeout_s):
             yielded = False
             for event in map_openai_stream_chunk(chunk):
                 yielded = True
@@ -131,3 +163,69 @@ def _cancel_after_events(policy: object) -> int | None:
     if isinstance(value, int) and value >= 0:
         return value
     return None
+
+
+def _diagnostics_enabled(policy: object) -> bool:
+    return isinstance(policy, Mapping) and policy.get("diagnostics") is True
+
+
+def _timeout_seconds(policy: object) -> float | None:
+    if not isinstance(policy, Mapping):
+        return None
+
+    value = policy.get("timeout_ms")
+    if isinstance(value, int) and value > 0:
+        return value / 1000
+    return None
+
+
+async def _await_with_timeout(
+    awaitable: Awaitable[ChatCompletionResult],
+    timeout_s: float | None,
+) -> ChatCompletionResult:
+    try:
+        if timeout_s is None:
+            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=timeout_s)
+    except TimeoutError as error:
+        raise TimeoutError("backend did not return before nnrp.timeout_ms") from error
+
+
+async def _iterate_with_timeout(
+    chunks: AsyncIterator[Mapping[str, Any]],
+    timeout_s: float | None,
+) -> AsyncIterator[Mapping[str, Any]]:
+    iterator = chunks.__aiter__()
+    while True:
+        try:
+            if timeout_s is None:
+                yield await iterator.__anext__()
+            else:
+                yield await asyncio.wait_for(iterator.__anext__(), timeout=timeout_s)
+        except StopAsyncIteration:
+            return
+        except TimeoutError as error:
+            raise TimeoutError("backend stream did not yield before nnrp.timeout_ms") from error
+
+
+async def _close_async_iterator(chunks: AsyncIterator[Mapping[str, Any]]) -> None:
+    closer = getattr(chunks, "aclose", None)
+    if closer is None:
+        return
+    result = closer()
+    if inspect.isawaitable(result):
+        await result
+
+
+def classify_backend_error(error: Exception) -> tuple[str, str]:
+    class_name = type(error).__name__.lower()
+    message = str(error).lower()
+    haystack = f"{class_name} {message}"
+
+    if "overload" in haystack or "rate limit" in haystack or "too many" in haystack:
+        return "server_error", "backend_overload"
+    if "scheduler" in haystack and ("reject" in haystack or "full" in haystack):
+        return "server_error", "scheduler_rejected"
+    if "cancel" in haystack or "abort" in haystack:
+        return "server_error", "backend_cancelled"
+    return "server_error", "backend_error"

@@ -146,12 +146,22 @@ def build_usage_event(usage: Mapping[str, Any]) -> dict[str, Any]:
     return {"type": "response.usage", "usage": dict(usage)}
 
 
+def build_diagnostics_event(fields: Mapping[str, Any]) -> dict[str, Any]:
+    return {"type": "response.diagnostics", "diagnostics": dict(fields)}
+
+
 def build_completed_event(body: Mapping[str, Any]) -> dict[str, Any]:
     return {"type": "response.completed", "body": dict(body)}
 
 
-def build_error_event(error_type: str, code: str, message: str) -> dict[str, Any]:
-    return {
+def build_error_event(
+    error_type: str,
+    code: str,
+    message: str,
+    *,
+    diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
         "type": "response.error",
         "error": {
             "type": error_type,
@@ -159,6 +169,9 @@ def build_error_event(error_type: str, code: str, message: str) -> dict[str, Any
             "message": message,
         },
     }
+    if diagnostics is not None:
+        event["diagnostics"] = dict(diagnostics)
+    return event
 
 
 def build_cancelled_event(reason: str = "client_cancelled") -> dict[str, Any]:

@@ -98,6 +98,16 @@ vllm-nnrp-adapter run-conformance-plan `
 
 Use `--backend module.path:factory_name` when running against a real vLLM serving object. The factory must return an object that exposes the adapter backend protocol.
 
+For an existing vLLM `OpenAIServingChat` object, wrap it with the built-in request factory:
+
+```python
+from vllm_nnrp_adapter import create_vllm_backend
+
+backend = create_vllm_backend(serving_chat)
+```
+
+The factory converts profile request bodies into vLLM `ChatCompletionRequest` objects at runtime. vLLM remains an optional dependency, so normal CI and conformance smoke tests can still run without a GPU serving stack.
+
 ## Benchmark Smoke
 
 The adapter includes a small profile-level benchmark runner for the same backend boundary used by conformance. The default mock backend is useful for CI and regression checks; a real vLLM backend factory can be supplied with the same `module.path:factory_name` syntax.
@@ -111,6 +121,19 @@ vllm-nnrp-adapter run-benchmark `
 ```
 
 The report records non-streaming roundtrip p50/p95 latency, streaming event p50/p95 latency and event throughput, plus cancellation latency.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Resolution |
+|---|---|---|
+| `unsupported_operation` | The request operation is not part of `openai-compatible/1` Level 1. | Use `chat.completions.create` for the current profile level. |
+| `request_timeout` | `nnrp.timeout_ms` expired before vLLM returned or streamed the next event. | Raise the timeout, reduce queue pressure, or inspect the vLLM engine logs. |
+| `backend_overload` | vLLM reported overload, rate limit, or too many queued requests. | Treat it as scheduler pressure and retry according to the caller policy. |
+| `scheduler_rejected` | The vLLM scheduler rejected the request path. | Check model capacity, admission policy, and active queue depth. |
+| `backend_cancelled` | vLLM reported an abort/cancel path. | Check whether the NNRP caller cancelled the frame or whether vLLM aborted internally. |
+| `vLLM serving object does not expose a supported chat completion method` | The installed vLLM version or wrapper object does not match the selected backend boundary. | Use `vllm>=0.18.0,<0.23` and pass an `OpenAIServingChat`-compatible object to `create_vllm_backend`. |
+
+Set `nnrp.diagnostics=true` in the request envelope to emit a `response.diagnostics` event with selected model, operation, and backend family before the request result stream.
 
 ## Contributors
 
