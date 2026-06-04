@@ -133,8 +133,7 @@ vllm-nnrp-adapter run-benchmark \
   --warmup 20
 ```
 
-The report includes non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency.
-The current release-readiness baseline is recorded in [benchmark-baseline.md](benchmark-baseline.md).
+The report includes non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency. Mock reports and HTTP-relay reports are smoke checks, not release-readiness evidence for the NNRP transport path.
 
 ## Request Envelope
 

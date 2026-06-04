@@ -42,7 +42,6 @@ The adapter declares compatibility with `vllm>=0.18.0,<0.23`. The first CI basel
 - `src/vllm_nnrp_adapter/vllm_backend.py`: vLLM serving-object wrapper and method probing.
 - `src/vllm_nnrp_adapter/conformance.py`: OpenAI NNRP API conformance plan executor and result writer.
 - `conformance/openai-api-capabilities.json`: Level 1 capability declaration consumed by `nnrp-conformance`.
-- `doc/benchmark-baseline.md`: release-readiness benchmark and vLLM compatibility baseline notes.
 - `tests/`: profile and adapter mapping tests that do not require a GPU runtime.
 - `doc/todo/v1-preview3/`: preview3 implementation checklist for the adapter.
 
@@ -145,8 +144,7 @@ vllm-nnrp-adapter run-benchmark `
   --warmup 20
 ```
 
-The report records non-streaming roundtrip p50/p95 latency, streaming event p50/p95 latency and event throughput, plus cancellation latency.
-See [doc/benchmark-baseline.md](doc/benchmark-baseline.md) for the current Level 1 baseline.
+The report records non-streaming roundtrip p50/p95 latency, streaming event p50/p95 latency and event throughput, plus cancellation latency. Mock benchmark reports are adapter-shape smoke tests only; release-readiness numbers must use the in-process vLLM NNRP path.
 
 ## Troubleshooting
 
