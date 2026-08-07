@@ -8,7 +8,7 @@
 - [x] Measure 4K, 8K, 16K, and 20K input prompts with controlled concurrency 1, 2, and 4.
 - [x] Report TTFT, TPOT, RTT, output-token throughput, cancellation latency, and per-request error rate for both paths.
 - [x] Run the in-process benchmark against vLLM `0.18.1`.
-- [ ] Smoke the current stable vLLM line.
+- [x] Smoke the then-current stable vLLM `0.18.1` line.
 - [x] Record release-readiness baseline results from the in-process NNRP path before release.
 - [x] Mark HTTP/SSE-to-NNRP relay benchmark data as non-release smoke evidence only.
 - [x] Run the OpenAI HTTP/SSE baseline against the same vLLM engine configuration and record TTFT/TPOT/RTT deltas.

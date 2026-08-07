@@ -1,0 +1,30 @@
+# 08 - Observability And Exporters
+
+## Observation Record
+
+- [ ] Add one immutable operation observation record shared by diagnostics, metrics, logs, and
+  benchmarks.
+- [ ] Record model, operation, vLLM version, backend binding, selected transport, connection,
+  session, operation, frame, route, view, trace, and profile identities.
+- [ ] Record queue delay, admission latency, preprocessing latency, time to first event, inter-event
+  latency, terminal latency, output event count, token usage, and bytes where available.
+- [ ] Record cancellation source, backend abort acceptance, error family, drop reason, retry hint,
+  pressure state, and terminal outcome.
+- [ ] Derive stage transitions from the same record used for `TRACE_CONTEXT` and `PROGRESS`.
+
+## Export Boundary
+
+- [ ] Expose an observation sink protocol and a structured-log sink.
+- [ ] Provide an optional Prometheus collector that registers into an existing registry.
+- [ ] Do not bind an HTTP `/metrics` server by default.
+- [ ] Keep standalone metrics serving behind an explicit deployment command and port.
+- [ ] Use stable metric names and bounded labels; never put request ids, prompts, generated text, or
+  arbitrary model metadata in labels.
+- [ ] Keep diagnostic and metrics values consistent by deriving both from the same terminal record.
+
+## Validation
+
+- [ ] Test successful, failed, cancelled, expired, superseded, dropped, and disconnected records.
+- [ ] Test concurrent operations for identity isolation and one terminal observation each.
+- [ ] Test exporters with no vLLM or GPU dependency.
+- [ ] Include observation evidence in wire E2E and GPU benchmark artifacts.
