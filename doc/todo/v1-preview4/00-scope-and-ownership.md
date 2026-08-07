@@ -32,6 +32,20 @@
   `09-conformance-and-vllm-integration.md`.
 - [ ] Assign benchmark, workflow, README, and final export integration to
   `10-benchmarks-packaging-and-docs.md`.
+- [ ] Assign adoption experiments, value thresholds, and capability evidence to
+  `11-adoption-value-and-overdesign-gate.md`.
+
+## Delivery Tiers
+
+- [ ] Treat native serving, direct vLLM binding, partial results, cancellation, abort, deadlines,
+  backpressure, credits, traces, drop diagnostics, and independent wire E2E as the core delivery
+  loop.
+- [ ] Advertise priority updates, route hints, runtime objects, and cache references only when the
+  adapter can name and test the concrete vLLM mechanism that applies them.
+- [ ] Keep KV-cache identity integration, standalone metrics serving, and backend-specific scheduler
+  extensions optional until each has an implemented mechanism and independent evidence.
+- [ ] Distinguish an installable vLLM version from a tested compatibility binding in every package,
+  diagnostic, document, and release claim.
 
 ## Completion Discipline
 
@@ -40,3 +54,6 @@
 - [ ] Keep parent checkboxes open until every listed child behavior and test is complete.
 - [ ] Run the full local CI contract before each commit is pushed.
 - [ ] Require remote CI and configured AI review before merging a pull request.
+- [ ] Require every advertised capability to have a real backend mechanism, an observable effect,
+  an independent benchmark scenario, and a quantitative acceptance threshold.
+- [ ] Keep capabilities without that evidence out of release claims and mandatory release gates.

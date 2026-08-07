@@ -18,13 +18,15 @@ HTTP/SSE endpoint.
 - [ ] [08 - Observability and exporters](08-observability-and-exporters.md)
 - [ ] [09 - Conformance and vLLM integration](09-conformance-and-vllm-integration.md)
 - [ ] [10 - Benchmarks, packaging, and docs](10-benchmarks-packaging-and-docs.md)
+- [ ] [11 - Adoption value and overdesign gate](11-adoption-value-and-overdesign-gate.md)
 
 ## Frozen Delivery Rules
 
 - The protocol baseline is NNRP/1 Preview4 and the API profile is `openai-compatible/1` Level 1.
 - The adapter consumes `nnrp-py>=1.0.0rc4.post14,<1.0.0rc5`; it does not preserve Preview3 SDK entrypoints.
-- The declared vLLM range is `>=0.18.0,<0.27`. Contract tests cover every minor line and real GPU
-  smoke covers `0.18.1`, `0.22.1`, and `0.26.0`.
+- The declared vLLM installation range is `>=0.18.0,<0.27`; it is not a blanket support claim.
+  Tested compatibility anchors are `0.18.1`, `0.22.1`, and `0.26.0`, and runtime diagnostics use
+  the same binding registry as the published compatibility table.
 - OpenAI-compatible request and profile-event bodies remain JSON as frozen by the profile. Runtime
   control, object, cache, flow, and diagnostics semantics use typed NNRP frames, never JSON control
   envelopes.
@@ -34,6 +36,8 @@ HTTP/SSE endpoint.
   provider composition and vLLM integration, not provider implementations.
 - Unsupported mandatory control semantics fail explicitly and affect advertised capabilities. They
   are never silently ignored.
+- An advertised capability must map to a real vLLM mechanism, produce an observable effect, pass an
+  independent benchmark scenario, and satisfy its quantitative acceptance threshold.
 - Mock backends prove mapping logic only. Release evidence requires an independent wire peer and a
   real vLLM process on the named GPU matrix.
 - A workstream is checked here only when every checkbox in its linked document is complete.
