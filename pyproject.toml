@@ -25,7 +25,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "nnrp-py>=1.0.0rc3.post2",
+  "nnrp-py>=1.0.0rc3.post2,<1.0.0rc4",
 ]
 
 [project.scripts]
