@@ -19,6 +19,8 @@ EXPECTED_PUBLIC_API = {
     "OPENAI_COMPATIBLE_SCHEMA_VERSION",
     "NNRP_PY_REQUIRED_RANGE",
     "BenchmarkConfig",
+    "NnrpServeStatistics",
+    "NnrpServerConfig",
     "NnrpRuntimeContractError",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
@@ -34,6 +36,7 @@ EXPECTED_PUBLIC_API = {
     "create_chat_completion_request",
     "create_vllm_backend",
     "run_benchmark",
+    "serve",
     "validate_nnrp_runtime_contract",
 }
 
@@ -47,6 +50,13 @@ EXPECTED_ENTRYPOINT_SIGNATURES = {
     "OpenAiNnrpCapabilityDocument": "(compatibility_levels: 'tuple[int, ...]', "
     "operations: 'tuple[dict[str, Any], ...]', models: 'tuple[dict[str, Any], ...]' = ()) -> None",
     "OpenAiNnrpError": "(error_type: 'str', code: 'str', message: 'str') -> 'None'",
+    "NnrpServeStatistics": "(accepted_sessions: 'int', accepted_operations: 'int', partial_results: 'int', "
+    "terminal_results: 'int') -> None",
+    "NnrpServerConfig": "(endpoint: 'str', provider_routes: 'Mapping[str, NativeServerProviderRoute]' = <factory>, "
+    "transport_policy: 'TransportPolicy' = <TransportPolicy.AUTO: 0>, "
+    "session_options: 'NativeServerSessionOptions' = <factory>, "
+    "accept_timeout_ms: 'int' = 100, receive_timeout_ms: 'int' = 100, max_active_sessions: 'int' = 8, "
+    "max_operations_per_session: 'int' = 4, native_worker_count: 'int' = 9) -> None",
     "VllmBackend": "(serving_chat: 'object', *, request_factory: 'object | None' = None, "
     "prefer_engine_direct: 'bool' = True) -> 'None'",
     "build_cancelled_event": "(reason: 'str' = 'client_cancelled') -> 'dict[str, Any]'",
@@ -59,6 +69,8 @@ EXPECTED_ENTRYPOINT_SIGNATURES = {
     "create_chat_completion_request": "(body: 'Mapping[str, Any]') -> 'object'",
     "create_vllm_backend": "(serving_chat: 'object') -> 'VllmBackend'",
     "run_benchmark": "(*, backend: 'ChatCompletionBackend', config: 'BenchmarkConfig') -> 'dict[str, Any]'",
+    "serve": "(adapter: 'OpenAiNnrpAdapter', *, config: 'NnrpServerConfig', "
+    "stop_event: 'asyncio.Event | None' = None) -> 'NnrpServeStatistics'",
     "validate_nnrp_runtime_contract": "(*, installed_version: 'str | None' = None) -> 'str'",
 }
 
@@ -105,8 +117,7 @@ def test_public_surface_contains_only_application_facing_entrypoints() -> None:
     assert "run_embedded_tcp_server" not in vllm_nnrp_adapter.__all__
 
     actual_signatures = {
-        name: str(inspect.signature(getattr(vllm_nnrp_adapter, name)))
-        for name in EXPECTED_ENTRYPOINT_SIGNATURES
+        name: str(inspect.signature(getattr(vllm_nnrp_adapter, name))) for name in EXPECTED_ENTRYPOINT_SIGNATURES
     }
     assert actual_signatures == EXPECTED_ENTRYPOINT_SIGNATURES
 

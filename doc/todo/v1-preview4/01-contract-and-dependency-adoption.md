@@ -17,7 +17,7 @@
 - [x] Keep `OpenAiNnrpAdapter` as the profile mapper and `OpenAiNnrpCapabilityDocument` as the
   profile capability document.
 - [x] Keep `create_vllm_backend` as the explicit serving-object binding entrypoint.
-- [ ] Replace TCP-specific production startup with one provider-neutral `serve` entrypoint accepting
+- [x] Replace TCP-specific production startup with one provider-neutral `serve` entrypoint accepting
   an `nnrp://` or `nnrps://` application endpoint and provider routes.
 - [x] Keep explicit test helpers separate from production exports.
 - [x] Export only application-facing typed APIs; do not export FFI handles, raw message codes, or

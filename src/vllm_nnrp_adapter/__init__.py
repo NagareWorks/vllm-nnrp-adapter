@@ -1,6 +1,7 @@
 from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark
 from .nnrp_contract import NNRP_PY_REQUIRED_RANGE, NnrpRuntimeContractError, validate_nnrp_runtime_contract
+from .nnrp_runtime import NnrpServerConfig, NnrpServeStatistics, serve
 from .profile import (
     OPENAI_COMPATIBLE_PROFILE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -22,6 +23,8 @@ __all__ = [
     "OPENAI_COMPATIBLE_SCHEMA_VERSION",
     "NNRP_PY_REQUIRED_RANGE",
     "BenchmarkConfig",
+    "NnrpServeStatistics",
+    "NnrpServerConfig",
     "NnrpRuntimeContractError",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
@@ -37,5 +40,6 @@ __all__ = [
     "create_chat_completion_request",
     "create_vllm_backend",
     "run_benchmark",
+    "serve",
     "validate_nnrp_runtime_contract",
 ]
