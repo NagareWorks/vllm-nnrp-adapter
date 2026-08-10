@@ -33,7 +33,7 @@
 
 ## Documentation
 
-- [ ] Update README and usage examples from `serve-tcp` to provider-neutral native server startup.
+- [x] Update README and usage examples from `serve-tcp` to provider-neutral native server startup.
 - [ ] Document application endpoints, provider routes, security, single-provider selection, and
   multi-provider probing.
 - [ ] Document cancellation, abort, deadlines, priorities, budgets, progress, pressure, capability

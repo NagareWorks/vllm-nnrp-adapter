@@ -3,7 +3,7 @@
 ## Provider-Neutral Startup
 
 - [x] Replace `serve-tcp` with `serve` accepting one `nnrp://` or `nnrps://` application endpoint.
-- [ ] Accept explicit TCP, QUIC, IPC, and WebSocket provider routes with provider-local locators and
+- [x] Accept explicit TCP, QUIC, IPC, and WebSocket provider routes with provider-local locators and
   security material.
 - [ ] Pass an explicit provider registry through to `listen_native_server` when supplied; otherwise
   use official installed-provider discovery.
@@ -18,7 +18,7 @@
   transport-scoped native artifact.
 - [x] Keep adapter, client, server, and profile packages free of hidden provider artifacts.
 - [ ] Treat unavailable bindings as diagnostics and never bind them.
-- [ ] Keep `unix://`, `npipe://`, `ws://`, and `wss://` locators inside provider routes while public
+- [x] Keep `unix://`, `npipe://`, `ws://`, and `wss://` locators inside provider routes while public
   application endpoints remain `nnrp://` or `nnrps://`.
 - [ ] Fail the logical server atomically when mandatory provider listeners cannot be established.
 

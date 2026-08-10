@@ -1,6 +1,7 @@
 # vLLM NNRP Adapter Usage
 
-This document records the preview3 runtime shape for host installs, vLLM containers, adapter startup, and OpenAI API profile conformance.
+This document records the Preview4 native-role runtime shape for host installs, vLLM containers,
+adapter startup, and OpenAI API profile conformance.
 
 ## Host Installation
 
@@ -65,80 +66,53 @@ def make_backend():
 
 The vLLM wrapper converts profile request bodies into `ChatCompletionRequest` at runtime and calls `create_chat_completion`.
 
-## Embedded vLLM Process Server
+## Native NNRP Server
 
-Run the NNRP profile server beside the vLLM serving stack when a factory can return the active
-`OpenAIServingChat`-compatible object:
+Run the profile server beside vLLM with one application endpoint and one or more provider-local
+routes. The installed `nnrp-py` provider packages own listener discovery, carrier behavior, and
+native artifacts.
 
 ```bash
-vllm-nnrp-adapter serve-tcp \
-  --serving-factory my_vllm_app.serving:make_serving_chat \
-  --host 0.0.0.0 \
-  --port 7766 \
-  --active-model-name example-model
+vllm-nnrp-adapter serve \
+  --backend my_vllm_app.serving:make_backend \
+  --endpoint nnrp://runtime.example/vllm \
+  --provider-route tcp=tcp://0.0.0.0:7766 \
+  --provider-route ipc=unix:///run/nnrp-vllm.sock \
+  --transport-policy auto
 ```
 
-For in-process integration, call the embedded runner from the code that already owns the vLLM serving object:
+For in-process integration, construct typed routes and call the same provider-neutral runtime:
 
 ```python
 import asyncio
 
-from vllm_nnrp_adapter import EmbeddedTcpServerConfig, run_embedded_tcp_server
+from nnrp import TransportPolicy
+from nnrp.server import NativeServerProviderRoute
+from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
 
 
-async def start_nnrp_profile_server(serving_chat):
-    await run_embedded_tcp_server(
-        serving_chat,
-        config=EmbeddedTcpServerConfig(
-            host="0.0.0.0",
-            port=7766,
-            active_model_name="example-model",
+async def start_nnrp_profile_server(backend):
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.example/vllm",
+            provider_routes={
+                "tcp": NativeServerProviderRoute(provider_endpoint="tcp://0.0.0.0:7766"),
+            },
+            transport_policy=TransportPolicy.FORCE_TCP,
         ),
     )
 
 
-asyncio.create_task(start_nnrp_profile_server(openai_serving_chat))
+asyncio.create_task(start_nnrp_profile_server(backend))
 ```
 
-The normal streaming chat path prefers vLLM engine output directly and falls back to vLLM OpenAI serving chunks for complex features that still need vLLM's OpenAI stream machinery.
+The application endpoint stays `nnrp://` or `nnrps://`. Carrier locators such as `tcp://`,
+`quic://`, `unix://`, `npipe://`, `ws://`, and `wss://` appear only inside provider routes.
 
-## NNRP Server Binding
-
-Use `nnrp-py` server sessions for transport and frame ownership. The adapter bridge only translates the OpenAI profile event stream into `RESULT_PUSH` frames:
-
-```python
-import json
-
-from nnrp.client import TypedPayload
-from vllm_nnrp_adapter import NnrpFrameContext, OpenAiNnrpAdapter, decode_profile_event
-from vllm_nnrp_adapter import emit_openai_profile_results
-
-
-async def handle_submit(server_session, backend):
-    adapter = OpenAiNnrpAdapter(backend)
-    submit = await server_session.receive_submit()
-    request = json.loads(submit.request.typed_payloads[0].payload.decode("utf-8"))
-
-    await emit_openai_profile_results(
-        adapter,
-        server_session,
-        request,
-        frame=NnrpFrameContext(
-            frame_id=submit.request.frame_id,
-            view_id=submit.request.view_id,
-            route_id=submit.request.route_id,
-            trace_id=submit.packet.header.trace_id,
-        ),
-    )
-
-
-async def consume_result(client_session):
-    result = await client_session.receive_result()
-    event = decode_profile_event(result.structured_events[0])
-    return event
-```
-
-The submit payload is the request envelope shown below, encoded as a `TypedPayload.structured_event(...)` by the caller. Streaming deltas, usage events, tool-call deltas, errors, cancellation, and completion are returned as structured result payloads. Terminal profile events are emitted as complete NNRP results.
+The native role receives operation bodies directly. Ordered non-terminal profile events are sent as
+`PARTIAL_RESULT`; exactly one `response.completed`, `response.error`, or `response.cancelled` event
+completes the operation through terminal `RESULT_PUSH`.
 
 ## Conformance
 

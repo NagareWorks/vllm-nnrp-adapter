@@ -90,6 +90,23 @@ The adapter consumes JSON-compatible request envelopes and emits JSON-compatible
 Normal streaming events are partial results; `response.completed`, `response.error`, and
 `response.cancelled` are terminal profile events.
 
+## Native Server Quick Start
+
+Start the adapter with an NNRP application endpoint and explicit provider-local routes:
+
+```bash
+vllm-nnrp-adapter serve \
+  --backend my_vllm_app.serving:make_backend \
+  --endpoint nnrp://runtime.example/vllm \
+  --provider-route tcp=tcp://0.0.0.0:7766 \
+  --provider-route ipc=unix:///run/nnrp-vllm.sock \
+  --transport-policy auto
+```
+
+The adapter does not implement carriers or package native provider artifacts. Installed `nnrp-py`
+transport distributions own TCP, QUIC, IPC, and WebSocket listeners; the adapter passes typed
+routes and policy to the native server role.
+
 ## Conformance Smoke
 
 `nnrp-conformance` owns OpenAI NNRP API profile plan and result schemas. This adapter consumes the generated plan and writes the result report:
