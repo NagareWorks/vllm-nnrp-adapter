@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+import threading
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -25,6 +26,26 @@ class StreamingBackend:
         return events()
 
 
+class InterleavingBackend:
+    def __init__(self, expected_operations: int) -> None:
+        self._expected_operations = expected_operations
+        self._all_started = asyncio.Event()
+        self.started: list[str] = []
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        async def events() -> AsyncIterator[Mapping[str, Any]]:
+            model = str(body["model"])
+            self.started.append(model)
+            if len(self.started) == self._expected_operations:
+                self._all_started.set()
+            await asyncio.wait_for(self._all_started.wait(), timeout=1)
+            yield {"choices": [{"index": 0, "delta": {"content": f"{model}:1"}}]}
+            await asyncio.sleep(0)
+            yield {"choices": [{"index": 0, "delta": {"content": f"{model}:2"}}]}
+
+        return events()
+
+
 @dataclass
 class FakeOperation:
     operation_id: int
@@ -32,8 +53,10 @@ class FakeOperation:
     body: bytes
     metadata: FrameSubmitMetadata
     terminal_results: list[tuple[ResultPushMetadata, bytes]]
+    native_thread_ids: list[int] = field(default_factory=list)
 
     def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
+        self.native_thread_ids.append(threading.get_ident())
         self.terminal_results.append((metadata, body))
 
 
@@ -47,12 +70,45 @@ class FakeSession:
         self.closed = False
 
     def receive_submit(self, *, timeout_ms: int = 0, max_events: int = 1) -> FakeOperation:
+        self._operation.native_thread_ids.append(threading.get_ident())
         assert timeout_ms == 10
         assert max_events == 1
         if not self._delivered:
             self._delivered = True
             return self._operation
         self._stop_event.set()
+        raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
+
+    def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
+        self._operation.native_thread_ids.append(threading.get_ident())
+        self.partial_results.append((metadata, body))
+
+    def close(self) -> None:
+        self._operation.native_thread_ids.append(threading.get_ident())
+        self.closed = True
+
+
+class MultiOperationFakeSession:
+    def __init__(
+        self,
+        operations: list[FakeOperation],
+        *,
+        operation_accepted: Callable[[], None],
+    ) -> None:
+        self.active_transport_name = "ipc"
+        self._pending = list(operations)
+        self._operation_accepted = operation_accepted
+        self.partial_results: list[tuple[PartialResultMetadata, bytes]] = []
+        self.closed = False
+
+    def receive_submit(self, *, timeout_ms: int = 0, max_events: int = 1) -> FakeOperation:
+        assert timeout_ms == 10
+        assert max_events == 1
+        if self._pending:
+            operation = self._pending.pop(0)
+            operation.native_thread_ids.append(threading.get_ident())
+            self._operation_accepted()
+            return operation
         raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
 
     def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
@@ -75,6 +131,18 @@ class FakeServer:
             raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
         self._accepted = True
         return self._session
+
+
+class MultiSessionFakeServer:
+    def __init__(self, sessions: list[MultiOperationFakeSession]) -> None:
+        self._pending = list(sessions)
+
+    def accept(self, options: NativeServerAcceptOptions | None = None) -> MultiOperationFakeSession:
+        assert options is not None
+        assert options.timeout_ms == 10
+        if self._pending:
+            return self._pending.pop(0)
+        raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
 
 
 class FakeServerContext:
@@ -140,6 +208,8 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
     assert session.closed is True
     assert server_context.exited is True
+    assert operation.native_thread_ids
+    assert threading.get_ident() not in operation.native_thread_ids
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1:7766", "unix:///tmp/nnrp.sock", "ws://host/nnrp"])
@@ -185,12 +255,79 @@ async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pyte
     assert json.loads(body)["error"]["code"] == "invalid_submit_body"
 
 
-def _chat_request() -> dict[str, Any]:
+@pytest.mark.asyncio
+async def test_native_server_runs_sessions_and_operations_concurrently_with_per_operation_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    operations = [
+        FakeOperation(
+            operation_id=operation_id,
+            frame_id=operation_id + 100,
+            body=json.dumps(_chat_request(model=f"model-{operation_id}")).encode("utf-8"),
+            metadata=_submit_metadata(operation_id=operation_id),
+            terminal_results=[],
+        )
+        for operation_id in range(1, 5)
+    ]
+    accepted_operations = 0
+
+    def operation_accepted() -> None:
+        nonlocal accepted_operations
+        accepted_operations += 1
+        if accepted_operations == len(operations):
+            loop.call_soon_threadsafe(stop_event.set)
+
+    sessions = [
+        MultiOperationFakeSession(operations[:2], operation_accepted=operation_accepted),
+        MultiOperationFakeSession(operations[2:], operation_accepted=operation_accepted),
+    ]
+    server_context = FakeServerContext(MultiSessionFakeServer(sessions))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        lambda _options: server_context,
+    )
+    backend = InterleavingBackend(expected_operations=len(operations))
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=2,
+            max_operations_per_session=2,
+            native_worker_count=8,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_sessions == 2
+    assert statistics.accepted_operations == 4
+    assert statistics.partial_results == 8
+    assert statistics.terminal_results == 4
+    assert set(backend.started) == {f"model-{operation_id}" for operation_id in range(1, 5)}
+    for session in sessions:
+        results_by_operation: dict[int, list[tuple[PartialResultMetadata, bytes]]] = {}
+        for metadata, body in session.partial_results:
+            results_by_operation.setdefault(metadata.operation_id, []).append((metadata, body))
+        for operation_id, results in results_by_operation.items():
+            assert [metadata.result_sequence for metadata, _body in results] == [1, 2]
+            assert [json.loads(body)["delta"] for _metadata, body in results] == [
+                f"model-{operation_id}:1",
+                f"model-{operation_id}:2",
+            ]
+        assert session.closed is True
+    assert all(len(operation.terminal_results) == 1 for operation in operations)
+
+
+def _chat_request(*, model: str = "mock-model") -> dict[str, Any]:
     return {
         "schema_version": "openai-compatible/1",
         "operation": "chat.completions.create",
         "body": {
-            "model": "mock-model",
+            "model": model,
             "messages": [{"role": "user", "content": "hello"}],
             "stream": True,
         },
