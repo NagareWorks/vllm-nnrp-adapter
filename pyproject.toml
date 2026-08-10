@@ -25,7 +25,8 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "nnrp-py>=1.0.0rc3.post2,<1.0.0rc4",
+  "nnrp-py>=1.0.0rc4.post14,<1.0.0rc5",
+  "packaging>=24.0",
 ]
 
 [project.scripts]
@@ -69,7 +70,3 @@ python_version = "3.11"
 warn_unused_configs = true
 strict = true
 packages = ["vllm_nnrp_adapter"]
-
-[[tool.mypy.overrides]]
-module = "nnrp.*"
-ignore_missing_imports = true

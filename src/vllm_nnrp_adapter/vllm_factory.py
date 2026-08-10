@@ -4,6 +4,7 @@ import importlib
 from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
+from .nnrp_contract import validate_nnrp_runtime_contract
 from .vllm_backend import VllmBackend
 
 CHAT_COMPLETION_REQUEST_PATHS = (
@@ -28,6 +29,7 @@ def create_chat_completion_request(body: Mapping[str, Any]) -> object:
 
 
 def create_vllm_backend(serving_chat: object) -> VllmBackend:
+    validate_nnrp_runtime_contract()
     return VllmBackend(serving_chat, request_factory=create_chat_completion_request)
 
 

@@ -1,25 +1,6 @@
 from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark
-from .embedded import (
-    EmbeddedTcpServerConfig,
-    create_embedded_openai_adapter,
-    load_serving_chat_factory,
-    run_embedded_tcp_server,
-    run_embedded_tcp_server_sync,
-    serve_embedded_tcp_listener,
-)
-from .nnrp_runtime import (
-    EmittedNnrpResult,
-    NnrpFrameContext,
-    decode_profile_event,
-    decode_submit_profile_request,
-    emit_openai_profile_results,
-    emit_profile_event,
-    encode_profile_event,
-    frame_context_from_submit,
-    handle_openai_profile_submit,
-    serve_openai_profile_session,
-)
+from .nnrp_contract import NNRP_PY_REQUIRED_RANGE, NnrpRuntimeContractError, validate_nnrp_runtime_contract
 from .profile import (
     OPENAI_COMPATIBLE_PROFILE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -39,10 +20,9 @@ from .vllm_factory import create_chat_completion_request, create_vllm_backend
 __all__ = [
     "OPENAI_COMPATIBLE_PROFILE",
     "OPENAI_COMPATIBLE_SCHEMA_VERSION",
+    "NNRP_PY_REQUIRED_RANGE",
     "BenchmarkConfig",
-    "EmittedNnrpResult",
-    "EmbeddedTcpServerConfig",
-    "NnrpFrameContext",
+    "NnrpRuntimeContractError",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
     "OpenAiNnrpError",
@@ -55,19 +35,7 @@ __all__ = [
     "build_text_delta_event",
     "build_usage_event",
     "create_chat_completion_request",
-    "create_embedded_openai_adapter",
     "create_vllm_backend",
-    "decode_profile_event",
-    "decode_submit_profile_request",
-    "emit_openai_profile_results",
-    "emit_profile_event",
-    "encode_profile_event",
-    "frame_context_from_submit",
-    "handle_openai_profile_submit",
-    "load_serving_chat_factory",
     "run_benchmark",
-    "run_embedded_tcp_server",
-    "run_embedded_tcp_server_sync",
-    "serve_embedded_tcp_listener",
-    "serve_openai_profile_session",
+    "validate_nnrp_runtime_contract",
 ]

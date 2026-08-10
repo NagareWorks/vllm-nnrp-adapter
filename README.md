@@ -38,12 +38,12 @@ The adapter declares compatibility with `vllm>=0.18.0,<0.23`. The first CI basel
 
 - `src/vllm_nnrp_adapter/profile.py`: frozen profile constants, request envelope validation, event builders, and capability document helpers.
 - `src/vllm_nnrp_adapter/adapter.py`: profile-level async request handler that maps backend responses to NNRP profile events.
-- `src/vllm_nnrp_adapter/nnrp_runtime.py`: NNRP server-session bridge that emits profile events as structured `RESULT_PUSH` payloads.
+- `src/vllm_nnrp_adapter/nnrp_contract.py`: Preview4 `nnrp-py` version and native-role contract validation.
 - `src/vllm_nnrp_adapter/vllm_backend.py`: vLLM serving-object wrapper and method probing.
 - `src/vllm_nnrp_adapter/conformance.py`: OpenAI NNRP API conformance plan executor and result writer.
 - `conformance/openai-api-capabilities.json`: Level 1 capability declaration consumed by `nnrp-conformance`.
 - `tests/`: profile and adapter mapping tests that do not require a GPU runtime.
-- `doc/todo/v1-preview3/`: preview3 implementation checklist for the adapter.
+- `doc/todo/v1-preview4/`: Preview4 implementation checklist for the adapter.
 
 ## Development
 
@@ -86,28 +86,9 @@ events = [
 ]
 ```
 
-The adapter consumes JSON-compatible request envelopes and emits JSON-compatible profile events. `nnrp_runtime` binds those events to `nnrp-py` server sessions by sending each event as a `STRUCTURED_EVENT` typed payload in a `RESULT_PUSH` frame. Normal streaming events are partial results; `response.completed`, `response.error`, and `response.cancelled` are terminal profile events emitted as complete results.
-
-```python
-import json
-
-from vllm_nnrp_adapter import NnrpFrameContext, emit_openai_profile_results
-
-submit = await server_session.receive_submit()
-request = json.loads(submit.request.typed_payloads[0].payload.decode("utf-8"))
-
-await emit_openai_profile_results(
-    adapter,
-    server_session,
-    request,
-    frame=NnrpFrameContext(
-        frame_id=submit.request.frame_id,
-        view_id=submit.request.view_id,
-        route_id=submit.request.route_id,
-        trace_id=submit.packet.header.trace_id,
-    ),
-)
-```
+The adapter consumes JSON-compatible request envelopes and emits JSON-compatible profile events.
+Normal streaming events are partial results; `response.completed`, `response.error`, and
+`response.cancelled` are terminal profile events.
 
 ## Conformance Smoke
 
