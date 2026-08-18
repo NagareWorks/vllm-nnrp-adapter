@@ -17,6 +17,11 @@ Install the vLLM extra only on a host or container that can actually import and 
 python -m pip install "vllm-nnrp-adapter[vllm]"
 ```
 
+The extra permits `vllm>=0.18.0,<0.27` to resolve, while production startup accepts only the named,
+feature-probed families in the [generated compatibility table](vllm-compatibility.md). An untested
+minor line inside the installation interval fails at startup instead of falling through to an
+accidental import or method match.
+
 For local development:
 
 ```bash

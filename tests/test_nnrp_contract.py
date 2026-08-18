@@ -129,6 +129,7 @@ def test_project_dependency_metadata_requires_preview4_without_native_payloads()
 
     assert "nnrp-py>=1.0.0rc4.post14,<1.0.0rc5" in dependencies
     assert all("rc3" not in dependency for dependency in dependencies)
+    assert metadata["project"]["optional-dependencies"]["vllm"] == ["vllm>=0.18.0,<0.27"]
 
     native_suffixes = {".dll", ".dylib", ".so", ".wasm"}
     packaged_native_files = [

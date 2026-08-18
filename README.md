@@ -32,7 +32,10 @@ Level 2 `responses.create` and Level 3 model discovery / embeddings are explicit
 
 ## Supported vLLM Line
 
-The adapter declares compatibility with `vllm>=0.18.0,<0.23`. The first CI baseline should exercise `0.18.1` and the current stable line separately. `0.18.0` remains in the supported range because it is the first version in the selected support band, while `0.18.1` is the preferred lower-bound test target.
+The optional dependency accepts `vllm>=0.18.0,<0.27` for installation. This is not blanket support
+for every minor release in that interval. Runtime binding is limited to the feature-probed `0.18.x`,
+`0.22.x`, and `0.26.x` families, anchored at `0.18.1`, `0.22.1`, and `0.26.0`. See the
+[generated compatibility table](doc/vllm-compatibility.md).
 
 ## Layout
 
@@ -159,7 +162,7 @@ only.
 | `backend_overload` | vLLM reported overload, rate limit, or too many queued requests. | Treat it as scheduler pressure and retry according to the caller policy. |
 | `scheduler_rejected` | The vLLM scheduler rejected the request path. | Check model capacity, admission policy, and active queue depth. |
 | `backend_cancelled` | vLLM reported an abort/cancel path. | Check whether the NNRP caller cancelled the frame or whether vLLM aborted internally. |
-| `vLLM serving object does not expose a supported chat completion method` | The installed vLLM version or wrapper object does not match the selected backend boundary. | Use `vllm>=0.18.0,<0.23` and pass an `OpenAIServingChat`-compatible object to `create_vllm_backend`. |
+| `vLLM compatibility check failed` | The installed version has no named binding, or its serving object is missing a required feature. | Use a family listed in the generated compatibility table and pass its `OpenAIServingChat` object to `create_vllm_backend`. |
 
 Set `nnrp.diagnostics=true` in the request envelope to emit a `response.diagnostics` event with selected model, operation, and backend family before the request result stream.
 

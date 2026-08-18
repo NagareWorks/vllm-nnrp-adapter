@@ -219,6 +219,30 @@ def test_server_config_rejects_provider_locator_as_application_endpoint(endpoint
 
 
 @pytest.mark.asyncio
+async def test_production_entrypoint_rejects_preview3_packet_session() -> None:
+    class Preview3PacketSession:
+        pass
+
+    with pytest.raises(TypeError, match="OpenAiNnrpAdapter Preview4"):
+        await serve(  # type: ignore[arg-type]
+            Preview3PacketSession(),
+            config=NnrpServerConfig(endpoint="nnrp://runtime.local/vllm"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_production_entrypoint_rejects_preview3_runtime_config() -> None:
+    class Preview3RuntimeConfig:
+        pass
+
+    with pytest.raises(TypeError, match="NnrpServerConfig Preview4"):
+        await serve(  # type: ignore[arg-type]
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=Preview3RuntimeConfig(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pytest.MonkeyPatch) -> None:
     stop_event = asyncio.Event()
     operation = FakeOperation(

@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 from .nnrp_contract import validate_nnrp_runtime_contract
 from .vllm_backend import VllmBackend
-
-CHAT_COMPLETION_REQUEST_PATHS = (
-    "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest",
-    "vllm.entrypoints.openai.protocol:ChatCompletionRequest",
-)
+from .vllm_compat import resolve_vllm_compatibility
 
 
 class RequestConstructor(Protocol):
@@ -18,8 +15,22 @@ class RequestConstructor(Protocol):
         pass
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundRequestFactory:
+    request_type: object
+    compatibility_binding: str
+    vllm_version: str
+
+    def __call__(self, body: Mapping[str, Any]) -> object:
+        return _construct_request(self.request_type, body)
+
+
 def create_chat_completion_request(body: Mapping[str, Any]) -> object:
-    request_type = _load_first_symbol(CHAT_COMPLETION_REQUEST_PATHS)
+    _detected_version, _binding, request_type = resolve_vllm_compatibility()
+    return _construct_request(request_type, body)
+
+
+def _construct_request(request_type: object, body: Mapping[str, Any]) -> object:
     payload = dict(body)
     model_validate = getattr(request_type, "model_validate", None)
     if callable(model_validate):
@@ -30,7 +41,13 @@ def create_chat_completion_request(body: Mapping[str, Any]) -> object:
 
 def create_vllm_backend(serving_chat: object) -> VllmBackend:
     validate_nnrp_runtime_contract()
-    return VllmBackend(serving_chat, request_factory=create_chat_completion_request)
+    detected_version, binding, request_type = resolve_vllm_compatibility(serving_chat)
+    request_factory = _BoundRequestFactory(
+        request_type=request_type,
+        compatibility_binding=binding.name,
+        vllm_version=detected_version,
+    )
+    return VllmBackend(serving_chat, request_factory=request_factory)
 
 
 def create_backend_from_serving_factory(factory_spec: str) -> VllmBackend:
@@ -47,13 +64,3 @@ def _load_symbol(spec: str) -> object:
 
     module = importlib.import_module(module_name)
     return getattr(module, symbol_name)
-
-
-def _load_first_symbol(specs: tuple[str, ...]) -> object:
-    errors: list[str] = []
-    for spec in specs:
-        try:
-            return _load_symbol(spec)
-        except (AttributeError, ModuleNotFoundError) as error:
-            errors.append(f"{spec}: {error}")
-    raise ModuleNotFoundError("could not load vLLM ChatCompletionRequest from supported paths: " + "; ".join(errors))

@@ -114,6 +114,7 @@ jobs:
         run: |
           ruff check .
           mypy
+          python scripts/generate_vllm_compatibility_table.py --check
           pytest \
             --cov=src/vllm_nnrp_adapter \
             --cov-report=xml:artifacts/coverage/coverage.xml \
@@ -128,6 +129,7 @@ jobs:
       - name: Build distributions
         run: |
           python -m build
+          python scripts/check_distribution_metadata.py dist
           python -m twine check dist/*
 
       - name: Upload workflow artifacts

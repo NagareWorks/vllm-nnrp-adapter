@@ -6,9 +6,17 @@ from typing import Any
 
 import pytest
 
+from vllm_nnrp_adapter.vllm_compat import (
+    VLLM_COMPATIBILITY_BINDINGS,
+    VLLM_INSTALLATION_RANGE,
+    VllmCompatibilityError,
+    render_vllm_compatibility_table,
+    resolve_vllm_compatibility,
+)
 from vllm_nnrp_adapter.vllm_factory import (
     create_backend_from_serving_factory,
     create_chat_completion_request,
+    create_vllm_backend,
 )
 
 
@@ -30,36 +38,76 @@ def make_serving_chat() -> FakeServingChat:
     return FakeServingChat()
 
 
-@pytest.fixture
-def fake_vllm_protocol_module(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture(autouse=True)
+def fake_vllm_installation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("vllm_nnrp_adapter.vllm_compat._installed_vllm_version", lambda: "0.26.0")
     module = ModuleType("vllm.entrypoints.openai.chat_completion.protocol")
     module.ChatCompletionRequest = FakeChatCompletionRequest
     monkeypatch.setitem(sys.modules, "vllm.entrypoints.openai.chat_completion.protocol", module)
 
 
-def test_create_chat_completion_request_uses_vllm_model_validate(fake_vllm_protocol_module: None) -> None:
+def test_create_chat_completion_request_uses_vllm_model_validate() -> None:
     request = create_chat_completion_request({"model": "llama", "messages": []})
 
     assert isinstance(request, FakeChatCompletionRequest)
     assert request.payload["model"] == "llama"
 
 
-def test_create_chat_completion_request_falls_back_to_legacy_vllm_protocol(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = ModuleType("vllm.entrypoints.openai.protocol")
-    module.ChatCompletionRequest = FakeChatCompletionRequest
-    monkeypatch.setitem(sys.modules, "vllm.entrypoints.openai.protocol", module)
+@pytest.mark.parametrize(
+    ("installed_version", "binding_name"),
+    (("0.18.1", "legacy-0.18"), ("0.22.1", "transition-0.22"), ("0.26.0", "current-0.26")),
+)
+def test_compatibility_anchors_select_named_bindings(installed_version: str, binding_name: str) -> None:
+    detected, binding, request_type = resolve_vllm_compatibility(
+        FakeServingChat(),
+        installed_version=installed_version,
+    )
 
-    request = create_chat_completion_request({"model": "llama", "messages": []})
+    assert detected == installed_version
+    assert binding.name == binding_name
+    assert request_type is FakeChatCompletionRequest
 
-    assert isinstance(request, FakeChatCompletionRequest)
-    assert request.payload["model"] == "llama"
+
+def test_backend_records_selected_binding_and_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("vllm_nnrp_adapter.vllm_compat._installed_vllm_version", lambda: "0.22.1")
+
+    backend = create_vllm_backend(FakeServingChat())
+
+    assert backend.compatibility_binding == "transition-0.22"
+    assert backend.vllm_version == "0.22.1"
+
+
+def test_compatibility_rejects_untested_minor_inside_installation_band() -> None:
+    with pytest.raises(VllmCompatibilityError) as captured:
+        resolve_vllm_compatibility(FakeServingChat(), installed_version="0.20.0")
+
+    message = str(captured.value)
+    assert "detected version 0.20.0" in message
+    assert "missing feature: named compatibility binding" in message
+    assert "tested anchors: 0.18.1, 0.22.1, 0.26.0" in message
+
+
+def test_compatibility_rejects_missing_serving_feature() -> None:
+    with pytest.raises(VllmCompatibilityError, match=r"missing feature: serving_chat\.create_chat_completion"):
+        resolve_vllm_compatibility(object(), installed_version="0.26.0")
+
+
+def test_compatibility_rejects_version_outside_installation_band() -> None:
+    with pytest.raises(VllmCompatibilityError, match=VLLM_INSTALLATION_RANGE.replace(".", r"\.")):
+        resolve_vllm_compatibility(FakeServingChat(), installed_version="0.27.0")
+
+
+def test_generated_compatibility_table_comes_from_runtime_registry() -> None:
+    table = render_vllm_compatibility_table()
+
+    for binding in VLLM_COMPATIBILITY_BINDINGS:
+        assert binding.name in table
+        assert binding.anchor_version in table
+        assert binding.version_range in table
 
 
 @pytest.mark.asyncio
 async def test_create_backend_from_serving_factory_wraps_real_request_factory(
-    fake_vllm_protocol_module: None,
 ) -> None:
     backend = create_backend_from_serving_factory(f"{__name__}:make_serving_chat")
 

@@ -106,6 +106,10 @@ async def serve(
     config: NnrpServerConfig,
     stop_event: asyncio.Event | None = None,
 ) -> NnrpServeStatistics:
+    if not isinstance(adapter, OpenAiNnrpAdapter):
+        raise TypeError("adapter must be an OpenAiNnrpAdapter Preview4 profile mapper")
+    if not isinstance(config, NnrpServerConfig):
+        raise TypeError("config must be an NnrpServerConfig Preview4 native-role configuration")
     validate_nnrp_runtime_contract()
     shutdown = stop_event or asyncio.Event()
     counters = _ServeCounters()

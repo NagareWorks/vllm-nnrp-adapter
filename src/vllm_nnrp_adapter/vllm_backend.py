@@ -28,6 +28,16 @@ class VllmBackend:
         self._request_factory = request_factory
         self._prefer_engine_direct = prefer_engine_direct
 
+    @property
+    def compatibility_binding(self) -> str | None:
+        value = getattr(self._request_factory, "compatibility_binding", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def vllm_version(self) -> str | None:
+        value = getattr(self._request_factory, "vllm_version", None)
+        return value if isinstance(value, str) else None
+
     async def create_chat_completion(self, body: Mapping[str, Any]) -> Any:
         request = self._build_request(body)
         if self._prefer_engine_direct and _supports_engine_direct(self._serving_chat, request, body):

@@ -8,7 +8,7 @@ HTTP/SSE endpoint.
 ## Workstreams
 
 - [ ] [00 - Scope and ownership](00-scope-and-ownership.md)
-- [ ] [01 - Contract and dependency adoption](01-contract-and-dependency-adoption.md)
+- [x] [01 - Contract and dependency adoption](01-contract-and-dependency-adoption.md)
 - [ ] [02 - vLLM version and backend bindings](02-vllm-version-and-backend-bindings.md)
 - [ ] [03 - Native server and session lifecycle](03-native-server-and-session-lifecycle.md)
 - [ ] [04 - Runtime control mapping](04-runtime-control-mapping.md)

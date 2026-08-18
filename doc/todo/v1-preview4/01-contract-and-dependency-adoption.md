@@ -29,6 +29,6 @@
 - [x] Add import tests against the installed Preview4 `nnrp-py` package rather than repository-local
   protocol doubles.
 - [x] Add public-signature tests for every exported adapter entrypoint.
-- [ ] Add negative tests proving Preview3 runtime objects and packet sessions are rejected by the
+- [x] Add negative tests proving Preview3 runtime objects and packet sessions are rejected by the
   production entrypoint.
-- [ ] Add dependency metadata tests that reject a release artifact carrying the old `rc3` range.
+- [x] Add dependency metadata tests that reject a release artifact carrying the old `rc3` range.

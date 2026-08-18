@@ -15,8 +15,8 @@
 
 ## Module Ownership
 
-- [ ] Assign dependency and public export changes to `01-contract-and-dependency-adoption.md`.
-- [ ] Assign vLLM serving-object compatibility to `vllm_backend.py` and `vllm_factory.py` under
+- [x] Assign dependency and public export changes to `01-contract-and-dependency-adoption.md`.
+- [x] Assign vLLM serving-object compatibility to `vllm_backend.py` and `vllm_factory.py` under
   `02-vllm-version-and-backend-bindings.md`.
 - [ ] Assign native role/session orchestration to `nnrp_runtime.py` under
   `03-native-server-and-session-lifecycle.md`.
@@ -44,7 +44,7 @@
   adapter can name and test the concrete vLLM mechanism that applies them.
 - [ ] Keep KV-cache identity integration, standalone metrics serving, and backend-specific scheduler
   extensions optional until each has an implemented mechanism and independent evidence.
-- [ ] Distinguish an installable vLLM version from a tested compatibility binding in every package,
+- [x] Distinguish an installable vLLM version from a tested compatibility binding in every package,
   diagnostic, document, and release claim.
 
 ## Completion Discipline
