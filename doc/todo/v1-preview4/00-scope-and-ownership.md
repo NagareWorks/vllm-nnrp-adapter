@@ -20,7 +20,7 @@
   `02-vllm-version-and-backend-bindings.md`.
 - [x] Assign native role/session orchestration to `nnrp_runtime.py` under
   `03-native-server-and-session-lifecycle.md`.
-- [ ] Add a dedicated runtime-control module owned by `04-runtime-control-mapping.md`.
+- [x] Add a dedicated runtime-control module owned by `04-runtime-control-mapping.md`.
 - [ ] Add a dedicated runtime-object/cache module owned by
   `05-runtime-objects-cache-and-payloads.md`.
 - [ ] Assign CLI and provider composition to `embedded.py`, `cli.py`, and a provider-serving module

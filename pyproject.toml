@@ -25,7 +25,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "nnrp-py>=1.0.0rc4.post14,<1.0.0rc5",
+  "nnrp-py>=1.0.0rc4.post15,<1.0.0rc5",
   "packaging>=24.0",
 ]
 
@@ -53,6 +53,15 @@ Documentation = "https://nagareworks.github.io/nnrp-doc/en/design/openai-compati
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_nnrp_adapter"]
+
+[tool.hatch.build]
+exclude = [
+  "/.ci-venv",
+  "/.venv",
+  "/artifacts",
+  "/build",
+  "/dist",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

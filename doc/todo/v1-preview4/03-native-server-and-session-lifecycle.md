@@ -10,7 +10,7 @@
   `NativeRuntimeServerSession.send_partial_result` with a monotonically increasing result sequence.
 - [x] Send terminal success exactly once through `NativeRuntimeServerOperation.send_result`; never
   use `send_result` for an intermediate streaming event because it completes the native operation.
-- [ ] Poll wire and lifecycle events through `poll_event` or the coarse `poll_events` batch surface.
+- [x] Poll wire and lifecycle events through `poll_event` or the coarse `poll_events` batch surface.
 - [x] Run blocking native calls on a bounded adapter-owned worker path so the vLLM event loop remains
   responsive.
 - [ ] Preserve connection, session, operation, frame, route, view, trace, and active-profile identity

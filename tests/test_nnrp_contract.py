@@ -101,7 +101,42 @@ def test_contract_rejects_missing_preview4_symbol(monkeypatch: pytest.MonkeyPatc
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="nnrp.server.NativeServer"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post14")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post15")
+
+
+def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    import nnrp
+
+    class OldNativeRuntimeServerOperation:
+        def send_partial_result(self) -> None:
+            pass
+
+        def send_result(self) -> None:
+            pass
+
+        def send_result_drop(self) -> None:
+            pass
+
+    old_nnrp = SimpleNamespace(
+        **{
+            name: getattr(nnrp, name)
+            for name in (
+                "NativeRuntimeServerSession",
+                "NativeTransportEndpoint",
+                "NnrpEndpoint",
+                "TransportPolicy",
+            )
+        },
+        NativeRuntimeServerOperation=OldNativeRuntimeServerOperation,
+    )
+    real_import = __import__
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_contract.import_module",
+        lambda module_name: old_nnrp if module_name == "nnrp" else real_import(module_name, fromlist=["*"]),
+    )
+
+    with pytest.raises(NnrpRuntimeContractError, match="incompatible Preview4 native role contract"):
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post15")
 
 
 def test_contract_rejects_versions_outside_preview4_range() -> None:
@@ -127,7 +162,7 @@ def test_project_dependency_metadata_requires_preview4_without_native_payloads()
     metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = metadata["project"]["dependencies"]
 
-    assert "nnrp-py>=1.0.0rc4.post14,<1.0.0rc5" in dependencies
+    assert "nnrp-py>=1.0.0rc4.post15,<1.0.0rc5" in dependencies
     assert all("rc3" not in dependency for dependency in dependencies)
     assert metadata["project"]["optional-dependencies"]["vllm"] == ["vllm>=0.18.0,<0.27"]
 

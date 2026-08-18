@@ -9,9 +9,19 @@ from typing import Any
 
 import pytest
 from nnrp import NativeWouldBlockError
-from nnrp.core import FrameSubmitMetadata, InputProfile, PayloadKind, ResultClass, ResultPushMetadata
+from nnrp.core import FrameSubmitMetadata, InputProfile, MessageType, PayloadKind, ResultClass, ResultPushMetadata
 from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
-from nnrp.runtime import PartialResultMetadata
+from nnrp.runtime import (
+    ControlRequestMetadata,
+    NativeRuntimeEvent,
+    PartialResultMetadata,
+    ResultDropReasonMetadata,
+    RuntimeEventMetadata,
+    RuntimeEventMetadataKind,
+    RuntimeEventTail,
+    RuntimeFrameHeader,
+    RuntimeRole,
+)
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
@@ -51,6 +61,25 @@ class InterleavingBackend:
         return events()
 
 
+class CancellableBackend:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.closed = threading.Event()
+        self._release = asyncio.Event()
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        async def events() -> AsyncIterator[Mapping[str, Any]]:
+            self.started.set()
+            try:
+                yield {"choices": [{"index": 0, "delta": {"content": "first"}}]}
+                await self._release.wait()
+                yield {"choices": [{"index": 0, "delta": {"content": "late"}}]}
+            finally:
+                self.closed.set()
+
+        return events()
+
+
 @dataclass
 class FakeOperation:
     operation_id: int
@@ -59,10 +88,32 @@ class FakeOperation:
     metadata: FrameSubmitMetadata
     terminal_results: list[tuple[ResultPushMetadata, bytes]]
     native_thread_ids: list[int] = field(default_factory=list)
+    partial_results: list[tuple[PartialResultMetadata, bytes]] = field(default_factory=list)
+    result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
 
-    def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
-        self.native_thread_ids.append(threading.get_ident())
+    async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
         self.terminal_results.append((metadata, body))
+
+    async def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
+        self.partial_results.append((metadata, body))
+
+    async def send_result_drop(self, metadata: ResultDropReasonMetadata, diagnostic: bytes = b"") -> None:
+        self.result_drops.append((metadata, diagnostic))
+
+
+@dataclass(frozen=True)
+class FakeServerEvent:
+    submit: FakeOperation | None = None
+    runtime: NativeRuntimeEvent | None = None
+
+    def as_submit(self) -> FakeOperation | None:
+        return self.submit
+
+    def as_runtime(self) -> NativeRuntimeEvent | None:
+        return self.runtime
+
+    def as_lifecycle(self) -> None:
+        return None
 
 
 class FakeSession:
@@ -71,22 +122,18 @@ class FakeSession:
         self._operation = operation
         self._stop_event = stop_event
         self._delivered = False
-        self.partial_results: list[tuple[PartialResultMetadata, bytes]] = []
+        self.partial_results = operation.partial_results
         self.closed = False
 
-    def receive_submit(self, *, timeout_ms: int = 0, max_events: int = 1) -> FakeOperation:
+    def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
         self._operation.native_thread_ids.append(threading.get_ident())
         assert timeout_ms == 10
         assert max_events == 1
         if not self._delivered:
             self._delivered = True
-            return self._operation
+            return (FakeServerEvent(submit=self._operation),)
         self._stop_event.set()
-        raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
-
-    def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
-        self._operation.native_thread_ids.append(threading.get_ident())
-        self.partial_results.append((metadata, body))
+        return ()
 
     def close(self) -> None:
         self._operation.native_thread_ids.append(threading.get_ident())
@@ -104,20 +151,50 @@ class MultiOperationFakeSession:
         self._pending = list(operations)
         self._operation_accepted = operation_accepted
         self.partial_results: list[tuple[PartialResultMetadata, bytes]] = []
+        for operation in operations:
+            operation.partial_results = self.partial_results
         self.closed = False
 
-    def receive_submit(self, *, timeout_ms: int = 0, max_events: int = 1) -> FakeOperation:
+    def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
         assert timeout_ms == 10
         assert max_events == 1
         if self._pending:
             operation = self._pending.pop(0)
             operation.native_thread_ids.append(threading.get_ident())
             self._operation_accepted()
-            return operation
-        raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
+            return (FakeServerEvent(submit=operation),)
+        return ()
 
-    def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
-        self.partial_results.append((metadata, body))
+    def close(self) -> None:
+        self.closed = True
+
+
+class ScriptedEventSession:
+    def __init__(
+        self,
+        events: list[FakeServerEvent],
+        *,
+        operation: FakeOperation,
+        backend_started: threading.Event,
+        stop_event: asyncio.Event,
+    ) -> None:
+        self.active_transport_name = "ipc"
+        self._events = list(events)
+        self._operation = operation
+        self._backend_started = backend_started
+        self._stop_event = stop_event
+        self.closed = False
+
+    def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
+        assert timeout_ms == 10
+        assert max_events == 1
+        if self._events:
+            event = self._events.pop(0)
+            if event.runtime is not None:
+                assert self._backend_started.wait(timeout=1)
+            return (event,)
+        self._stop_event.set()
+        return ()
 
     def close(self) -> None:
         self.closed = True
@@ -129,7 +206,7 @@ class FakeServer:
         self._accepted = False
         self.closed = False
 
-    def accept(self, options: NativeServerAcceptOptions | None = None) -> FakeSession:
+    async def accept(self, options: NativeServerAcceptOptions | None = None) -> FakeSession:
         assert options is not None
         assert options.timeout_ms == 10
         if self._accepted:
@@ -139,10 +216,10 @@ class FakeServer:
 
 
 class MultiSessionFakeServer:
-    def __init__(self, sessions: list[MultiOperationFakeSession]) -> None:
+    def __init__(self, sessions: list[Any]) -> None:
         self._pending = list(sessions)
 
-    def accept(self, options: NativeServerAcceptOptions | None = None) -> MultiOperationFakeSession:
+    async def accept(self, options: NativeServerAcceptOptions | None = None) -> Any:
         assert options is not None
         assert options.timeout_ms == 10
         if self._pending:
@@ -400,6 +477,78 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
     duplicate_event = json.loads(operations[1].terminal_results[0][1])
     assert duplicate_event["type"] == "response.error"
     assert duplicate_event["error"]["code"] == "duplicate_operation_id"
+
+
+@pytest.mark.parametrize(("message_type", "expect_drop"), [(MessageType.CANCEL, False), (MessageType.ABORT, True)])
+@pytest.mark.asyncio
+async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    message_type: MessageType,
+    expect_drop: bool,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=101,
+        frame_id=201,
+        body=json.dumps(_chat_request()).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=101),
+        terminal_results=[],
+    )
+    control = _control_event(message_type, operation_id=101, sequence=1)
+    session = ScriptedEventSession(
+        [FakeServerEvent(submit=operation), FakeServerEvent(runtime=control)],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_operations == 1
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert [json.loads(body)["delta"] for _metadata, body in operation.partial_results] == ["first"]
+    if expect_drop:
+        assert operation.terminal_results == []
+        assert len(operation.result_drops) == 1
+        assert operation.result_drops[0][0].operation_id == 101
+    else:
+        assert operation.result_drops == []
+        assert len(operation.terminal_results) == 1
+        assert json.loads(operation.terminal_results[0][1]) == {
+            "reason": "peer_cancelled",
+            "type": "response.cancelled",
+        }
+
+
+def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:
+    metadata = ControlRequestMetadata(
+        operation_id=operation_id,
+        control_sequence=sequence,
+        reason_code=3,
+        source_role=RuntimeRole.CLIENT,
+        flags=0,
+        diagnostic_bytes=len(b"obsolete"),
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=message_type, session_id=1, frame_id=201),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.CONTROL_REQUEST, metadata),
+        RuntimeEventTail.with_body(b"obsolete"),
+    )
 
 
 def _chat_request(*, model: str = "mock-model") -> dict[str, Any]:

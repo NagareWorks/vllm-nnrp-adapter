@@ -16,7 +16,13 @@ from nnrp import (  # type: ignore[import-untyped]
     TransportPolicy,
 )
 from nnrp.core import ResultClass, ResultFlags, ResultPushMetadata  # type: ignore[import-untyped]
-from nnrp.runtime import PartialResultMetadata  # type: ignore[import-untyped]
+from nnrp.runtime import (  # type: ignore[import-untyped]
+    NativeRuntimeEvent,
+    PartialResultMetadata,
+    ResultDropReasonCode,
+    ResultDropReasonMetadata,
+    RuntimeRole,
+)
 from nnrp.server import (  # type: ignore[import-untyped]
     NativeServerAcceptOptions,
     NativeServerBootstrapOptions,
@@ -28,6 +34,14 @@ from nnrp.server import (  # type: ignore[import-untyped]
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
+from .profile import build_cancelled_event
+from .runtime_control import (
+    OperationControlSlot,
+    RuntimeControlDisposition,
+    RuntimeControlKind,
+    RuntimeControlRegistry,
+    decode_operation_control,
+)
 
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "response.cancelled"})
 _T = TypeVar("_T")
@@ -79,6 +93,9 @@ class _ServeCounters:
     accepted_operations: int = 0
     partial_results: int = 0
     terminal_results: int = 0
+    result_drops: int = 0
+    applied_control_events: int = 0
+    rejected_control_events: int = 0
 
     def snapshot(self) -> NnrpServeStatistics:
         return NnrpServeStatistics(
@@ -133,10 +150,7 @@ async def serve(
                 await _wait_for_task_or_shutdown(sessions, shutdown)
                 continue
             try:
-                session = await native.call(
-                    server.accept,
-                    NativeServerAcceptOptions(timeout_ms=config.accept_timeout_ms),
-                )
+                session = await server.accept(NativeServerAcceptOptions(timeout_ms=config.accept_timeout_ms))
             except NativeWouldBlockError:
                 continue
             counters.accepted_sessions += 1
@@ -165,18 +179,39 @@ async def _serve_session(
 ) -> None:
     operations: set[asyncio.Task[None]] = set()
     registry = OperationRegistry()
+    controls = RuntimeControlRegistry()
     try:
         while not shutdown.is_set():
             _retire_completed_tasks(operations)
-            if len(operations) >= config.max_operations_per_session:
-                await _wait_for_task_or_shutdown(operations, shutdown)
-                continue
             try:
-                operation = await native.call(
-                    session.receive_submit,
+                events = await native.call(
+                    session.poll_events,
+                    max_events=1,
                     timeout_ms=config.receive_timeout_ms,
                 )
             except NativeWouldBlockError:
+                continue
+            if not events:
+                continue
+            event = events[0]
+            operation = event.as_submit()
+            if operation is None:
+                runtime_event = event.as_runtime()
+                if runtime_event is not None:
+                    await _handle_runtime_control(
+                        runtime_event,
+                        registry=registry,
+                        controls=controls,
+                        counters=counters,
+                    )
+                continue
+            if len(operations) >= config.max_operations_per_session:
+                capacity_event = _operation_capacity_event(config.max_operations_per_session)
+                await operation.send_result(
+                    _terminal_metadata(operation, capacity_event),
+                    _encode_event(capacity_event),
+                )
+                counters.terminal_results += 1
                 continue
             try:
                 record = registry.register(
@@ -186,20 +221,21 @@ async def _serve_session(
                 record.transition(OperationState.QUEUED)
             except OperationStateError as error:
                 event = _duplicate_operation_event(error)
-                await native.call(operation.send_result, _terminal_metadata(operation, event), _encode_event(event))
+                await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
                 counters.terminal_results += 1
                 continue
             counters.accepted_operations += 1
+            control = controls.register(operation.operation_id)
             task = asyncio.create_task(
                 _serve_operation(
                     adapter,
-                    session,
                     operation,
                     record=record,
-                    native=native,
+                    control=control,
                     counters=counters,
                 )
             )
+            control.bind(task)
             operations.add(task)
     except asyncio.CancelledError:
         await _finish_tasks(operations, cancel=True)
@@ -211,16 +247,16 @@ async def _serve_session(
             try:
                 await native.call(session.close)
             finally:
+                controls.clear()
                 registry.clear()
 
 
 async def _serve_operation(
     adapter: OpenAiNnrpAdapter,
-    session: NativeRuntimeServerSession,
     operation: NativeRuntimeServerOperation,
     *,
     record: OperationRecord,
-    native: _NativeCallExecutor,
+    control: OperationControlSlot,
     counters: _ServeCounters,
 ) -> None:
     result_sequence = 0
@@ -235,13 +271,12 @@ async def _serve_operation(
                 if _is_terminal_event(event):
                     record.terminate(_terminal_operation_state(event))
                     terminal_sent = True
-                    await native.call(operation.send_result, _terminal_metadata(operation, event), body)
+                    await operation.send_result(_terminal_metadata(operation, event), body)
                     counters.terminal_results += 1
                     break
                 record.mark_partial()
                 result_sequence += 1
-                await native.call(
-                    session.send_partial_result,
+                await operation.send_partial_result(
                     PartialResultMetadata(
                         operation_id=operation.operation_id,
                         result_sequence=result_sequence,
@@ -254,9 +289,34 @@ async def _serve_operation(
                 )
                 counters.partial_results += 1
         except asyncio.CancelledError:
-            if not record.is_terminal:
+            control_request = control.terminal_request
+            if control_request is None:
+                if not record.is_terminal:
+                    record.terminate(OperationState.CANCELLED)
+                raise
+            if control_request.kind is RuntimeControlKind.CANCEL:
+                event = build_cancelled_event("peer_cancelled")
                 record.terminate(OperationState.CANCELLED)
-            raise
+                await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
+                counters.terminal_results += 1
+            else:
+                record.terminate(OperationState.DROPPED)
+                diagnostic = control_request.diagnostic or b"peer_abort"
+                await operation.send_result_drop(
+                    ResultDropReasonMetadata(
+                        operation_id=operation.operation_id,
+                        result_sequence=max(1, result_sequence + 1),
+                        drop_reason_code=ResultDropReasonCode.PEER_CANCELLED,
+                        source_role=RuntimeRole.RUNTIME,
+                        flags=0,
+                        diagnostic_bytes=len(diagnostic),
+                    ),
+                    diagnostic,
+                )
+                counters.result_drops += 1
+                counters.terminal_results += 1
+            terminal_sent = True
+            return
         except Exception as error:
             if terminal_sent:
                 raise
@@ -268,11 +328,32 @@ async def _serve_operation(
         if not terminal_sent:
             record.terminate(_terminal_operation_state(event))
             terminal_sent = True
-            await native.call(operation.send_result, _terminal_metadata(operation, event), _encode_event(event))
+            await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
             counters.terminal_results += 1
     finally:
         if record.is_terminal and not record.resources_released:
             record.release_resources()
+
+
+async def _handle_runtime_control(
+    event: NativeRuntimeEvent,
+    *,
+    registry: OperationRegistry,
+    controls: RuntimeControlRegistry,
+    counters: _ServeCounters,
+) -> None:
+    request = decode_operation_control(event)
+    if request is None:
+        return
+    try:
+        terminal = registry.get(request.operation_id).is_terminal
+    except OperationStateError:
+        terminal = False
+    disposition = await controls.apply(request, terminal=terminal)
+    if disposition is RuntimeControlDisposition.APPLIED:
+        counters.applied_control_events += 1
+    else:
+        counters.rejected_control_events += 1
 
 
 def _decode_request(body: bytes) -> dict[str, Any]:
@@ -313,6 +394,17 @@ def _duplicate_operation_event(error: OperationStateError) -> dict[str, Any]:
             "type": "invalid_request_error",
             "code": "duplicate_operation_id",
             "message": str(error),
+        },
+    }
+
+
+def _operation_capacity_event(limit: int) -> dict[str, Any]:
+    return {
+        "type": "response.error",
+        "error": {
+            "type": "server_error",
+            "code": "adapter_operation_limit",
+            "message": f"Adapter session operation limit {limit} is active.",
         },
     }
 

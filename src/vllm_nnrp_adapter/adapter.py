@@ -81,6 +81,9 @@ class OpenAiNnrpAdapter:
                             await _close_async_iterator(chunks)
                             yield build_cancelled_event()
                             return
+                except asyncio.CancelledError:
+                    await _close_async_iterator(chunks)
+                    raise
                 except TimeoutError as error:
                     await _close_async_iterator(chunks)
                     raise error

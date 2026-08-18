@@ -13,7 +13,7 @@ from vllm_nnrp_adapter.distribution_metadata import (
 )
 
 
-def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post14,<1.0.0rc5") -> str:
+def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post15,<1.0.0rc5") -> str:
     return "\n".join(
         (
             "Metadata-Version: 2.4",
@@ -68,4 +68,15 @@ def test_validate_distribution_rejects_unknown_artifact(tmp_path) -> None:
     artifact.write_bytes(b"")
 
     with pytest.raises(DistributionMetadataError, match="unsupported distribution artifact"):
+        validate_distribution(artifact)
+
+
+@pytest.mark.parametrize("forbidden_path", [".ci-venv/Lib/site.py", "artifacts/coverage.xml", "dist/old.whl"])
+def test_validate_distribution_rejects_generated_paths(tmp_path, forbidden_path: str) -> None:
+    artifact = tmp_path / "adapter.whl"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("adapter.dist-info/METADATA", _metadata())
+        archive.writestr(forbidden_path, b"generated")
+
+    with pytest.raises(DistributionMetadataError, match="forbidden generated paths"):
         validate_distribution(artifact)

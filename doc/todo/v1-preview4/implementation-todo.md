@@ -23,7 +23,7 @@ HTTP/SSE endpoint.
 ## Frozen Delivery Rules
 
 - The protocol baseline is NNRP/1 Preview4 and the API profile is `openai-compatible/1` Level 1.
-- The adapter consumes `nnrp-py>=1.0.0rc4.post14,<1.0.0rc5`; it does not preserve Preview3 SDK entrypoints.
+- The adapter consumes `nnrp-py>=1.0.0rc4.post15,<1.0.0rc5`; it does not preserve Preview3 SDK entrypoints.
 - The declared vLLM installation range is `>=0.18.0,<0.27`; it is not a blanket support claim.
   Tested compatibility anchors are `0.18.1`, `0.22.1`, and `0.26.0`, and runtime diagnostics use
   the same binding registry as the published compatibility table.
