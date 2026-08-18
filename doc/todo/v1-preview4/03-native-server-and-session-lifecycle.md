@@ -18,15 +18,15 @@
 
 ## Operation State
 
-- [ ] Maintain one operation registry keyed by NNRP operation id and one backend request id per live
+- [x] Maintain one operation registry keyed by NNRP operation id and one backend request id per live
   operation.
-- [ ] Define explicit `accepted`, `queued`, `admitted`, `streaming`, `completed`, `cancelled`,
+- [x] Define explicit `accepted`, `queued`, `admitted`, `streaming`, `completed`, `cancelled`,
   `dropped`, and `failed` states.
-- [ ] Enforce legal state transitions and one terminal outcome.
-- [ ] Reject a second terminal send and any partial result emitted after the native operation has
+- [x] Enforce legal state transitions and one terminal outcome.
+- [x] Reject a second terminal send and any partial result emitted after the native operation has
   completed, cancelled, expired, superseded, dropped, or failed.
-- [ ] Reject duplicate operation ids without corrupting the existing operation.
-- [ ] Stop emitting profile events immediately after a terminal state.
+- [x] Reject duplicate operation ids without corrupting the existing operation.
+- [x] Stop emitting profile events immediately after a terminal state.
 - [ ] Release operation resources after success, error, cancellation, abort, expiration, disconnect,
   or server shutdown.
 

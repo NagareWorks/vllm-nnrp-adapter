@@ -304,6 +304,34 @@ async def test_adapter_maps_non_streaming_chat_body() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_passes_profile_request_id_to_backend_request() -> None:
+    class RequestIdBackend:
+        def __init__(self) -> None:
+            self.request_id: str | None = None
+
+        def create_chat_completion(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+            self.request_id = str(body["request_id"])
+            return {"choices": []}
+
+    backend = RequestIdBackend()
+    adapter = OpenAiNnrpAdapter(backend)
+
+    _events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "request_id": "request-profile-1",
+                "body": {"model": "llama", "messages": [{"role": "user", "content": "hello"}]},
+            }
+        )
+    ]
+
+    assert backend.request_id == "request-profile-1"
+
+
+@pytest.mark.asyncio
 async def test_adapter_emits_profile_error_for_bad_request() -> None:
     adapter = OpenAiNnrpAdapter(NonStreamingBackend())
 

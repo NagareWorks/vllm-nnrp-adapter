@@ -61,7 +61,11 @@ class OpenAiNnrpAdapter:
                     }
                 )
 
-            result = self._backend.create_chat_completion(envelope["body"])
+            backend_body = dict(envelope["body"])
+            request_id = envelope.get("request_id")
+            if request_id is not None:
+                backend_body["request_id"] = request_id
+            result = self._backend.create_chat_completion(backend_body)
             if inspect.isawaitable(result):
                 result = await _await_with_timeout(result, timeout_s)
 

@@ -18,7 +18,12 @@ from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
 
 
 class StreamingBackend:
+    def __init__(self) -> None:
+        self.requests: list[Mapping[str, Any]] = []
+
     def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        self.requests.append(body)
+
         async def events() -> AsyncIterator[Mapping[str, Any]]:
             yield {"choices": [{"index": 0, "delta": {"content": body["model"]}}]}
             yield {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
@@ -188,7 +193,8 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         native_worker_count=2,
     )
 
-    statistics = await serve(OpenAiNnrpAdapter(StreamingBackend()), config=config, stop_event=stop_event)
+    backend = StreamingBackend()
+    statistics = await serve(OpenAiNnrpAdapter(backend), config=config, stop_event=stop_event)
 
     assert statistics.accepted_sessions == 1
     assert statistics.accepted_operations == 1
@@ -210,6 +216,7 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert server_context.exited is True
     assert operation.native_thread_ids
     assert threading.get_ident() not in operation.native_thread_ids
+    assert backend.requests[0]["request_id"] == "nnrp-71-19"
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1:7766", "unix:///tmp/nnrp.sock", "ws://host/nnrp"])
@@ -344,6 +351,55 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
             ]
         assert session.closed is True
     assert all(len(operation.terminal_results) == 1 for operation in operations)
+
+
+@pytest.mark.asyncio
+async def test_native_server_rejects_duplicate_operation_without_corrupting_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    operations = [
+        FakeOperation(
+            operation_id=91,
+            frame_id=frame_id,
+            body=json.dumps(_chat_request()).encode("utf-8"),
+            metadata=_submit_metadata(operation_id=91),
+            terminal_results=[],
+        )
+        for frame_id in (191, 192)
+    ]
+    received = 0
+
+    def operation_received() -> None:
+        nonlocal received
+        received += 1
+        if received == len(operations):
+            loop.call_soon_threadsafe(stop_event.set)
+
+    session = MultiOperationFakeSession(operations, operation_accepted=operation_received)
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=2,
+            native_worker_count=4,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_operations == 1
+    assert statistics.terminal_results == 2
+    assert json.loads(operations[0].terminal_results[0][1])["type"] == "response.completed"
+    duplicate_event = json.loads(operations[1].terminal_results[0][1])
+    assert duplicate_event["type"] == "response.error"
+    assert duplicate_event["error"]["code"] == "duplicate_operation_id"
 
 
 def _chat_request(*, model: str = "mock-model") -> dict[str, Any]:

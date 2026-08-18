@@ -18,7 +18,7 @@
 - [x] Assign dependency and public export changes to `01-contract-and-dependency-adoption.md`.
 - [x] Assign vLLM serving-object compatibility to `vllm_backend.py` and `vllm_factory.py` under
   `02-vllm-version-and-backend-bindings.md`.
-- [ ] Assign native role/session orchestration to `nnrp_runtime.py` under
+- [x] Assign native role/session orchestration to `nnrp_runtime.py` under
   `03-native-server-and-session-lifecycle.md`.
 - [ ] Add a dedicated runtime-control module owned by `04-runtime-control-mapping.md`.
 - [ ] Add a dedicated runtime-object/cache module owned by

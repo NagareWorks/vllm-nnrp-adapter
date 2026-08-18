@@ -27,6 +27,7 @@ from nnrp.server import (  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
+from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
 
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "response.cancelled"})
 _T = TypeVar("_T")
@@ -163,6 +164,7 @@ async def _serve_session(
     counters: _ServeCounters,
 ) -> None:
     operations: set[asyncio.Task[None]] = set()
+    registry = OperationRegistry()
     try:
         while not shutdown.is_set():
             _retire_completed_tasks(operations)
@@ -176,8 +178,28 @@ async def _serve_session(
                 )
             except NativeWouldBlockError:
                 continue
+            try:
+                record = registry.register(
+                    operation.operation_id,
+                    _backend_request_id(operation.operation_id, operation.frame_id),
+                )
+                record.transition(OperationState.QUEUED)
+            except OperationStateError as error:
+                event = _duplicate_operation_event(error)
+                await native.call(operation.send_result, _terminal_metadata(operation, event), _encode_event(event))
+                counters.terminal_results += 1
+                continue
             counters.accepted_operations += 1
-            task = asyncio.create_task(_serve_operation(adapter, session, operation, native=native, counters=counters))
+            task = asyncio.create_task(
+                _serve_operation(
+                    adapter,
+                    session,
+                    operation,
+                    record=record,
+                    native=native,
+                    counters=counters,
+                )
+            )
             operations.add(task)
     except asyncio.CancelledError:
         await _finish_tasks(operations, cancel=True)
@@ -186,7 +208,10 @@ async def _serve_session(
         try:
             await _finish_tasks(operations, cancel=False)
         finally:
-            await native.call(session.close)
+            try:
+                await native.call(session.close)
+            finally:
+                registry.clear()
 
 
 async def _serve_operation(
@@ -194,46 +219,60 @@ async def _serve_operation(
     session: NativeRuntimeServerSession,
     operation: NativeRuntimeServerOperation,
     *,
+    record: OperationRecord,
     native: _NativeCallExecutor,
     counters: _ServeCounters,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
     try:
-        request = _decode_request(operation.body)
-        async for event in adapter.handle_request(request):
-            body = _encode_event(event)
-            if _is_terminal_event(event):
-                await native.call(operation.send_result, _terminal_metadata(operation, event), body)
-                counters.terminal_results += 1
-                terminal_sent = True
-                break
-            result_sequence += 1
-            await native.call(
-                session.send_partial_result,
-                PartialResultMetadata(
-                    operation_id=operation.operation_id,
-                    result_sequence=result_sequence,
-                    object_id=0,
-                    delta_sequence=result_sequence,
-                    body_bytes=len(body),
-                    flags=0,
-                ),
-                body,
-            )
-            counters.partial_results += 1
-    except Exception as error:
-        if terminal_sent:
+        try:
+            request = _decode_request(operation.body)
+            request.setdefault("request_id", record.backend_request_id)
+            record.transition(OperationState.ADMITTED)
+            async for event in adapter.handle_request(request):
+                body = _encode_event(event)
+                if _is_terminal_event(event):
+                    record.terminate(_terminal_operation_state(event))
+                    terminal_sent = True
+                    await native.call(operation.send_result, _terminal_metadata(operation, event), body)
+                    counters.terminal_results += 1
+                    break
+                record.mark_partial()
+                result_sequence += 1
+                await native.call(
+                    session.send_partial_result,
+                    PartialResultMetadata(
+                        operation_id=operation.operation_id,
+                        result_sequence=result_sequence,
+                        object_id=0,
+                        delta_sequence=result_sequence,
+                        body_bytes=len(body),
+                        flags=0,
+                    ),
+                    body,
+                )
+                counters.partial_results += 1
+        except asyncio.CancelledError:
+            if not record.is_terminal:
+                record.terminate(OperationState.CANCELLED)
             raise
-        event = _runtime_error_event(error)
-    else:
-        if terminal_sent:
-            return
-        event = _missing_terminal_event()
+        except Exception as error:
+            if terminal_sent:
+                raise
+            event = _runtime_error_event(error)
+        else:
+            if not terminal_sent:
+                event = _missing_terminal_event()
 
-    if not terminal_sent:
-        await native.call(operation.send_result, _terminal_metadata(operation, event), _encode_event(event))
-        counters.terminal_results += 1
+        if not terminal_sent:
+            record.terminate(_terminal_operation_state(event))
+            terminal_sent = True
+            await native.call(operation.send_result, _terminal_metadata(operation, event), _encode_event(event))
+            counters.terminal_results += 1
+    finally:
+        if record.is_terminal and not record.resources_released:
+            record.release_resources()
 
 
 def _decode_request(body: bytes) -> dict[str, Any]:
@@ -252,6 +291,30 @@ def _encode_event(event: Mapping[str, Any]) -> bytes:
 
 def _is_terminal_event(event: Mapping[str, Any]) -> bool:
     return event.get("type") in _TERMINAL_EVENT_TYPES
+
+
+def _terminal_operation_state(event: Mapping[str, Any]) -> OperationState:
+    event_type = event.get("type")
+    if event_type == "response.completed":
+        return OperationState.COMPLETED
+    if event_type == "response.cancelled":
+        return OperationState.CANCELLED
+    return OperationState.FAILED
+
+
+def _backend_request_id(operation_id: int, frame_id: int) -> str:
+    return f"nnrp-{operation_id}-{frame_id}"
+
+
+def _duplicate_operation_event(error: OperationStateError) -> dict[str, Any]:
+    return {
+        "type": "response.error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "duplicate_operation_id",
+            "message": str(error),
+        },
+    }
 
 
 def _terminal_metadata(
