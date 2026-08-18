@@ -17,6 +17,8 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
 class RuntimeControlKind(StrEnum):
     CANCEL = "cancel"
     ABORT = "abort"
+    PEER_DISCONNECT = "peer_disconnect"
+    SERVER_SHUTDOWN = "server_shutdown"
 
 
 class RuntimeControlDisposition(StrEnum):
@@ -82,6 +84,30 @@ class RuntimeControlRegistry:
         if slot is None:
             return RuntimeControlDisposition.UNKNOWN_OPERATION
         return await slot.apply(request, terminal=terminal)
+
+    async def terminate_all(
+        self,
+        kind: RuntimeControlKind,
+        *,
+        source_role: RuntimeRole,
+        diagnostic: bytes,
+    ) -> None:
+        for slot in self._slots.values():
+            task = slot.task
+            if task is None or task.done() or slot.terminal_request is not None:
+                continue
+            await slot.apply(
+                RuntimeControlRequest(
+                    kind=kind,
+                    operation_id=slot.operation_id,
+                    control_sequence=slot.last_control_sequence + 1,
+                    reason_code=0,
+                    source_role=source_role,
+                    flags=0,
+                    diagnostic=diagnostic,
+                ),
+                terminal=False,
+            )
 
     def clear(self) -> None:
         self._slots.clear()

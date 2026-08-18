@@ -15,7 +15,7 @@ from nnrp import (  # type: ignore[import-untyped]
     PayloadKind,
     TransportPolicy,
 )
-from nnrp.core import ResultClass, ResultFlags, ResultPushMetadata  # type: ignore[import-untyped]
+from nnrp.core import MessageType, ResultClass, ResultFlags, ResultPushMetadata  # type: ignore[import-untyped]
 from nnrp.runtime import (  # type: ignore[import-untyped]
     NativeRuntimeEvent,
     PartialResultMetadata,
@@ -160,11 +160,13 @@ async def serve(
             sessions.add(task)
     finally:
         try:
-            if server is not None:
-                await native.call(server_context.__exit__, None, None, None)
             await _finish_tasks(sessions, cancel=not shutdown.is_set())
         finally:
-            native.close()
+            try:
+                if server is not None:
+                    await native.call(server_context.__exit__, None, None, None)
+            finally:
+                native.close()
     return counters.snapshot()
 
 
@@ -198,6 +200,13 @@ async def _serve_session(
             if operation is None:
                 runtime_event = event.as_runtime()
                 if runtime_event is not None:
+                    if runtime_event.header.message_type is MessageType.SESSION_CLOSE:
+                        await controls.terminate_all(
+                            RuntimeControlKind.PEER_DISCONNECT,
+                            source_role=RuntimeRole.CLIENT,
+                            diagnostic=b"peer_disconnect",
+                        )
+                        break
                     await _handle_runtime_control(
                         runtime_event,
                         registry=registry,
@@ -238,10 +247,24 @@ async def _serve_session(
             control.bind(task)
             operations.add(task)
     except asyncio.CancelledError:
-        await _finish_tasks(operations, cancel=True)
+        await controls.terminate_all(
+            RuntimeControlKind.SERVER_SHUTDOWN,
+            source_role=RuntimeRole.SERVER,
+            diagnostic=b"server_shutdown",
+        )
+        await _finish_tasks(operations, cancel=False)
         raise
     finally:
         try:
+            if operations:
+                termination_kind = (
+                    RuntimeControlKind.SERVER_SHUTDOWN if shutdown.is_set() else RuntimeControlKind.PEER_DISCONNECT
+                )
+                await controls.terminate_all(
+                    termination_kind,
+                    source_role=(RuntimeRole.SERVER if shutdown.is_set() else RuntimeRole.CLIENT),
+                    diagnostic=termination_kind.value.encode("ascii"),
+                )
             await _finish_tasks(operations, cancel=False)
         finally:
             try:
@@ -299,14 +322,19 @@ async def _serve_operation(
                 record.terminate(OperationState.CANCELLED)
                 await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
                 counters.terminal_results += 1
-            else:
+            elif control_request.kind in {RuntimeControlKind.ABORT, RuntimeControlKind.SERVER_SHUTDOWN}:
                 record.terminate(OperationState.DROPPED)
                 diagnostic = control_request.diagnostic or b"peer_abort"
+                drop_reason = (
+                    ResultDropReasonCode.PEER_CANCELLED
+                    if control_request.kind is RuntimeControlKind.ABORT
+                    else ResultDropReasonCode.TRANSPORT_CLOSED
+                )
                 await operation.send_result_drop(
                     ResultDropReasonMetadata(
                         operation_id=operation.operation_id,
                         result_sequence=max(1, result_sequence + 1),
-                        drop_reason_code=ResultDropReasonCode.PEER_CANCELLED,
+                        drop_reason_code=drop_reason,
                         source_role=RuntimeRole.RUNTIME,
                         flags=0,
                         diagnostic_bytes=len(diagnostic),
@@ -315,6 +343,8 @@ async def _serve_operation(
                 )
                 counters.result_drops += 1
                 counters.terminal_results += 1
+            else:
+                record.terminate(OperationState.DROPPED)
             terminal_sent = True
             return
         except Exception as error:

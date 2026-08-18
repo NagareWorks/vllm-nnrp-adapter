@@ -13,14 +13,18 @@ from nnrp.core import FrameSubmitMetadata, InputProfile, MessageType, PayloadKin
 from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
 from nnrp.runtime import (
     ControlRequestMetadata,
+    InFlightPolicy,
     NativeRuntimeEvent,
     PartialResultMetadata,
+    ResultDropReasonCode,
     ResultDropReasonMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
     RuntimeFrameHeader,
     RuntimeRole,
+    SessionCloseMetadata,
+    SessionCloseReason,
 )
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
@@ -90,15 +94,20 @@ class FakeOperation:
     native_thread_ids: list[int] = field(default_factory=list)
     partial_results: list[tuple[PartialResultMetadata, bytes]] = field(default_factory=list)
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
+    on_terminal: Callable[[], None] | None = None
 
     async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
         self.terminal_results.append((metadata, body))
+        if self.on_terminal is not None:
+            self.on_terminal()
 
     async def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
         self.partial_results.append((metadata, body))
 
     async def send_result_drop(self, metadata: ResultDropReasonMetadata, diagnostic: bytes = b"") -> None:
         self.result_drops.append((metadata, diagnostic))
+        if self.on_terminal is not None:
+            self.on_terminal()
 
 
 @dataclass(frozen=True)
@@ -177,12 +186,15 @@ class ScriptedEventSession:
         operation: FakeOperation,
         backend_started: threading.Event,
         stop_event: asyncio.Event,
+        stop_after_last_event: bool = False,
     ) -> None:
         self.active_transport_name = "ipc"
         self._events = list(events)
         self._operation = operation
         self._backend_started = backend_started
         self._stop_event = stop_event
+        self._loop = asyncio.get_running_loop()
+        self._stop_after_last_event = stop_after_last_event
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -192,8 +204,9 @@ class ScriptedEventSession:
             event = self._events.pop(0)
             if event.runtime is not None:
                 assert self._backend_started.wait(timeout=1)
+            if not self._events and self._stop_after_last_event:
+                self._loop.call_soon_threadsafe(self._stop_event.set)
             return (event,)
-        self._stop_event.set()
         return ()
 
     def close(self) -> None:
@@ -368,7 +381,6 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
     operations = [
         FakeOperation(
             operation_id=operation_id,
@@ -379,17 +391,20 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         )
         for operation_id in range(1, 5)
     ]
-    accepted_operations = 0
+    completed_operations = 0
 
-    def operation_accepted() -> None:
-        nonlocal accepted_operations
-        accepted_operations += 1
-        if accepted_operations == len(operations):
-            loop.call_soon_threadsafe(stop_event.set)
+    def operation_completed() -> None:
+        nonlocal completed_operations
+        completed_operations += 1
+        if completed_operations == len(operations):
+            stop_event.set()
+
+    for operation in operations:
+        operation.on_terminal = operation_completed
 
     sessions = [
-        MultiOperationFakeSession(operations[:2], operation_accepted=operation_accepted),
-        MultiOperationFakeSession(operations[2:], operation_accepted=operation_accepted),
+        MultiOperationFakeSession(operations[:2], operation_accepted=lambda: None),
+        MultiOperationFakeSession(operations[2:], operation_accepted=lambda: None),
     ]
     server_context = FakeServerContext(MultiSessionFakeServer(sessions))
     monkeypatch.setattr(
@@ -496,6 +511,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
         terminal_results=[],
     )
     control = _control_event(message_type, operation_id=101, sequence=1)
+    operation.on_terminal = stop_event.set
     session = ScriptedEventSession(
         [FakeServerEvent(submit=operation), FakeServerEvent(runtime=control)],
         operation=operation,
@@ -535,6 +551,104 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
         }
 
 
+@pytest.mark.asyncio
+async def test_server_shutdown_drops_active_operation_before_closing_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=102,
+        frame_id=202,
+        body=json.dumps(_chat_request()).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=102),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [FakeServerEvent(submit=operation)],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    async def request_shutdown() -> None:
+        await asyncio.to_thread(backend.started.wait, 1)
+        stop_event.set()
+
+    shutdown_task = asyncio.create_task(request_shutdown())
+
+    try:
+        statistics = await serve(
+            OpenAiNnrpAdapter(backend),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=2,
+            ),
+            stop_event=stop_event,
+        )
+    finally:
+        await shutdown_task
+
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert len(operation.result_drops) == 1
+    assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.TRANSPORT_CLOSED
+    assert session.closed is True
+    assert server_context.exited is True
+
+
+@pytest.mark.asyncio
+async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=103,
+        frame_id=203,
+        body=json.dumps(_chat_request()).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=103),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(runtime=_session_close_event(last_operation_id=103)),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+        stop_after_last_event=True,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 0
+    assert backend.closed.is_set()
+    assert operation.terminal_results == []
+    assert operation.result_drops == []
+    assert session.closed is True
+
+
 def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:
     metadata = ControlRequestMetadata(
         operation_id=operation_id,
@@ -548,6 +662,22 @@ def _control_event(message_type: MessageType, *, operation_id: int, sequence: in
         RuntimeFrameHeader(message_type=message_type, session_id=1, frame_id=201),
         RuntimeEventMetadata(RuntimeEventMetadataKind.CONTROL_REQUEST, metadata),
         RuntimeEventTail.with_body(b"obsolete"),
+    )
+
+
+def _session_close_event(*, last_operation_id: int) -> NativeRuntimeEvent:
+    metadata = SessionCloseMetadata(
+        close_reason=SessionCloseReason.CLIENT_SHUTDOWN,
+        in_flight_policy=InFlightPolicy.ABORT,
+        drain_timeout_ms=0,
+        last_operation_id=last_operation_id,
+        session_error_code=0,
+        session_close_tag=1,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.SESSION_CLOSE, session_id=1),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SESSION_CLOSE, metadata),
+        RuntimeEventTail.none(),
     )
 
 

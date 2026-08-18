@@ -96,6 +96,27 @@ async def test_control_registry_rejects_unknown_duplicate_and_unbound_operations
     registry.clear()
 
 
+@pytest.mark.asyncio
+async def test_control_registry_terminates_every_bound_operation() -> None:
+    registry = RuntimeControlRegistry()
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    tasks = [asyncio.create_task(worker()) for _ in range(2)]
+    for operation_id, task in enumerate(tasks, start=1):
+        registry.register(operation_id).bind(task)
+
+    await registry.terminate_all(
+        RuntimeControlKind.SERVER_SHUTDOWN,
+        source_role=RuntimeRole.SERVER,
+        diagnostic=b"server_shutdown",
+    )
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(task.cancelled() for task in tasks)
+
+
 def _request(*, operation_id: int, sequence: int) -> RuntimeControlRequest:
     return RuntimeControlRequest(
         kind=RuntimeControlKind.CANCEL,
