@@ -27,7 +27,7 @@
   completed, cancelled, expired, superseded, dropped, or failed.
 - [x] Reject duplicate operation ids without corrupting the existing operation.
 - [x] Stop emitting profile events immediately after a terminal state.
-- [ ] Release operation resources after success, error, cancellation, abort, expiration, disconnect,
+- [x] Release operation resources after success, error, cancellation, abort, expiration, disconnect,
   or server shutdown.
 
 ## Concurrency And Shutdown

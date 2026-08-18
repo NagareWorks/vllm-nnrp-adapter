@@ -6,7 +6,7 @@
   terminal drop reason when no final profile event can be delivered.
 - [x] Map `ABORT` to immediate backend abort and suppress every later backend chunk.
 - [ ] Map `SUPERSEDE` to atomic old-operation cancellation and new-operation admission.
-- [ ] Map `DEADLINE` and `EXPIRE_AT` to absolute operation timers and discard stale backend output.
+- [x] Map `DEADLINE` and `EXPIRE_AT` to absolute operation timers and discard stale backend output.
 - [x] Preserve control sequence ordering and reject stale or duplicate updates.
 - [ ] Record cancellation source, reason code, backend acceptance, and terminal state.
 

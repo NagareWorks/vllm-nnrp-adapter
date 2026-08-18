@@ -40,6 +40,7 @@ from .runtime_control import (
     RuntimeControlDisposition,
     RuntimeControlKind,
     RuntimeControlRegistry,
+    decode_deadline_update,
     decode_operation_control,
 )
 
@@ -270,7 +271,7 @@ async def _serve_session(
             try:
                 await native.call(session.close)
             finally:
-                controls.clear()
+                await controls.clear()
                 registry.clear()
 
 
@@ -322,14 +323,18 @@ async def _serve_operation(
                 record.terminate(OperationState.CANCELLED)
                 await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
                 counters.terminal_results += 1
-            elif control_request.kind in {RuntimeControlKind.ABORT, RuntimeControlKind.SERVER_SHUTDOWN}:
+            elif control_request.kind in {
+                RuntimeControlKind.ABORT,
+                RuntimeControlKind.SERVER_SHUTDOWN,
+                RuntimeControlKind.DEADLINE_EXPIRED,
+            }:
                 record.terminate(OperationState.DROPPED)
                 diagnostic = control_request.diagnostic or b"peer_abort"
-                drop_reason = (
-                    ResultDropReasonCode.PEER_CANCELLED
-                    if control_request.kind is RuntimeControlKind.ABORT
-                    else ResultDropReasonCode.TRANSPORT_CLOSED
-                )
+                drop_reason = {
+                    RuntimeControlKind.ABORT: ResultDropReasonCode.PEER_CANCELLED,
+                    RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
+                    RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
+                }[control_request.kind]
                 await operation.send_result_drop(
                     ResultDropReasonMetadata(
                         operation_id=operation.operation_id,
@@ -361,8 +366,11 @@ async def _serve_operation(
             await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
             counters.terminal_results += 1
     finally:
-        if record.is_terminal and not record.resources_released:
-            record.release_resources()
+        try:
+            await control.complete()
+        finally:
+            if record.is_terminal and not record.resources_released:
+                record.release_resources()
 
 
 async def _handle_runtime_control(
@@ -373,13 +381,23 @@ async def _handle_runtime_control(
     counters: _ServeCounters,
 ) -> None:
     request = decode_operation_control(event)
-    if request is None:
+    deadline = None if request is not None else decode_deadline_update(event)
+    if request is None and deadline is None:
         return
+    if request is not None:
+        operation_id = request.operation_id
+    else:
+        assert deadline is not None
+        operation_id = deadline.operation_id
     try:
-        terminal = registry.get(request.operation_id).is_terminal
+        terminal = registry.get(operation_id).is_terminal
     except OperationStateError:
         terminal = False
-    disposition = await controls.apply(request, terminal=terminal)
+    if request is not None:
+        disposition = await controls.apply(request, terminal=terminal)
+    else:
+        assert deadline is not None
+        disposition = await controls.apply_deadline(deadline, terminal=terminal)
     if disposition is RuntimeControlDisposition.APPLIED:
         counters.applied_control_events += 1
     else:

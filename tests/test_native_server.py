@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +24,7 @@ from nnrp.runtime import (
     RuntimeEventTail,
     RuntimeFrameHeader,
     RuntimeRole,
+    SchedulingMetadata,
     SessionCloseMetadata,
     SessionCloseReason,
 )
@@ -114,6 +116,7 @@ class FakeOperation:
 class FakeServerEvent:
     submit: FakeOperation | None = None
     runtime: NativeRuntimeEvent | None = None
+    wait_for_backend: bool = False
 
     def as_submit(self) -> FakeOperation | None:
         return self.submit
@@ -202,7 +205,7 @@ class ScriptedEventSession:
         assert max_events == 1
         if self._events:
             event = self._events.pop(0)
-            if event.runtime is not None:
+            if event.wait_for_backend:
                 assert self._backend_started.wait(timeout=1)
             if not self._events and self._stop_after_last_event:
                 self._loop.call_soon_threadsafe(self._stop_event.set)
@@ -513,7 +516,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     control = _control_event(message_type, operation_id=101, sequence=1)
     operation.on_terminal = stop_event.set
     session = ScriptedEventSession(
-        [FakeServerEvent(submit=operation), FakeServerEvent(runtime=control)],
+        [FakeServerEvent(submit=operation), FakeServerEvent(runtime=control, wait_for_backend=True)],
         operation=operation,
         backend_started=backend.started,
         stop_event=stop_event,
@@ -619,7 +622,7 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     session = ScriptedEventSession(
         [
             FakeServerEvent(submit=operation),
-            FakeServerEvent(runtime=_session_close_event(last_operation_id=103)),
+            FakeServerEvent(runtime=_session_close_event(last_operation_id=103), wait_for_backend=True),
         ],
         operation=operation,
         backend_started=backend.started,
@@ -647,6 +650,62 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     assert operation.terminal_results == []
     assert operation.result_drops == []
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_deadline_update_stops_backend_and_drops_late_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=104,
+        frame_id=204,
+        body=json.dumps(_chat_request()).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=104),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    deadline = _deadline_event(
+        MessageType.DEADLINE,
+        operation_id=104,
+        sequence=1,
+        deadline_unix_ms=int(time.time() * 1000) - 1,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(runtime=deadline, wait_for_backend=True),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_operations == 1
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert [json.loads(body)["delta"] for _metadata, body in operation.partial_results] == ["first"]
+    assert operation.terminal_results == []
+    assert len(operation.result_drops) == 1
+    drop_metadata, diagnostic = operation.result_drops[0]
+    assert drop_metadata.drop_reason_code is ResultDropReasonCode.DEADLINE_EXPIRED
+    assert diagnostic == b"deadline_expired"
 
 
 def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:
@@ -677,6 +736,28 @@ def _session_close_event(*, last_operation_id: int) -> NativeRuntimeEvent:
     return NativeRuntimeEvent(
         RuntimeFrameHeader(message_type=MessageType.SESSION_CLOSE, session_id=1),
         RuntimeEventMetadata(RuntimeEventMetadataKind.SESSION_CLOSE, metadata),
+        RuntimeEventTail.none(),
+    )
+
+
+def _deadline_event(
+    message_type: MessageType,
+    *,
+    operation_id: int,
+    sequence: int,
+    deadline_unix_ms: int,
+) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=operation_id,
+        control_sequence=sequence,
+        priority_class=0,
+        priority_delta=0,
+        deadline_unix_ms=deadline_unix_ms,
+        flags=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=message_type, session_id=1),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
         RuntimeEventTail.none(),
     )
 

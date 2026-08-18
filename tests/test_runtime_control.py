@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from nnrp.core import MessageType
@@ -12,6 +13,7 @@ from nnrp.runtime import (
     RuntimeEventTail,
     RuntimeFrameHeader,
     RuntimeRole,
+    SchedulingMetadata,
 )
 
 from vllm_nnrp_adapter.runtime_control import (
@@ -20,6 +22,8 @@ from vllm_nnrp_adapter.runtime_control import (
     RuntimeControlKind,
     RuntimeControlRegistry,
     RuntimeControlRequest,
+    RuntimeDeadlineUpdate,
+    decode_deadline_update,
     decode_operation_control,
 )
 
@@ -50,6 +54,29 @@ def test_decode_operation_control_rejects_wrong_metadata_and_session_scope() -> 
 
     with pytest.raises(ValueError, match="non-zero operation_id"):
         decode_operation_control(_control_event(MessageType.CANCEL, operation_id=0, sequence=1))
+
+
+def test_decode_deadline_update_preserves_frozen_metadata() -> None:
+    update = decode_deadline_update(
+        _deadline_event(MessageType.EXPIRE_AT, operation_id=8, sequence=10, deadline_unix_ms=123_456)
+    )
+
+    assert update == RuntimeDeadlineUpdate(
+        operation_id=8,
+        control_sequence=10,
+        deadline_unix_ms=123_456,
+        flags=1,
+    )
+    assert decode_deadline_update(_runtime_event(MessageType.PROGRESS)) is None
+
+
+def test_decode_deadline_update_rejects_wrong_metadata_and_zero_values() -> None:
+    with pytest.raises(TypeError, match="DEADLINE requires SchedulingMetadata"):
+        decode_deadline_update(_runtime_event(MessageType.DEADLINE))
+    with pytest.raises(ValueError, match="non-zero operation_id"):
+        decode_deadline_update(_deadline_event(MessageType.DEADLINE, operation_id=0, sequence=1))
+    with pytest.raises(ValueError, match="non-zero deadline_unix_ms"):
+        decode_deadline_update(_deadline_event(MessageType.DEADLINE, operation_id=1, sequence=1, deadline_unix_ms=0))
 
 
 @pytest.mark.asyncio
@@ -93,7 +120,7 @@ async def test_control_registry_rejects_unknown_duplicate_and_unbound_operations
     )
     with pytest.raises(RuntimeError, match="does not have a bound task"):
         await slot.apply(_request(operation_id=21, sequence=1), terminal=False)
-    registry.clear()
+    await registry.clear()
 
 
 @pytest.mark.asyncio
@@ -115,6 +142,67 @@ async def test_control_registry_terminates_every_bound_operation() -> None:
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert all(task.cancelled() for task in tasks)
+
+
+@pytest.mark.asyncio
+async def test_deadline_arriving_before_submit_is_bound_and_expires_operation() -> None:
+    registry = RuntimeControlRegistry()
+    update = RuntimeDeadlineUpdate(
+        operation_id=31,
+        control_sequence=4,
+        deadline_unix_ms=int(time.time() * 1000) - 1,
+        flags=1,
+    )
+
+    assert await registry.apply_deadline(update, terminal=False) is RuntimeControlDisposition.APPLIED
+    slot = registry.register(31)
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(worker())
+    slot.bind(task)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert slot.terminal_request is not None
+    assert slot.terminal_request.kind is RuntimeControlKind.DEADLINE_EXPIRED
+    await registry.clear()
+
+
+@pytest.mark.asyncio
+async def test_deadline_update_reschedules_and_rejects_stale_sequence() -> None:
+    slot = OperationControlSlot(32)
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(worker())
+    slot.bind(task)
+    later = RuntimeDeadlineUpdate(32, 5, int(time.time() * 1000) + 60_000, 0)
+    sooner = RuntimeDeadlineUpdate(32, 6, int(time.time() * 1000) - 1, 0)
+
+    assert await slot.apply_deadline(later, terminal=False) is RuntimeControlDisposition.APPLIED
+    assert await slot.apply_deadline(later, terminal=False) is RuntimeControlDisposition.STALE
+    assert await slot.apply_deadline(sooner, terminal=False) is RuntimeControlDisposition.APPLIED
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert slot.terminal_request is not None
+    assert slot.terminal_request.control_sequence == 6
+    await slot.complete()
+
+
+@pytest.mark.asyncio
+async def test_completed_operation_cancels_pending_deadline_timer() -> None:
+    slot = OperationControlSlot(33)
+    task = asyncio.create_task(asyncio.sleep(0))
+    slot.bind(task)
+    await slot.apply_deadline(
+        RuntimeDeadlineUpdate(33, 1, int(time.time() * 1000) + 60_000, 0),
+        terminal=False,
+    )
+    await task
+    await slot.complete()
+    assert slot.terminal_request is None
 
 
 def _request(*, operation_id: int, sequence: int) -> RuntimeControlRequest:
@@ -142,6 +230,28 @@ def _control_event(message_type: MessageType, *, operation_id: int, sequence: in
         RuntimeFrameHeader(message_type=message_type),
         RuntimeEventMetadata(RuntimeEventMetadataKind.CONTROL_REQUEST, metadata),
         RuntimeEventTail.with_body(b"obsolete"),
+    )
+
+
+def _deadline_event(
+    message_type: MessageType,
+    *,
+    operation_id: int,
+    sequence: int,
+    deadline_unix_ms: int = 123_456,
+) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=operation_id,
+        control_sequence=sequence,
+        priority_class=0,
+        priority_delta=0,
+        deadline_unix_ms=deadline_unix_ms,
+        flags=1,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=message_type),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
+        RuntimeEventTail.none(),
     )
 
 
