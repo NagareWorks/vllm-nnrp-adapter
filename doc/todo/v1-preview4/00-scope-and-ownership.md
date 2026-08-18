@@ -2,15 +2,15 @@
 
 ## Product Boundary
 
-- [ ] Keep the adapter positioned as vLLM compatibility for NNRP deployments, not as a claim that
+- [x] Keep the adapter positioned as vLLM compatibility for NNRP deployments, not as a claim that
   token generation becomes faster than OpenAI HTTP/SSE.
-- [ ] Keep vLLM responsible for model loading, tokenization, scheduling, batching, generation, and
+- [x] Keep vLLM responsible for model loading, tokenization, scheduling, batching, generation, and
   backend-specific limits.
-- [ ] Keep NNRP responsible for carrier selection, sessions, runtime control, flow control, typed
+- [x] Keep NNRP responsible for carrier selection, sessions, runtime control, flow control, typed
   payloads, object/cache references, result delivery, and wire diagnostics.
-- [ ] Keep `openai-compatible/1` responsible for JSON request envelopes, profile events, errors,
+- [x] Keep `openai-compatible/1` responsible for JSON request envelopes, profile events, errors,
   usage, tool-call events, and capability documents.
-- [ ] Reject any implementation route that starts a second HTTP service or converts HTTP/SSE traffic
+- [x] Reject any implementation route that starts a second HTTP service or converts HTTP/SSE traffic
   back into NNRP for the production path.
 
 ## Module Ownership

@@ -37,12 +37,19 @@ for every minor release in that interval. Runtime binding is limited to the feat
 `0.22.x`, and `0.26.x` families, anchored at `0.18.1`, `0.22.1`, and `0.26.0`. See the
 [generated compatibility table](doc/vllm-compatibility.md).
 
+Production streaming uses the in-process engine-direct path. It does not parse vLLM's rendered SSE
+output or relay through an HTTP server. Tool-call streaming is therefore omitted from the published
+capability manifest until a version-bound engine-direct parser is implemented and tested. The
+explicit `HttpSseSmokeBackend` remains internal comparison tooling and is never auto-selected.
+
 ## Layout
 
 - `src/vllm_nnrp_adapter/profile.py`: frozen profile constants, request envelope validation, event builders, and capability document helpers.
 - `src/vllm_nnrp_adapter/adapter.py`: profile-level async request handler that maps backend responses to NNRP profile events.
 - `src/vllm_nnrp_adapter/nnrp_contract.py`: Preview4 `nnrp-py` version and native-role contract validation.
 - `src/vllm_nnrp_adapter/vllm_backend.py`: vLLM serving-object wrapper and method probing.
+- `src/vllm_nnrp_adapter/vllm_compat.py`: named compatibility registry and startup validation.
+- `src/vllm_nnrp_adapter/http_sse_smoke.py`: explicit HTTP/SSE comparison backend outside production selection.
 - `src/vllm_nnrp_adapter/conformance.py`: OpenAI NNRP API conformance plan executor and result writer.
 - `conformance/openai-api-capabilities.json`: Level 1 capability declaration consumed by `nnrp-conformance`.
 - `tests/`: profile and adapter mapping tests that do not require a GPU runtime.

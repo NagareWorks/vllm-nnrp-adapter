@@ -2,7 +2,7 @@
 
 ## OpenAI API Profile Conformance
 
-- [ ] Update the capability manifest to the real Preview4 Level 1 surface.
+- [x] Update the capability manifest to the real Preview4 Level 1 surface.
 - [ ] Consume suite-generated API profile execution plans instead of maintaining a divergent local
   case list.
 - [ ] Pass streaming chat, non-streaming chat, invalid body, unsupported operation, usage, event

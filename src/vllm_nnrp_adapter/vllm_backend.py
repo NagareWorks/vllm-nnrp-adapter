@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -16,6 +15,8 @@ CHAT_METHOD_CANDIDATES = (
 
 
 class VllmBackend:
+    supports_tool_calls = False
+
     def __init__(
         self,
         serving_chat: object,
@@ -40,10 +41,17 @@ class VllmBackend:
 
     async def create_chat_completion(self, body: Mapping[str, Any]) -> Any:
         request = self._build_request(body)
-        if self._prefer_engine_direct and _supports_engine_direct(self._serving_chat, request, body):
-            direct = await _try_create_engine_direct_stream(self._serving_chat, request, body)
-            if direct is not None:
-                return direct
+        if body.get("stream", False):
+            if not self._prefer_engine_direct:
+                raise VllmProductionBoundaryError("production streaming requires the engine-direct backend")
+            if not _supports_engine_direct(self._serving_chat, request, body):
+                raise VllmProductionBoundaryError(
+                    "request features or serving-object shape are not supported by the engine-direct backend"
+                )
+            try:
+                return await _create_engine_direct_stream(self._serving_chat, request, body)
+            except EngineDirectUnsupported as error:
+                raise VllmProductionBoundaryError("vLLM rejected the engine-direct request shape") from error
 
         method = getattr(self._serving_chat, self._chat_method_name)
         result = _call_chat_method(method, request)
@@ -87,40 +95,10 @@ def _call_chat_method(method: object, request: object) -> object:
 
 def _normalize_chat_result(result: object) -> object:
     if _is_async_iterator(result):
-        return _normalize_stream(result)
+        raise VllmProductionBoundaryError("production vLLM backend received an HTTP/SSE-shaped stream")
+    if isinstance(result, str):
+        raise VllmProductionBoundaryError("production vLLM backend received an HTTP/SSE string")
     return _normalize_object(result)
-
-
-async def _normalize_stream(chunks: object) -> AsyncIterator[Mapping[str, Any]]:
-    iterator = cast(AsyncIterator[object], chunks)
-    async for chunk in iterator:
-        for normalized in _normalize_stream_chunk(chunk):
-            yield normalized
-
-
-def _normalize_stream_chunk(chunk: object) -> tuple[Mapping[str, Any], ...]:
-    if isinstance(chunk, str):
-        return tuple(_parse_sse_chunk(chunk))
-    normalized = _normalize_object(chunk)
-    if isinstance(normalized, Mapping):
-        return (normalized,)
-    raise TypeError(f"unsupported vLLM stream chunk shape: {type(chunk).__name__}")
-
-
-def _parse_sse_chunk(chunk: str) -> list[Mapping[str, Any]]:
-    parsed: list[Mapping[str, Any]] = []
-    for line in chunk.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        data = line[5:].strip() if line.startswith("data:") else line
-        if not data or data == "[DONE]":
-            continue
-        value = json.loads(data)
-        if not isinstance(value, Mapping):
-            raise TypeError("vLLM SSE stream data must decode to a JSON object")
-        parsed.append(value)
-    return parsed
 
 
 def _normalize_object(value: object) -> object:
@@ -160,17 +138,6 @@ def _supports_engine_direct(serving_chat: object, request: object, body: Mapping
         callable(getattr(serving_chat, name, None))
         for name in ("render_chat_request", "_extract_prompt_components", "_extract_prompt_len")
     ) and hasattr(serving_chat, "engine_client")
-
-
-async def _try_create_engine_direct_stream(
-    serving_chat: object,
-    request: object,
-    body: Mapping[str, Any],
-) -> AsyncIterator[Mapping[str, Any]] | None:
-    try:
-        return await _create_engine_direct_stream(serving_chat, request, body)
-    except EngineDirectUnsupported:
-        return None
 
 
 async def _create_engine_direct_stream(
@@ -314,6 +281,10 @@ class EngineDirectChatStream:
 
 
 class EngineDirectUnsupported(Exception):
+    pass
+
+
+class VllmProductionBoundaryError(RuntimeError):
     pass
 
 

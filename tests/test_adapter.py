@@ -8,8 +8,9 @@ import pytest
 
 from vllm_nnrp_adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.adapter import classify_backend_error, map_openai_stream_chunk
+from vllm_nnrp_adapter.http_sse_smoke import HttpSseSmokeBackend
 from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
-from vllm_nnrp_adapter.vllm_backend import VllmBackend
+from vllm_nnrp_adapter.vllm_backend import VllmBackend, VllmProductionBoundaryError
 
 
 class StreamingBackend:
@@ -476,20 +477,21 @@ async def test_vllm_backend_uses_request_factory_and_raw_request_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_vllm_backend_normalizes_in_process_sse_stream() -> None:
+async def test_explicit_smoke_backend_normalizes_in_process_sse_stream() -> None:
     class ServingChat:
         async def create_chat_completion(
             self,
-            request: object,
-            raw_request: object | None = None,
+            body: Mapping[str, Any],
         ) -> AsyncIterator[str]:
+            assert body["model"] == "llama"
+
             async def chunks() -> AsyncIterator[str]:
                 yield 'data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n'
                 yield "data: [DONE]\n\n"
 
             return chunks()
 
-    backend = VllmBackend(ServingChat(), request_factory=lambda body: ("request", body["model"]))
+    backend = HttpSseSmokeBackend(ServingChat())
     adapter = OpenAiNnrpAdapter(backend)
 
     events = [
@@ -509,6 +511,22 @@ async def test_vllm_backend_normalizes_in_process_sse_stream() -> None:
 
     assert [event["type"] for event in events] == ["response.output_text.delta", "response.completed"]
     assert events[0]["delta"] == "hello"
+    assert adapter.capabilities.operations[0]["tool_calls"] is True
+
+
+@pytest.mark.asyncio
+async def test_production_backend_rejects_http_sse_stream() -> None:
+    class ServingChat:
+        async def create_chat_completion(self, request: object) -> AsyncIterator[str]:
+            async def chunks() -> AsyncIterator[str]:
+                yield 'data: {"choices":[]}\n\n'
+
+            return chunks()
+
+    backend = VllmBackend(ServingChat())
+
+    with pytest.raises(VllmProductionBoundaryError, match="HTTP/SSE-shaped stream"):
+        await backend.create_chat_completion({"model": "llama"})
 
 
 @pytest.mark.asyncio
@@ -613,14 +631,13 @@ async def test_vllm_backend_direct_path_can_be_disabled(monkeypatch: pytest.Monk
         prefer_engine_direct=False,
     )
 
-    assert await backend.create_chat_completion({"model": "llama", "stream": True}) == {
-        "choices": [{"message": {"content": "fallback"}}]
-    }
-    assert serving_chat.fallback_calls == 1
+    with pytest.raises(VllmProductionBoundaryError, match="requires the engine-direct backend"):
+        await backend.create_chat_completion({"model": "llama", "stream": True})
+    assert serving_chat.fallback_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_vllm_backend_falls_back_when_direct_render_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_vllm_backend_rejects_direct_render_error_without_sse_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(
         sys.modules,
         "vllm.entrypoints.utils",
@@ -629,14 +646,15 @@ async def test_vllm_backend_falls_back_when_direct_render_returns_error(monkeypa
     serving_chat = FakeErrorServingChat()
     backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
 
-    assert await backend.create_chat_completion({"model": "llama", "stream": True}) == {
-        "choices": [{"message": {"content": "fallback"}}]
-    }
-    assert serving_chat.fallback_calls == 1
+    with pytest.raises(VllmProductionBoundaryError, match="rejected the engine-direct request shape"):
+        await backend.create_chat_completion({"model": "llama", "stream": True})
+    assert serving_chat.fallback_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_vllm_backend_skips_direct_path_for_complex_chat_features(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_vllm_backend_rejects_unimplemented_complex_features_without_sse_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setitem(
         sys.modules,
         "vllm.entrypoints.utils",
@@ -645,12 +663,9 @@ async def test_vllm_backend_skips_direct_path_for_complex_chat_features(monkeypa
     serving_chat = FakeDirectServingChat()
     backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
 
-    assert await backend.create_chat_completion(
-        {"model": "llama", "stream": True, "tools": [{"type": "function"}]}
-    ) == {
-        "choices": [{"message": {"content": "fallback"}}]
-    }
-    assert serving_chat.fallback_calls == 1
+    with pytest.raises(VllmProductionBoundaryError, match="not supported by the engine-direct backend"):
+        await backend.create_chat_completion({"model": "llama", "stream": True, "tools": [{"type": "function"}]})
+    assert serving_chat.fallback_calls == 0
 
 
 def test_vllm_backend_rejects_unknown_serving_object() -> None:

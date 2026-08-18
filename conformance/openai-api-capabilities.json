@@ -11,7 +11,7 @@
       "name": "chat.completions.create",
       "streaming": true,
       "non_streaming": true,
-      "tool_calls": true,
+      "tool_calls": false,
       "cancellation": true
     }
   ],

@@ -86,6 +86,8 @@ def _call_backend_factory(spec: str) -> object:
 
 
 class MockChatCompletionBackend:
+    supports_tool_calls = True
+
     def create_chat_completion(self, body: Mapping[str, Any]) -> Mapping[str, Any] | AsyncIterator[Mapping[str, Any]]:
         model = str(body.get("model", "mock-model"))
         if model == "backend-error":

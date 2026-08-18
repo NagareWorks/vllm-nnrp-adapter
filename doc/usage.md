@@ -70,6 +70,10 @@ def make_backend():
 ```
 
 The vLLM wrapper converts profile request bodies into `ChatCompletionRequest` at runtime and calls `create_chat_completion`.
+For streaming requests, production uses the engine client directly and rejects any path that would
+return rendered SSE. Complex streaming features without an implemented direct binding fail
+explicitly and are absent from the capability manifest. `HttpSseSmokeBackend` exists only for
+comparison tests and is not exported or selected by the production factory.
 
 ## Native NNRP Server
 

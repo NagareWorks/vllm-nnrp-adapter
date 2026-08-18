@@ -22,7 +22,7 @@
   server.
 - [ ] Bind the engine-direct generation path for each compatibility family that exposes the required
   request preprocessing and engine client APIs.
-- [ ] Keep HTTP/SSE parsing behind an explicit smoke-only backend and exclude it from production
+- [x] Keep HTTP/SSE parsing behind an explicit smoke-only backend and exclude it from production
   auto-selection.
 - [ ] Preserve request id, model id, LoRA selection, sampling parameters, multimodal inputs, usage,
   finish reasons, and tool-call deltas across each binding.
@@ -39,6 +39,6 @@
   in every compatibility family.
 - [x] Test feature probing, exact unsupported-version diagnostics, and rejection of a version that
   falls inside the installation band but has no tested binding.
-- [ ] Test that the production backend never enters the HTTP/SSE parser.
+- [x] Test that the production backend never enters the HTTP/SSE parser.
 - [ ] Record the vLLM version, compatibility binding, model, engine configuration, and GPU in every
   integration result.

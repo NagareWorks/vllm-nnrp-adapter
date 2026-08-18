@@ -38,7 +38,7 @@ class OpenAiNnrpAdapter:
         capabilities: OpenAiNnrpCapabilityDocument | None = None,
     ) -> None:
         self._backend = backend
-        self.capabilities = capabilities or OpenAiNnrpCapabilityDocument.level1()
+        self.capabilities = capabilities or _default_capabilities(backend)
 
     async def handle_request(self, request: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
         try:
@@ -144,6 +144,17 @@ def map_openai_stream_chunk(chunk: Mapping[str, Any]) -> list[dict[str, Any]]:
                     events.append(build_tool_call_delta_event(tool_call, index=index, openai_chunk=chunk))
 
     return events
+
+
+def _default_capabilities(backend: ChatCompletionBackend) -> OpenAiNnrpCapabilityDocument:
+    document = OpenAiNnrpCapabilityDocument.level1()
+    tool_calls = getattr(backend, "supports_tool_calls", False) is True
+    operations = tuple({**operation, "tool_calls": tool_calls} for operation in document.operations)
+    return OpenAiNnrpCapabilityDocument(
+        compatibility_levels=document.compatibility_levels,
+        operations=operations,
+        models=document.models,
+    )
 
 
 def _is_async_iterator(value: object) -> bool:

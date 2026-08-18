@@ -1,5 +1,9 @@
+import json
+from pathlib import Path
+
 import pytest
 
+from vllm_nnrp_adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.profile import (
     CHAT_COMPLETIONS_CREATE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -18,6 +22,22 @@ def test_level1_capability_document_shape() -> None:
     assert document["operations"][0]["name"] == CHAT_COMPLETIONS_CREATE
     assert document["operations"][0]["cancellation"] is True
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
+
+
+def test_release_capability_manifest_does_not_advertise_unimplemented_vllm_tool_calls() -> None:
+    class ProductionCapabilityBackend:
+        supports_tool_calls = False
+
+        def create_chat_completion(self, body):
+            return {"model": body["model"], "choices": []}
+
+    manifest = json.loads(
+        (Path(__file__).parents[1] / "conformance" / "openai-api-capabilities.json").read_text(encoding="utf-8")
+    )
+    adapter = OpenAiNnrpAdapter(ProductionCapabilityBackend())
+
+    assert manifest["operations"][0]["tool_calls"] is False
+    assert manifest["operations"] == list(adapter.capabilities.operations)
 
 
 def test_validate_chat_request_preserves_body_and_policy() -> None:
