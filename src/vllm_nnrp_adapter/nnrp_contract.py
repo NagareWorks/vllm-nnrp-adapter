@@ -42,6 +42,7 @@ _REQUIRED_NNRP_METHODS = {
     },
     "nnrp.NativeRuntimeServerOperation": {
         "send_partial_result": True,
+        "send_progress": True,
         "send_result": True,
         "send_result_drop": True,
     },

@@ -24,7 +24,7 @@
 
 ## Progress, Pressure, And Capabilities
 
-- [ ] Emit `PROGRESS` with frozen stage codes for queued, admitted, preprocessing, executing,
+- [x] Emit `PROGRESS` with frozen stage codes for queued, admitted, preprocessing, executing,
   producing-partial, finalizing, completed, dropped, and failed transitions.
 - [ ] Preserve ordered OpenAI profile events in the NNRP result stream; do not replace the frozen
   profile mapping with JSON control messages.

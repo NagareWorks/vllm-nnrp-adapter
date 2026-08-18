@@ -17,6 +17,7 @@ from nnrp.runtime import (
     InFlightPolicy,
     NativeRuntimeEvent,
     PartialResultMetadata,
+    ProgressMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
     RuntimeEventMetadata,
@@ -95,6 +96,7 @@ class FakeOperation:
     terminal_results: list[tuple[ResultPushMetadata, bytes]]
     native_thread_ids: list[int] = field(default_factory=list)
     partial_results: list[tuple[PartialResultMetadata, bytes]] = field(default_factory=list)
+    progress_results: list[tuple[ProgressMetadata, bytes]] = field(default_factory=list)
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
     on_terminal: Callable[[], None] | None = None
 
@@ -105,6 +107,9 @@ class FakeOperation:
 
     async def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
         self.partial_results.append((metadata, body))
+
+    async def send_progress(self, metadata: ProgressMetadata, body: bytes = b"") -> None:
+        self.progress_results.append((metadata, body))
 
     async def send_result_drop(self, metadata: ResultDropReasonMetadata, diagnostic: bytes = b"") -> None:
         self.result_drops.append((metadata, diagnostic))
@@ -299,6 +304,17 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         "response.usage",
     ]
     assert len(operation.terminal_results) == 1
+    assert [metadata.progress_sequence for metadata, _body in operation.progress_results] == list(range(1, 9))
+    assert [metadata.stage_code for metadata, _body in operation.progress_results] == [
+        0x0001,
+        0x0003,
+        0x0002,
+        0x0004,
+        0x0005,
+        0x0007,
+        0x0008,
+        0x0009,
+    ]
     terminal_metadata, terminal_body = operation.terminal_results[0]
     assert terminal_metadata.result_class is ResultClass.COMPLETE
     assert terminal_metadata.payload_kind_bitmap is PayloadKind.STRUCTURED_EVENT
@@ -377,6 +393,7 @@ async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pyte
     metadata, body = operation.terminal_results[0]
     assert metadata.status_code == 500
     assert json.loads(body)["error"]["code"] == "invalid_submit_body"
+    assert [metadata.stage_code for metadata, _body in operation.progress_results] == [0x0001, 0x0003, 0x0008, 0x000B]
 
 
 @pytest.mark.asyncio
@@ -552,6 +569,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
             "reason": "peer_cancelled",
             "type": "response.cancelled",
         }
+    assert operation.progress_results[-1][0].stage_code == 0x000A
 
 
 @pytest.mark.asyncio
@@ -602,6 +620,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     assert backend.closed.is_set()
     assert len(operation.result_drops) == 1
     assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.TRANSPORT_CLOSED
+    assert operation.progress_results[-1][0].stage_code == 0x000A
     assert session.closed is True
     assert server_context.exited is True
 
@@ -706,6 +725,7 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     drop_metadata, diagnostic = operation.result_drops[0]
     assert drop_metadata.drop_reason_code is ResultDropReasonCode.DEADLINE_EXPIRED
     assert diagnostic == b"deadline_expired"
+    assert operation.progress_results[-1][0].stage_code == 0x000A
 
 
 def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:

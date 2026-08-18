@@ -33,6 +33,7 @@ from nnrp.server import (  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
+from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
 from .profile import build_cancelled_event
 from .runtime_control import (
@@ -285,20 +286,29 @@ async def _serve_operation(
 ) -> None:
     result_sequence = 0
     terminal_sent = False
+    progress = OperationProgressReporter(operation)
     try:
         try:
+            await progress.emit(OperationProgressStage.QUEUED)
+            await progress.emit(OperationProgressStage.INPUT_RECEIVED)
             request = _decode_request(operation.body)
             request.setdefault("request_id", record.backend_request_id)
             record.transition(OperationState.ADMITTED)
+            await progress.emit(OperationProgressStage.ADMITTED)
+            await progress.emit(OperationProgressStage.PREPROCESSING)
+            await progress.emit(OperationProgressStage.EXECUTING)
             async for event in adapter.handle_request(request):
                 body = _encode_event(event)
                 if _is_terminal_event(event):
+                    await progress.emit(OperationProgressStage.FINALIZING)
                     record.terminate(_terminal_operation_state(event))
+                    await progress.emit(_terminal_progress_stage(event))
                     terminal_sent = True
                     await operation.send_result(_terminal_metadata(operation, event), body)
                     counters.terminal_results += 1
                     break
                 record.mark_partial()
+                await progress.emit(OperationProgressStage.PRODUCING_PARTIAL)
                 result_sequence += 1
                 await operation.send_partial_result(
                     PartialResultMetadata(
@@ -321,6 +331,7 @@ async def _serve_operation(
             if control_request.kind is RuntimeControlKind.CANCEL:
                 event = build_cancelled_event("peer_cancelled")
                 record.terminate(OperationState.CANCELLED)
+                await progress.emit(OperationProgressStage.DROPPED)
                 await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
                 counters.terminal_results += 1
             elif control_request.kind in {
@@ -335,6 +346,7 @@ async def _serve_operation(
                     RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
                     RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
                 }[control_request.kind]
+                await progress.emit(OperationProgressStage.DROPPED)
                 await operation.send_result_drop(
                     ResultDropReasonMetadata(
                         operation_id=operation.operation_id,
@@ -361,7 +373,9 @@ async def _serve_operation(
                 event = _missing_terminal_event()
 
         if not terminal_sent:
+            await progress.emit(OperationProgressStage.FINALIZING)
             record.terminate(_terminal_operation_state(event))
+            await progress.emit(_terminal_progress_stage(event))
             terminal_sent = True
             await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
             counters.terminal_results += 1
@@ -429,6 +443,15 @@ def _terminal_operation_state(event: Mapping[str, Any]) -> OperationState:
     if event_type == "response.cancelled":
         return OperationState.CANCELLED
     return OperationState.FAILED
+
+
+def _terminal_progress_stage(event: Mapping[str, Any]) -> OperationProgressStage:
+    event_type = event.get("type")
+    if event_type == "response.completed":
+        return OperationProgressStage.COMPLETED
+    if event_type == "response.cancelled":
+        return OperationProgressStage.DROPPED
+    return OperationProgressStage.FAILED
 
 
 def _backend_request_id(operation_id: int, frame_id: int) -> str:
