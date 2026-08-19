@@ -33,6 +33,7 @@ from nnrp.server import (  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
+from .observability import _emit_operation_observation, _OperationObservationTracker
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
 from .profile import build_cancelled_event
@@ -238,6 +239,10 @@ async def _serve_session(
                 continue
             counters.accepted_operations += 1
             control = controls.register(operation.operation_id)
+            observation = _OperationObservationTracker.from_operation(
+                operation,
+                selected_transport=session.active_transport_name,
+            )
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:
                 try:
@@ -251,6 +256,7 @@ async def _serve_session(
                     operation,
                     record=record,
                     control=control,
+                    observation=observation,
                     counters=counters,
                 )
             )
@@ -290,6 +296,7 @@ async def _serve_operation(
     *,
     record: OperationRecord,
     control: OperationControlSlot,
+    observation: _OperationObservationTracker,
     counters: _ServeCounters,
 ) -> None:
     result_sequence = 0
@@ -300,13 +307,16 @@ async def _serve_operation(
             await progress.emit(OperationProgressStage.QUEUED)
             await progress.emit(OperationProgressStage.INPUT_RECEIVED)
             request = _decode_request(operation.submit.tail.body)
+            observation.record_request(request)
             request.setdefault("request_id", record.backend_request_id)
             record.transition(OperationState.ADMITTED)
+            observation.mark_admitted()
             await progress.emit(OperationProgressStage.ADMITTED)
             await progress.emit(OperationProgressStage.PREPROCESSING)
             await progress.emit(OperationProgressStage.EXECUTING)
             async for event in adapter.handle_request(request):
                 body = _encode_event(event)
+                observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):
                     await progress.emit(OperationProgressStage.FINALIZING)
                     record.terminate(_terminal_operation_state(event))
@@ -340,13 +350,14 @@ async def _serve_operation(
                 event = build_cancelled_event("peer_cancelled")
                 record.terminate(OperationState.CANCELLED)
                 await progress.emit(OperationProgressStage.DROPPED)
-                await _send_cancelled_outcome(
+                fallback_drop = await _send_cancelled_outcome(
                     operation,
                     event,
                     control_request=control_request,
                     result_sequence=result_sequence,
                     counters=counters,
                 )
+                observation.record_control(control_request, drop_reason=fallback_drop)
             elif control_request.kind in {
                 RuntimeControlKind.ABORT,
                 RuntimeControlKind.SERVER_SHUTDOWN,
@@ -366,6 +377,7 @@ async def _serve_operation(
                     RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
                     RuntimeControlKind.SUPERSEDE: ResultDropReasonCode.SUPERSEDED,
                 }[control_request.kind]
+                observation.record_control(control_request, drop_reason=drop_reason)
                 await progress.emit(OperationProgressStage.DROPPED)
                 await operation.send_result_drop(
                     ResultDropReasonMetadata(
@@ -382,9 +394,11 @@ async def _serve_operation(
                 counters.terminal_results += 1
             else:
                 record.terminate(OperationState.DROPPED)
+                observation.record_control(control_request)
             terminal_sent = True
             return
         except Exception as error:
+            observation.record_exception(error)
             if terminal_sent:
                 raise
             event = _runtime_error_event(error)
@@ -403,8 +417,11 @@ async def _serve_operation(
         try:
             await control.complete()
         finally:
-            if record.is_terminal and not record.resources_released:
-                record.release_resources()
+            try:
+                if record.is_terminal and not record.resources_released:
+                    record.release_resources()
+            finally:
+                _emit_operation_observation(observation.finish(record.state))
 
 
 async def _handle_runtime_control(
@@ -456,7 +473,8 @@ async def _send_cancelled_outcome(
     control_request: RuntimeControlRequest,
     result_sequence: int,
     counters: _ServeCounters,
-) -> None:
+) -> ResultDropReasonCode | None:
+    fallback_drop = None
     try:
         await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
     except Exception:
@@ -473,7 +491,9 @@ async def _send_cancelled_outcome(
             diagnostic,
         )
         counters.result_drops += 1
+        fallback_drop = ResultDropReasonCode.PEER_CANCELLED
     counters.terminal_results += 1
+    return fallback_drop
 
 
 def _decode_request(body: bytes) -> dict[str, Any]:

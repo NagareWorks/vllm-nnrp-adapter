@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -129,6 +130,9 @@ class FakeOperation:
                 message_type=MessageType.FRAME_SUBMIT,
                 session_id=1,
                 frame_id=self.frame_id,
+                view_id=self.operation_id + 2_000,
+                route_id=self.operation_id + 1_000,
+                trace_id=self.operation_id + 3_000,
             ),
             RuntimeEventMetadata(RuntimeEventMetadataKind.FRAME_SUBMIT, metadata),
             RuntimeEventTail.with_body(body),
@@ -436,7 +440,9 @@ async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pyte
 @pytest.mark.asyncio
 async def test_native_server_runs_sessions_and_operations_concurrently_with_per_operation_order(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
     stop_event = asyncio.Event()
     operations = [
         FakeOperation(
@@ -500,6 +506,24 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
             ]
         assert session.closed is True
     assert all(len(operation.terminal_results) == 1 for operation in operations)
+    observation_records = [
+        json.loads(record.getMessage().removeprefix("nnrp_operation_observation "))
+        for record in caplog.records
+        if record.getMessage().startswith("nnrp_operation_observation ")
+    ]
+    assert len(observation_records) == len(operations)
+    assert {record["operation_id"] for record in observation_records} == {1, 2, 3, 4}
+    for observation in observation_records:
+        operation_id = observation["operation_id"]
+        assert observation["frame_id"] == operation_id + 100
+        assert observation["route_id"] == operation_id + 1_000
+        assert observation["view_id"] == operation_id + 2_000
+        assert observation["trace_id"] == operation_id + 3_000
+        assert observation["model_id"] == f"model-{operation_id}"
+        assert observation["profile_operation"] == "chat.completions.create"
+        assert observation["selected_transport"] == "ipc"
+        assert observation["output_event_count"] == 3
+        assert observation["terminal_outcome"] == "completed"
 
 
 @pytest.mark.asyncio

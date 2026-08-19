@@ -2,7 +2,7 @@
 
 ## Observation Record
 
-- [ ] Add one immutable operation observation record shared by diagnostics, metrics, logs, and
+- [x] Add one immutable operation observation record shared by diagnostics, metrics, logs, and
   benchmarks.
 - [ ] Record model, operation, vLLM version, backend binding, selected transport, connection,
   session, operation, frame, route, view, trace, and profile identities.
@@ -25,6 +25,6 @@
 ## Validation
 
 - [ ] Test successful, failed, cancelled, expired, superseded, dropped, and disconnected records.
-- [ ] Test concurrent operations for identity isolation and one terminal observation each.
+- [x] Test concurrent operations for identity isolation and one terminal observation each.
 - [ ] Test exporters with no vLLM or GPU dependency.
 - [ ] Include observation evidence in wire E2E and GPU benchmark artifacts.
