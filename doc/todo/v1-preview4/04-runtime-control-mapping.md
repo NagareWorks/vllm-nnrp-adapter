@@ -2,7 +2,7 @@
 
 ## Cancellation And Freshness
 
-- [ ] Map `CANCEL` to cooperative backend abort, stream closure, `response.cancelled`, and a typed
+- [x] Map `CANCEL` to cooperative backend abort, stream closure, `response.cancelled`, and a typed
   terminal drop reason when no final profile event can be delivered.
 - [x] Map `ABORT` to immediate backend abort and suppress every later backend chunk.
 - [x] Map `SUPERSEDE` to atomic old-operation cancellation and new-operation admission.

@@ -120,8 +120,12 @@ class FakeOperation:
     progress_results: list[tuple[ProgressMetadata, bytes]] = field(default_factory=list)
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
     on_terminal: Callable[[], None] | None = None
+    fail_next_terminal_result: bool = False
 
     async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
+        if self.fail_next_terminal_result:
+            self.fail_next_terminal_result = False
+            raise OSError("terminal profile result unavailable")
         self.terminal_results.append((metadata, body))
         if self.on_terminal is not None:
             self.on_terminal()
@@ -591,6 +595,58 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
             "type": "response.cancelled",
         }
     assert operation.progress_results[-1][0].stage_code == 0x000A
+
+
+@pytest.mark.asyncio
+async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cannot_be_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=107,
+        frame_id=207,
+        body=json.dumps(_chat_request()).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=107),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+        fail_next_terminal_result=True,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_control_event(MessageType.CANCEL, operation_id=107, sequence=1),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert operation.terminal_results == []
+    assert len(operation.result_drops) == 1
+    metadata, diagnostic = operation.result_drops[0]
+    assert metadata.drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
+    assert diagnostic == b"obsolete"
 
 
 @pytest.mark.asyncio

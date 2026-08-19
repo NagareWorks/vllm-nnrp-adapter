@@ -41,6 +41,7 @@ from .runtime_control import (
     RuntimeControlDisposition,
     RuntimeControlKind,
     RuntimeControlRegistry,
+    RuntimeControlRequest,
     decode_deadline_update,
     decode_operation_control,
 )
@@ -339,8 +340,13 @@ async def _serve_operation(
                 event = build_cancelled_event("peer_cancelled")
                 record.terminate(OperationState.CANCELLED)
                 await progress.emit(OperationProgressStage.DROPPED)
-                await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
-                counters.terminal_results += 1
+                await _send_cancelled_outcome(
+                    operation,
+                    event,
+                    control_request=control_request,
+                    result_sequence=result_sequence,
+                    counters=counters,
+                )
             elif control_request.kind in {
                 RuntimeControlKind.ABORT,
                 RuntimeControlKind.SERVER_SHUTDOWN,
@@ -441,6 +447,33 @@ async def _handle_runtime_control(
         counters.applied_control_events += 1
     else:
         counters.rejected_control_events += 1
+
+
+async def _send_cancelled_outcome(
+    operation: NativeRuntimeServerOperation,
+    event: Mapping[str, Any],
+    *,
+    control_request: RuntimeControlRequest,
+    result_sequence: int,
+    counters: _ServeCounters,
+) -> None:
+    try:
+        await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
+    except Exception:
+        diagnostic = control_request.diagnostic or b"peer_cancelled"
+        await operation.send_result_drop(
+            ResultDropReasonMetadata(
+                operation_id=operation.operation_id,
+                result_sequence=max(1, result_sequence + 1),
+                drop_reason_code=ResultDropReasonCode.PEER_CANCELLED,
+                source_role=RuntimeRole.RUNTIME,
+                flags=0,
+                diagnostic_bytes=len(diagnostic),
+            ),
+            diagnostic,
+        )
+        counters.result_drops += 1
+    counters.terminal_results += 1
 
 
 def _decode_request(body: bytes) -> dict[str, Any]:
