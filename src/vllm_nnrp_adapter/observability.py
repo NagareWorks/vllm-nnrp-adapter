@@ -33,6 +33,9 @@ class _OperationObservation:
     identity: _OperationIdentity
     model_id: str | None
     profile_operation: str | None
+    backend_family: str
+    backend_binding: str | None
+    vllm_version: str | None
     queue_delay_ms: float | None
     first_event_latency_ms: float | None
     inter_event_latency_ms: tuple[float, ...]
@@ -61,6 +64,9 @@ class _OperationObservation:
             "profile_id": self.identity.profile_id,
             "model_id": self.model_id,
             "profile_operation": self.profile_operation,
+            "backend_family": self.backend_family,
+            "backend_binding": self.backend_binding,
+            "vllm_version": self.vllm_version,
             "queue_delay_ms": self.queue_delay_ms,
             "first_event_latency_ms": self.first_event_latency_ms,
             "inter_event_latency_ms": self.inter_event_latency_ms,
@@ -82,6 +88,9 @@ class _OperationObservation:
 @dataclass(slots=True)
 class _OperationObservationTracker:
     identity: _OperationIdentity
+    backend_family: str
+    backend_binding: str | None
+    vllm_version: str | None
     _clock_ns: Callable[[], int] = field(repr=False)
     _accepted_ns: int = field(repr=False)
     _admitted_ns: int | None = field(default=None, repr=False)
@@ -108,6 +117,9 @@ class _OperationObservationTracker:
         operation: NativeRuntimeServerOperation,
         *,
         selected_transport: str,
+        backend_family: str = "unknown",
+        backend_binding: str | None = None,
+        vllm_version: str | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> _OperationObservationTracker:
         submit = operation.submit
@@ -126,6 +138,9 @@ class _OperationObservationTracker:
                 trace_id=header.trace_id,
                 profile_id=int(metadata.input_profile),
             ),
+            backend_family=backend_family,
+            backend_binding=backend_binding,
+            vllm_version=vllm_version,
             _clock_ns=clock_ns,
             _accepted_ns=clock_ns(),
         )
@@ -180,6 +195,9 @@ class _OperationObservationTracker:
             identity=self.identity,
             model_id=self._model_id,
             profile_operation=self._profile_operation,
+            backend_family=self.backend_family,
+            backend_binding=self.backend_binding,
+            vllm_version=self.vllm_version,
             queue_delay_ms=_duration_ms(self._accepted_ns, self._admitted_ns),
             first_event_latency_ms=_duration_ms(self._accepted_ns, self._first_event_ns),
             inter_event_latency_ms=tuple(_nanoseconds_to_ms(value) for value in self._inter_event_ns),

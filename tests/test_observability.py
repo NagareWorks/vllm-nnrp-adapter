@@ -34,6 +34,9 @@ def test_operation_observation_is_immutable_complete_and_structured(
     tracker = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        backend_family="VllmBackend",
+        backend_binding="current-0.26",
+        vllm_version="0.26.0",
         clock_ns=lambda: next(ticks),
     )
     tracker.record_request(
@@ -82,6 +85,9 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.identity.profile_id == int(InputProfile.UNSPECIFIED)
     assert observation.model_id == "test-model"
     assert observation.profile_operation == "chat.completions.create"
+    assert observation.backend_family == "VllmBackend"
+    assert observation.backend_binding == "current-0.26"
+    assert observation.vllm_version == "0.26.0"
     assert observation.queue_delay_ms == 2.0
     assert observation.first_event_latency_ms == 5.0
     assert observation.inter_event_latency_ms == (3.0,)
@@ -107,6 +113,8 @@ def test_operation_observation_is_immutable_complete_and_structured(
     payload = json.loads(caplog.records[-1].getMessage().removeprefix("nnrp_operation_observation "))
     assert payload["operation_id"] == 7
     assert payload["model_id"] == "test-model"
+    assert payload["backend_binding"] == "current-0.26"
+    assert payload["vllm_version"] == "0.26.0"
     assert payload["terminal_outcome"] == "dropped"
 
 

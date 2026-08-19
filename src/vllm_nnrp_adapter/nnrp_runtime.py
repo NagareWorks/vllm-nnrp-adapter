@@ -186,6 +186,7 @@ async def _serve_session(
     operations: set[asyncio.Task[None]] = set()
     registry = OperationRegistry()
     controls = RuntimeControlRegistry()
+    backend_family, backend_binding, vllm_version = adapter._backend_observation_identity()
     try:
         while not shutdown.is_set():
             _retire_completed_tasks(operations)
@@ -242,6 +243,9 @@ async def _serve_session(
             observation = _OperationObservationTracker.from_operation(
                 operation,
                 selected_transport=session.active_transport_name,
+                backend_family=backend_family,
+                backend_binding=backend_binding,
+                vllm_version=vllm_version,
             )
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:

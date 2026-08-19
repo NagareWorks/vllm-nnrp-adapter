@@ -40,6 +40,13 @@ class OpenAiNnrpAdapter:
         self._backend = backend
         self.capabilities = capabilities or _default_capabilities(backend)
 
+    def _backend_observation_identity(self) -> tuple[str, str | None, str | None]:
+        return (
+            type(self._backend).__name__,
+            _optional_string_attribute(self._backend, "compatibility_binding"),
+            _optional_string_attribute(self._backend, "vllm_version"),
+        )
+
     async def handle_request(self, request: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
         try:
             envelope = validate_request(request, self.capabilities)
@@ -166,6 +173,11 @@ def _default_capabilities(backend: ChatCompletionBackend) -> OpenAiNnrpCapabilit
 
 def _is_async_iterator(value: object) -> bool:
     return hasattr(value, "__aiter__") and hasattr(value, "__anext__")
+
+
+def _optional_string_attribute(value: object, name: str) -> str | None:
+    attribute = getattr(value, name, None)
+    return attribute if isinstance(attribute, str) else None
 
 
 def _as_mapping(value: object) -> Mapping[str, Any]:

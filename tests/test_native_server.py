@@ -534,6 +534,9 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         assert observation["trace_id"] == operation_id + 3_000
         assert observation["model_id"] == f"model-{operation_id}"
         assert observation["profile_operation"] == "chat.completions.create"
+        assert observation["backend_family"] == "InterleavingBackend"
+        assert observation["backend_binding"] is None
+        assert observation["vllm_version"] is None
         assert observation["selected_transport"] == "ipc"
         assert observation["output_event_count"] == 3
         assert observation["terminal_outcome"] == "completed"
