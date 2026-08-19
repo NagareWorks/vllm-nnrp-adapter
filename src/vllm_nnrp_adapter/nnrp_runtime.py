@@ -299,7 +299,7 @@ async def _serve_operation(
         try:
             await progress.emit(OperationProgressStage.QUEUED)
             await progress.emit(OperationProgressStage.INPUT_RECEIVED)
-            request = _decode_request(operation.body)
+            request = _decode_request(operation.submit.tail.body)
             request.setdefault("request_id", record.backend_request_id)
             record.transition(OperationState.ADMITTED)
             await progress.emit(OperationProgressStage.ADMITTED)
@@ -547,7 +547,7 @@ def _terminal_metadata(
         result_flags=ResultFlags(0),
         section_count=0,
         tile_count=0,
-        active_profile_id=int(operation.metadata.input_profile),
+        active_profile_id=int(operation.submit.metadata.value.input_profile),
         reserved0=0,
         inference_ms=0,
         queue_ms=0,

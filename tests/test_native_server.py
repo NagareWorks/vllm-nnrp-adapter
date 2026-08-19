@@ -5,7 +5,7 @@ import json
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 import pytest
@@ -112,15 +112,27 @@ class ReplacementBackend:
 class FakeOperation:
     operation_id: int
     frame_id: int
-    body: bytes
-    metadata: FrameSubmitMetadata
+    body: InitVar[bytes]
+    metadata: InitVar[FrameSubmitMetadata]
     terminal_results: list[tuple[ResultPushMetadata, bytes]]
+    submit: NativeRuntimeEvent = field(init=False)
     native_thread_ids: list[int] = field(default_factory=list)
     partial_results: list[tuple[PartialResultMetadata, bytes]] = field(default_factory=list)
     progress_results: list[tuple[ProgressMetadata, bytes]] = field(default_factory=list)
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
     on_terminal: Callable[[], None] | None = None
     fail_next_terminal_result: bool = False
+
+    def __post_init__(self, body: bytes, metadata: FrameSubmitMetadata) -> None:
+        self.submit = NativeRuntimeEvent(
+            RuntimeFrameHeader(
+                message_type=MessageType.FRAME_SUBMIT,
+                session_id=1,
+                frame_id=self.frame_id,
+            ),
+            RuntimeEventMetadata(RuntimeEventMetadataKind.FRAME_SUBMIT, metadata),
+            RuntimeEventTail.with_body(body),
+        )
 
     async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
         if self.fail_next_terminal_result:
