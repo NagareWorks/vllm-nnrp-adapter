@@ -350,6 +350,7 @@ async def _serve_operation(
                 event = build_cancelled_event("peer_cancelled")
                 record.terminate(OperationState.CANCELLED)
                 await progress.emit(OperationProgressStage.DROPPED)
+                observation.record_event(event, body_bytes=len(_encode_event(event)))
                 fallback_drop = await _send_cancelled_outcome(
                     operation,
                     event,
@@ -410,8 +411,10 @@ async def _serve_operation(
             await progress.emit(OperationProgressStage.FINALIZING)
             record.terminate(_terminal_operation_state(event))
             await progress.emit(_terminal_progress_stage(event))
+            body = _encode_event(event)
+            observation.record_event(event, body_bytes=len(body))
             terminal_sent = True
-            await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
+            await operation.send_result(_terminal_metadata(operation, event), body)
             counters.terminal_results += 1
     finally:
         try:

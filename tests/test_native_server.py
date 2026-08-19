@@ -304,7 +304,9 @@ class FakeServerContext:
 @pytest.mark.asyncio
 async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     operation = FakeOperation(
         operation_id=71,
@@ -356,6 +358,10 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         0x0008,
         0x0009,
     ]
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "completed"
+    assert observation["output_event_count"] == 3
+    assert observation["total_tokens"] == 2
     terminal_metadata, terminal_body = operation.terminal_results[0]
     assert terminal_metadata.result_class is ResultClass.COMPLETE
     assert terminal_metadata.payload_kind_bitmap is PayloadKind.STRUCTURED_EVENT
@@ -400,7 +406,11 @@ async def test_production_entrypoint_rejects_preview3_runtime_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invalid_submit_body_produces_one_terminal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     operation = FakeOperation(
         operation_id=72,
@@ -435,6 +445,9 @@ async def test_invalid_submit_body_produces_one_terminal_error(monkeypatch: pyte
     assert metadata.status_code == 500
     assert json.loads(body)["error"]["code"] == "invalid_submit_body"
     assert [metadata.stage_code for metadata, _body in operation.progress_results] == [0x0001, 0x0003, 0x0008, 0x000B]
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "failed"
+    assert observation["error_family"] == "invalid_request_error"
 
 
 @pytest.mark.asyncio
@@ -442,7 +455,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     operations = [
         FakeOperation(
@@ -581,7 +594,9 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     message_type: MessageType,
     expect_drop: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -631,12 +646,20 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
             "type": "response.cancelled",
         }
     assert operation.progress_results[-1][0].stage_code == 0x000A
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == ("dropped" if expect_drop else "cancelled")
+    assert observation["cancellation_kind"] == message_type.name.lower()
+    assert observation["cancellation_source"] == "client"
+    assert observation["cancellation_reason_code"] == 3
+    assert observation["drop_reason"] == ("peer_cancelled" if expect_drop else None)
 
 
 @pytest.mark.asyncio
 async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cannot_be_delivered(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -683,12 +706,17 @@ async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cann
     metadata, diagnostic = operation.result_drops[0]
     assert metadata.drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
     assert diagnostic == b"obsolete"
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "cancelled"
+    assert observation["drop_reason"] == "peer_cancelled"
 
 
 @pytest.mark.asyncio
 async def test_server_shutdown_drops_active_operation_before_closing_session(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -736,12 +764,18 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     assert operation.progress_results[-1][0].stage_code == 0x000A
     assert session.closed is True
     assert server_context.exited is True
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "dropped"
+    assert observation["cancellation_kind"] == "server_shutdown"
+    assert observation["drop_reason"] == "transport_closed"
 
 
 @pytest.mark.asyncio
 async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -782,12 +816,18 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     assert operation.terminal_results == []
     assert operation.result_drops == []
     assert session.closed is True
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "dropped"
+    assert observation["cancellation_kind"] == "peer_disconnect"
+    assert observation["cancellation_source"] == "client"
 
 
 @pytest.mark.asyncio
 async def test_native_deadline_update_stops_backend_and_drops_late_output(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -839,12 +879,18 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     assert drop_metadata.drop_reason_code is ResultDropReasonCode.DEADLINE_EXPIRED
     assert diagnostic == b"deadline_expired"
     assert operation.progress_results[-1][0].stage_code == 0x000A
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "dropped"
+    assert observation["cancellation_kind"] == "deadline_expired"
+    assert observation["drop_reason"] == "deadline_expired"
 
 
 @pytest.mark.asyncio
 async def test_native_supersede_admits_replacement_before_dropping_old_operation(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     backend = ReplacementBackend()
     old_operation = FakeOperation(
@@ -909,6 +955,12 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
     assert old_operation.result_drops[0][1] == b"newer_request"
     assert len(new_operation.terminal_results) == 1
     assert json.loads(new_operation.terminal_results[0][1])["type"] == "response.completed"
+    observations = {record["operation_id"]: record for record in _observation_records(caplog)}
+    assert observations[105]["terminal_outcome"] == "dropped"
+    assert observations[105]["cancellation_kind"] == "supersede"
+    assert observations[105]["drop_reason"] == "superseded"
+    assert observations[106]["terminal_outcome"] == "completed"
+    assert observations[106]["cancellation_kind"] is None
 
 
 def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:
@@ -1020,3 +1072,15 @@ def _submit_metadata(*, operation_id: int) -> FrameSubmitMetadata:
         payload_kind_bitmap=PayloadKind.STRUCTURED_EVENT,
         payload_frame_count=1,
     )
+
+
+def _capture_observations(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
+
+
+def _observation_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        json.loads(record.getMessage().removeprefix("nnrp_operation_observation "))
+        for record in caplog.records
+        if record.getMessage().startswith("nnrp_operation_observation ")
+    ]

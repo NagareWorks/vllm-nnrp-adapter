@@ -24,7 +24,7 @@
 
 ## Validation
 
-- [ ] Test successful, failed, cancelled, expired, superseded, dropped, and disconnected records.
+- [x] Test successful, failed, cancelled, expired, superseded, dropped, and disconnected records.
 - [x] Test concurrent operations for identity isolation and one terminal observation each.
 - [ ] Test exporters with no vLLM or GPU dependency.
 - [ ] Include observation evidence in wire E2E and GPU benchmark artifacts.
