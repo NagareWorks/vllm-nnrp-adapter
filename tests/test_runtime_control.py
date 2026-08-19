@@ -14,6 +14,7 @@ from nnrp.runtime import (
     RuntimeFrameHeader,
     RuntimeRole,
     SchedulingMetadata,
+    SupersedeMetadata,
 )
 
 from vllm_nnrp_adapter.runtime_control import (
@@ -54,6 +55,35 @@ def test_decode_operation_control_rejects_wrong_metadata_and_session_scope() -> 
 
     with pytest.raises(ValueError, match="non-zero operation_id"):
         decode_operation_control(_control_event(MessageType.CANCEL, operation_id=0, sequence=1))
+
+
+def test_decode_supersede_preserves_replacement_and_drop_metadata() -> None:
+    request = decode_operation_control(_supersede_event(old_operation_id=7, new_operation_id=8, sequence=11))
+
+    assert request == RuntimeControlRequest(
+        kind=RuntimeControlKind.SUPERSEDE,
+        operation_id=7,
+        control_sequence=11,
+        reason_code=2,
+        source_role=RuntimeRole.CLIENT,
+        flags=1,
+        diagnostic=b"newer_request",
+        replacement_operation_id=8,
+    )
+
+
+def test_decode_supersede_rejects_wrong_zero_and_identical_operations() -> None:
+    wrong_metadata = NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.SUPERSEDE),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.NONE),
+        RuntimeEventTail.none(),
+    )
+    with pytest.raises(TypeError, match="SUPERSEDE requires SupersedeMetadata"):
+        decode_operation_control(wrong_metadata)
+    with pytest.raises(ValueError, match="non-zero"):
+        decode_operation_control(_supersede_event(old_operation_id=0, new_operation_id=8, sequence=1))
+    with pytest.raises(ValueError, match="distinct"):
+        decode_operation_control(_supersede_event(old_operation_id=8, new_operation_id=8, sequence=1))
 
 
 def test_decode_deadline_update_preserves_frozen_metadata() -> None:
@@ -142,6 +172,87 @@ async def test_control_registry_terminates_every_bound_operation() -> None:
 
     await asyncio.gather(*tasks, return_exceptions=True)
     assert all(task.cancelled() for task in tasks)
+
+
+@pytest.mark.asyncio
+async def test_supersede_waits_for_replacement_admission_before_cancelling_old_operation() -> None:
+    registry = RuntimeControlRegistry()
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    old_task = asyncio.create_task(worker())
+    registry.register(41).bind(old_task)
+    request = RuntimeControlRequest(
+        kind=RuntimeControlKind.SUPERSEDE,
+        operation_id=41,
+        control_sequence=3,
+        reason_code=2,
+        source_role=RuntimeRole.CLIENT,
+        flags=1,
+        diagnostic=b"newer_request",
+        replacement_operation_id=42,
+    )
+
+    assert (
+        await registry.apply_supersede(request, old_terminal=False, replacement_active=False)
+        is RuntimeControlDisposition.APPLIED
+    )
+    assert not old_task.done()
+    assert registry.pending_supersede(42) is request
+    assert (
+        await registry.apply(_request(operation_id=41, sequence=2), terminal=False) is RuntimeControlDisposition.STALE
+    )
+    assert await registry.activate_replacement(42, old_terminal=False) is RuntimeControlDisposition.APPLIED
+    with pytest.raises(asyncio.CancelledError):
+        await old_task
+    await registry.clear()
+
+
+@pytest.mark.asyncio
+async def test_newer_pending_supersede_replaces_old_target_and_invalidates_prior_activation() -> None:
+    registry = RuntimeControlRegistry()
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    old_task = asyncio.create_task(worker())
+    registry.register(51).bind(old_task)
+    first = RuntimeControlRequest(
+        RuntimeControlKind.SUPERSEDE,
+        51,
+        4,
+        2,
+        RuntimeRole.CLIENT,
+        1,
+        b"first",
+        52,
+    )
+    second = RuntimeControlRequest(
+        RuntimeControlKind.SUPERSEDE,
+        51,
+        5,
+        2,
+        RuntimeRole.CLIENT,
+        1,
+        b"second",
+        53,
+    )
+
+    assert (
+        await registry.apply_supersede(first, old_terminal=False, replacement_active=False)
+        is RuntimeControlDisposition.APPLIED
+    )
+    assert (
+        await registry.apply_supersede(second, old_terminal=False, replacement_active=False)
+        is RuntimeControlDisposition.APPLIED
+    )
+    assert await registry.activate_replacement(52, old_terminal=False) is None
+    assert not old_task.done()
+    assert await registry.activate_replacement(53, old_terminal=False) is RuntimeControlDisposition.APPLIED
+    await asyncio.gather(old_task, return_exceptions=True)
+    assert old_task.cancelled()
+    await registry.clear()
 
 
 @pytest.mark.asyncio
@@ -252,6 +363,27 @@ def _deadline_event(
         RuntimeFrameHeader(message_type=message_type),
         RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
         RuntimeEventTail.none(),
+    )
+
+
+def _supersede_event(
+    *,
+    old_operation_id: int,
+    new_operation_id: int,
+    sequence: int,
+) -> NativeRuntimeEvent:
+    metadata = SupersedeMetadata(
+        old_operation_id=old_operation_id,
+        new_operation_id=new_operation_id,
+        control_sequence=sequence,
+        drop_reason_code=2,
+        flags=1,
+        diagnostic_bytes=len(b"newer_request"),
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.SUPERSEDE),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SUPERSEDE, metadata),
+        RuntimeEventTail.with_body(b"newer_request"),
     )
 
 

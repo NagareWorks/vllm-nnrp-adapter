@@ -28,6 +28,7 @@ from nnrp.runtime import (
     SchedulingMetadata,
     SessionCloseMetadata,
     SessionCloseReason,
+    SupersedeMetadata,
 )
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
@@ -83,6 +84,26 @@ class CancellableBackend:
                 yield {"choices": [{"index": 0, "delta": {"content": "late"}}]}
             finally:
                 self.closed.set()
+
+        return events()
+
+
+class ReplacementBackend:
+    def __init__(self) -> None:
+        self.old_started = threading.Event()
+        self.old_closed = threading.Event()
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        async def events() -> AsyncIterator[Mapping[str, Any]]:
+            if body["model"] == "old-model":
+                self.old_started.set()
+                try:
+                    yield {"choices": [{"index": 0, "delta": {"content": "old:first"}}]}
+                    await asyncio.Event().wait()
+                finally:
+                    self.old_closed.set()
+                return
+            yield {"choices": [{"index": 0, "delta": {"content": "new:complete"}}]}
 
         return events()
 
@@ -728,6 +749,76 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     assert operation.progress_results[-1][0].stage_code == 0x000A
 
 
+@pytest.mark.asyncio
+async def test_native_supersede_admits_replacement_before_dropping_old_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = ReplacementBackend()
+    old_operation = FakeOperation(
+        operation_id=105,
+        frame_id=205,
+        body=json.dumps(_chat_request(model="old-model")).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=105),
+        terminal_results=[],
+    )
+    new_operation = FakeOperation(
+        operation_id=106,
+        frame_id=206,
+        body=json.dumps(_chat_request(model="new-model")).encode("utf-8"),
+        metadata=_submit_metadata(operation_id=106),
+        terminal_results=[],
+    )
+    completed = 0
+
+    def operation_completed() -> None:
+        nonlocal completed
+        completed += 1
+        if completed == 2:
+            stop_event.set()
+
+    old_operation.on_terminal = operation_completed
+    new_operation.on_terminal = operation_completed
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=old_operation),
+            FakeServerEvent(
+                runtime=_supersede_event(old_operation_id=105, new_operation_id=106, sequence=1),
+                wait_for_backend=True,
+            ),
+            FakeServerEvent(submit=new_operation),
+        ],
+        operation=old_operation,
+        backend_started=backend.old_started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=2,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_operations == 2
+    assert statistics.terminal_results == 2
+    assert backend.old_closed.is_set()
+    assert old_operation.terminal_results == []
+    assert len(old_operation.result_drops) == 1
+    assert old_operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.SUPERSEDED
+    assert old_operation.result_drops[0][1] == b"newer_request"
+    assert len(new_operation.terminal_results) == 1
+    assert json.loads(new_operation.terminal_results[0][1])["type"] == "response.completed"
+
+
 def _control_event(message_type: MessageType, *, operation_id: int, sequence: int) -> NativeRuntimeEvent:
     metadata = ControlRequestMetadata(
         operation_id=operation_id,
@@ -779,6 +870,27 @@ def _deadline_event(
         RuntimeFrameHeader(message_type=message_type, session_id=1),
         RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
         RuntimeEventTail.none(),
+    )
+
+
+def _supersede_event(
+    *,
+    old_operation_id: int,
+    new_operation_id: int,
+    sequence: int,
+) -> NativeRuntimeEvent:
+    metadata = SupersedeMetadata(
+        old_operation_id=old_operation_id,
+        new_operation_id=new_operation_id,
+        control_sequence=sequence,
+        drop_reason_code=int(ResultDropReasonCode.SUPERSEDED),
+        flags=1,
+        diagnostic_bytes=len(b"newer_request"),
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.SUPERSEDE, session_id=1),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SUPERSEDE, metadata),
+        RuntimeEventTail.with_body(b"newer_request"),
     )
 
 

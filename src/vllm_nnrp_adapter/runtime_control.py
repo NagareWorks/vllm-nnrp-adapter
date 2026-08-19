@@ -13,6 +13,7 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
     RuntimeEventTailKind,
     RuntimeRole,
     SchedulingMetadata,
+    SupersedeMetadata,
 )
 
 
@@ -22,6 +23,7 @@ class RuntimeControlKind(StrEnum):
     PEER_DISCONNECT = "peer_disconnect"
     SERVER_SHUTDOWN = "server_shutdown"
     DEADLINE_EXPIRED = "deadline_expired"
+    SUPERSEDE = "supersede"
 
 
 class RuntimeControlDisposition(StrEnum):
@@ -40,6 +42,7 @@ class RuntimeControlRequest:
     source_role: RuntimeRole | int
     flags: int
     diagnostic: bytes
+    replacement_operation_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +82,26 @@ class OperationControlSlot:
         if task is None:
             raise RuntimeError(f"operation {self.operation_id} does not have a bound task")
         await asyncio.sleep(0)
+        task.cancel()
+        return RuntimeControlDisposition.APPLIED
+
+    async def activate_reserved(
+        self,
+        request: RuntimeControlRequest,
+        *,
+        terminal: bool,
+    ) -> RuntimeControlDisposition:
+        if request.control_sequence != self.last_control_sequence:
+            return RuntimeControlDisposition.STALE
+        if terminal:
+            return RuntimeControlDisposition.TERMINAL_OPERATION
+        if self.terminal_request is not None:
+            return RuntimeControlDisposition.STALE
+        self.terminal_request = request
+        await self._cancel_deadline()
+        task = self.task
+        if task is None:
+            raise RuntimeError(f"operation {self.operation_id} does not have a bound task")
         task.cancel()
         return RuntimeControlDisposition.APPLIED
 
@@ -135,6 +158,8 @@ class RuntimeControlRegistry:
     def __init__(self) -> None:
         self._slots: dict[int, OperationControlSlot] = {}
         self._pending_deadlines: dict[int, RuntimeDeadlineUpdate] = {}
+        self._pending_supersedes: dict[int, RuntimeControlRequest] = {}
+        self._pending_supersedes_by_old: dict[int, RuntimeControlRequest] = {}
 
     def register(self, operation_id: int) -> OperationControlSlot:
         if operation_id in self._slots:
@@ -168,6 +193,54 @@ class RuntimeControlRegistry:
         self._pending_deadlines[update.operation_id] = update
         return RuntimeControlDisposition.APPLIED
 
+    async def apply_supersede(
+        self,
+        request: RuntimeControlRequest,
+        *,
+        old_terminal: bool,
+        replacement_active: bool,
+    ) -> RuntimeControlDisposition:
+        slot = self._slots.get(request.operation_id)
+        if slot is None:
+            return RuntimeControlDisposition.UNKNOWN_OPERATION
+        if request.control_sequence <= slot.last_control_sequence:
+            return RuntimeControlDisposition.STALE
+        if old_terminal or slot.terminal_request is not None:
+            return RuntimeControlDisposition.TERMINAL_OPERATION
+        prior = self._pending_supersedes_by_old.get(request.operation_id)
+        if prior is not None and request.control_sequence <= prior.control_sequence:
+            return RuntimeControlDisposition.STALE
+        if replacement_active:
+            if prior is not None:
+                self._pending_supersedes.pop(prior.replacement_operation_id, None)
+                self._pending_supersedes_by_old.pop(request.operation_id, None)
+            return await slot.apply(request, terminal=False)
+        if prior is not None:
+            self._pending_supersedes.pop(prior.replacement_operation_id, None)
+        slot.last_control_sequence = request.control_sequence
+        self._pending_supersedes[request.replacement_operation_id] = request
+        self._pending_supersedes_by_old[request.operation_id] = request
+        return RuntimeControlDisposition.APPLIED
+
+    def pending_supersede(self, replacement_operation_id: int) -> RuntimeControlRequest | None:
+        return self._pending_supersedes.get(replacement_operation_id)
+
+    async def activate_replacement(
+        self,
+        replacement_operation_id: int,
+        *,
+        old_terminal: bool,
+    ) -> RuntimeControlDisposition | None:
+        request = self._pending_supersedes.pop(replacement_operation_id, None)
+        if request is None:
+            return None
+        if self._pending_supersedes_by_old.get(request.operation_id) is request:
+            self._pending_supersedes_by_old.pop(request.operation_id, None)
+        slot = self._slots.get(request.operation_id)
+        if slot is None:
+            return RuntimeControlDisposition.UNKNOWN_OPERATION
+        return await slot.activate_reserved(request, terminal=old_terminal)
+
     async def terminate_all(
         self,
         kind: RuntimeControlKind,
@@ -196,10 +269,30 @@ class RuntimeControlRegistry:
         await asyncio.gather(*(slot.complete() for slot in self._slots.values()))
         self._slots.clear()
         self._pending_deadlines.clear()
+        self._pending_supersedes.clear()
+        self._pending_supersedes_by_old.clear()
 
 
 def decode_operation_control(event: NativeRuntimeEvent) -> RuntimeControlRequest | None:
     message_type = event.header.message_type
+    if message_type is MessageType.SUPERSEDE:
+        metadata = event.metadata.value
+        if not isinstance(metadata, SupersedeMetadata):
+            raise TypeError("SUPERSEDE requires SupersedeMetadata")
+        if metadata.old_operation_id <= 0 or metadata.new_operation_id <= 0:
+            raise ValueError("SUPERSEDE requires non-zero old_operation_id and new_operation_id")
+        if metadata.old_operation_id == metadata.new_operation_id:
+            raise ValueError("SUPERSEDE requires distinct old_operation_id and new_operation_id")
+        return RuntimeControlRequest(
+            kind=RuntimeControlKind.SUPERSEDE,
+            operation_id=metadata.old_operation_id,
+            control_sequence=metadata.control_sequence,
+            reason_code=metadata.drop_reason_code,
+            source_role=RuntimeRole.CLIENT,
+            flags=metadata.flags,
+            diagnostic=_event_diagnostic(event),
+            replacement_operation_id=metadata.new_operation_id,
+        )
     if message_type not in {MessageType.CANCEL, MessageType.ABORT}:
         return None
     metadata = event.metadata.value

@@ -237,6 +237,13 @@ async def _serve_session(
                 continue
             counters.accepted_operations += 1
             control = controls.register(operation.operation_id)
+            pending_supersede = controls.pending_supersede(operation.operation_id)
+            if pending_supersede is not None:
+                try:
+                    old_terminal = registry.get(pending_supersede.operation_id).is_terminal
+                except OperationStateError:
+                    old_terminal = False
+                await controls.activate_replacement(operation.operation_id, old_terminal=old_terminal)
             task = asyncio.create_task(
                 _serve_operation(
                     adapter,
@@ -338,13 +345,20 @@ async def _serve_operation(
                 RuntimeControlKind.ABORT,
                 RuntimeControlKind.SERVER_SHUTDOWN,
                 RuntimeControlKind.DEADLINE_EXPIRED,
+                RuntimeControlKind.SUPERSEDE,
             }:
                 record.terminate(OperationState.DROPPED)
-                diagnostic = control_request.diagnostic or b"peer_abort"
+                diagnostic = control_request.diagnostic or {
+                    RuntimeControlKind.ABORT: b"peer_abort",
+                    RuntimeControlKind.SERVER_SHUTDOWN: b"server_shutdown",
+                    RuntimeControlKind.DEADLINE_EXPIRED: b"deadline_expired",
+                    RuntimeControlKind.SUPERSEDE: b"superseded",
+                }[control_request.kind]
                 drop_reason = {
                     RuntimeControlKind.ABORT: ResultDropReasonCode.PEER_CANCELLED,
                     RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
                     RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
+                    RuntimeControlKind.SUPERSEDE: ResultDropReasonCode.SUPERSEDED,
                 }[control_request.kind]
                 await progress.emit(OperationProgressStage.DROPPED)
                 await operation.send_result_drop(
@@ -408,7 +422,18 @@ async def _handle_runtime_control(
     except OperationStateError:
         terminal = False
     if request is not None:
-        disposition = await controls.apply(request, terminal=terminal)
+        if request.kind is RuntimeControlKind.SUPERSEDE:
+            try:
+                replacement_active = not registry.get(request.replacement_operation_id).is_terminal
+            except OperationStateError:
+                replacement_active = False
+            disposition = await controls.apply_supersede(
+                request,
+                old_terminal=terminal,
+                replacement_active=replacement_active,
+            )
+        else:
+            disposition = await controls.apply(request, terminal=terminal)
     else:
         assert deadline is not None
         disposition = await controls.apply_deadline(deadline, terminal=terminal)
