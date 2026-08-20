@@ -20,7 +20,7 @@
 
 - [x] Bind the OpenAI serving-object path for each compatibility family without starting the HTTP
   server.
-- [ ] Bind the engine-direct generation path for each compatibility family that exposes the required
+- [x] Bind the engine-direct generation path for each compatibility family that exposes the required
   request preprocessing and engine client APIs.
 - [x] Keep HTTP/SSE parsing behind an explicit smoke-only backend and exclude it from production
   auto-selection.

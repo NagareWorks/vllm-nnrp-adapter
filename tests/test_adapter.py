@@ -16,6 +16,7 @@ from vllm_nnrp_adapter.adapter import (
 from vllm_nnrp_adapter.http_sse_smoke import HttpSseSmokeBackend
 from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
 from vllm_nnrp_adapter.vllm_backend import EngineDirectChatStream, VllmBackend, VllmProductionBoundaryError
+from vllm_nnrp_adapter.vllm_compat import VLLM_COMPATIBILITY_BINDINGS, VllmEngineDirectBinding
 
 
 class StreamingBackend:
@@ -111,6 +112,8 @@ class FakeSamplingRequest:
     priority = 0
     max_completion_tokens = None
     max_tokens = 16
+    truncate_prompt_tokens = 7
+    include_reasoning = False
 
     def to_sampling_params(self, max_tokens: int, default_sampling_params: Mapping[str, Any]) -> dict[str, Any]:
         return {"max_tokens": max_tokens, **default_sampling_params}
@@ -129,6 +132,7 @@ class FakeModels:
 class FakeEngineClient:
     def __init__(self) -> None:
         self.aborted: list[str] = []
+        self.last_generate_kwargs: dict[str, object] = {}
 
     def generate(
         self,
@@ -140,6 +144,7 @@ class FakeEngineClient:
         assert engine_prompt == {"prompt_token_ids": [1, 2, 3]}
         assert sampling_params == {"max_tokens": 16, "temperature": 0.2}
         assert kwargs["priority"] == 0
+        self.last_generate_kwargs = dict(kwargs)
 
         async def outputs() -> AsyncIterator[FakeRequestOutput]:
             yield FakeRequestOutput(outputs=[FakeCompletionOutput(text="hello", token_ids=[10])])
@@ -159,6 +164,7 @@ class FakeDirectServingChat:
     default_sampling_params = {"temperature": 0.2}
     override_max_tokens = None
     reasoning_parser_cls = None
+    parser_cls = None
     use_harmony = False
     models = FakeModels()
 
@@ -196,6 +202,14 @@ class FakeErrorServingChat(FakeDirectServingChat):
             },
         )()
         return type("ErrorResponse", (), {"error": error})()
+
+
+class FakeBoundRequestFactory:
+    def __init__(self, binding: VllmEngineDirectBinding | None = None) -> None:
+        self.engine_direct_binding = binding or VLLM_COMPATIBILITY_BINDINGS[0].engine_direct
+
+    def __call__(self, body: Mapping[str, Any]) -> FakeSamplingRequest:
+        return FakeSamplingRequest()
 
 
 class FakeNoUsageRequestOutput(FakeRequestOutput):
@@ -717,7 +731,7 @@ async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch
         _module_with_get_max_tokens(),
     )
     serving_chat = FakeDirectServingChat()
-    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory())
     adapter = OpenAiNnrpAdapter(backend)
 
     events = [
@@ -756,7 +770,7 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
         _module_with_get_max_tokens(),
     )
     serving_chat = FakeDirectServingChat()
-    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory())
     adapter = OpenAiNnrpAdapter(backend)
 
     abort_observations: list[bool | None] = []
@@ -780,6 +794,54 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
     assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
     assert serving_chat.engine_client.aborted == ["chatcmpl-nnrp-test"]
     assert abort_observations == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name", "expected_truncate", "expected_parser_kwargs", "expected_reasoning_ended"),
+    (
+        (0, "vllm.entrypoints.utils", None, False, None),
+        (1, "vllm.entrypoints.utils", 7, True, True),
+        (2, "vllm.entrypoints.serve.utils.api_utils", 7, True, True),
+    ),
+)
+async def test_engine_direct_binding_matches_each_vllm_family(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+    expected_truncate: int | None,
+    expected_parser_kwargs: bool,
+    expected_reasoning_ended: bool | None,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+
+    stream = await backend.create_chat_completion({"model": "llama", "stream": True})
+
+    assert isinstance(stream, EngineDirectChatStream)
+    assert calls == [expected_truncate]
+    assert serving_chat.engine_client.last_generate_kwargs["reasoning_ended"] is expected_reasoning_ended
+    assert (
+        "reasoning_parser_kwargs" in serving_chat.engine_client.last_generate_kwargs
+    ) is expected_parser_kwargs
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_engine_direct_requires_named_compatibility_binding() -> None:
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+
+    with pytest.raises(VllmProductionBoundaryError, match="not supported by the engine-direct backend"):
+        await backend.create_chat_completion({"model": "llama", "stream": True})
+
+    assert serving_chat.fallback_calls == 0
 
 
 @pytest.mark.asyncio
@@ -879,7 +941,7 @@ async def test_vllm_backend_direct_path_can_be_disabled(monkeypatch: pytest.Monk
     serving_chat = FakeDirectServingChat()
     backend = VllmBackend(
         serving_chat,
-        request_factory=lambda body: FakeSamplingRequest(),
+        request_factory=FakeBoundRequestFactory(),
         prefer_engine_direct=False,
     )
 
@@ -896,7 +958,7 @@ async def test_vllm_backend_rejects_direct_render_error_without_sse_fallback(mon
         _module_with_get_max_tokens(),
     )
     serving_chat = FakeErrorServingChat()
-    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory())
 
     events = [
         event
@@ -934,7 +996,7 @@ async def test_vllm_backend_rejects_unimplemented_complex_features_without_sse_f
         _module_with_get_max_tokens(),
     )
     serving_chat = FakeDirectServingChat()
-    backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory())
 
     with pytest.raises(VllmProductionBoundaryError, match="not supported by the engine-direct backend"):
         await backend.create_chat_completion({"model": "llama", "stream": True, "tools": [{"type": "function"}]})
@@ -964,3 +1026,41 @@ def _module_with_get_max_tokens() -> ModuleType:
 
     module.get_max_tokens = get_max_tokens
     return module
+
+
+def _module_with_versioned_get_max_tokens(
+    module_name: str,
+    *,
+    supports_truncate: bool,
+) -> tuple[ModuleType, list[int | None]]:
+    module = ModuleType(module_name)
+    calls: list[int | None] = []
+
+    if supports_truncate:
+
+        def get_max_tokens(
+            max_model_len: int,
+            request_max_tokens: int | None,
+            prompt_len: int,
+            default_sampling_params: Mapping[str, Any],
+            override_max_tokens: int | None,
+            *,
+            truncate_prompt_tokens: int | None,
+        ) -> int:
+            calls.append(truncate_prompt_tokens)
+            return request_max_tokens or 32
+
+    else:
+
+        def get_max_tokens(  # type: ignore[misc]
+            max_model_len: int,
+            request_max_tokens: int | None,
+            prompt_len: int,
+            default_sampling_params: Mapping[str, Any],
+            override_max_tokens: int | None,
+        ) -> int:
+            calls.append(None)
+            return request_max_tokens or 32
+
+    module.get_max_tokens = get_max_tokens
+    return module, calls

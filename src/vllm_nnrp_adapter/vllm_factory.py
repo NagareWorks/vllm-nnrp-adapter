@@ -7,7 +7,7 @@ from typing import Any, Protocol, cast
 
 from .nnrp_contract import validate_nnrp_runtime_contract
 from .vllm_backend import VllmBackend
-from .vllm_compat import resolve_vllm_compatibility
+from .vllm_compat import VllmEngineDirectBinding, resolve_vllm_compatibility
 
 
 class RequestConstructor(Protocol):
@@ -20,6 +20,7 @@ class _BoundRequestFactory:
     request_type: object
     compatibility_binding: str
     vllm_version: str
+    engine_direct_binding: VllmEngineDirectBinding
 
     def __call__(self, body: Mapping[str, Any]) -> object:
         return _construct_request(self.request_type, body)
@@ -46,6 +47,7 @@ def create_vllm_backend(serving_chat: object) -> VllmBackend:
         request_type=request_type,
         compatibility_binding=binding.name,
         vllm_version=detected_version,
+        engine_direct_binding=binding.engine_direct,
     )
     return VllmBackend(serving_chat, request_factory=request_factory)
 

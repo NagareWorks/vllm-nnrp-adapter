@@ -5,11 +5,11 @@
 The optional dependency accepts `>=0.18.0,<0.27` for installation. Runtime support is
 limited to the named, feature-probed compatibility bindings below.
 
-| Binding | Tested anchor | Accepted minor family | Required serving method |
-| --- | --- | --- | --- |
-| `legacy-0.18` | `0.18.1` | `>=0.18.0,<0.19` | `create_chat_completion` |
-| `transition-0.22` | `0.22.1` | `>=0.22.0,<0.23` | `create_chat_completion` |
-| `current-0.26` | `0.26.0` | `>=0.26.0,<0.27` | `create_chat_completion` |
+| Binding | Tested anchor | Accepted minor family | Required serving method | Token-limit helper |
+| --- | --- | --- | --- | --- |
+| `legacy-0.18` | `0.18.1` | `>=0.18.0,<0.19` | `create_chat_completion` | `vllm.entrypoints.utils:get_max_tokens` |
+| `transition-0.22` | `0.22.1` | `>=0.22.0,<0.23` | `create_chat_completion` | `vllm.entrypoints.utils:get_max_tokens` |
+| `current-0.26` | `0.26.0` | `>=0.26.0,<0.27` | `create_chat_completion` | `vllm.entrypoints.serve.utils.api_utils:get_max_tokens` |
 
 Versions inside the installation range but outside these minor families are rejected at startup.
 Later patches in a listed family must still pass the same request-type and serving-feature probes.

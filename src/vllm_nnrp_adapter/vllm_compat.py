@@ -15,13 +15,23 @@ class VllmCompatibilityError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class VllmEngineDirectBinding:
+    required_serving_features: tuple[str, ...]
+    get_max_tokens_path: str
+    supports_truncate_prompt_tokens: bool
+    supports_reasoning_parser_kwargs: bool
+    parser_attribute: str
+    honors_include_reasoning: bool
+
+
+@dataclass(frozen=True, slots=True)
 class VllmCompatibilityBinding:
     name: str
     anchor_version: str
     version_range: str
     request_type_path: str
     serving_method: str
-    engine_direct_features: tuple[str, ...]
+    engine_direct: VllmEngineDirectBinding
 
     def accepts(self, installed_version: Version) -> bool:
         return installed_version in SpecifierSet(self.version_range)
@@ -31,9 +41,33 @@ _ENGINE_DIRECT_FEATURES = (
     "render_chat_request",
     "_extract_prompt_components",
     "_extract_prompt_len",
-    "engine_client",
 )
 _CHAT_COMPLETION_REQUEST_PATH = "vllm.entrypoints.openai.chat_completion.protocol:ChatCompletionRequest"
+
+_LEGACY_ENGINE_DIRECT = VllmEngineDirectBinding(
+    required_serving_features=_ENGINE_DIRECT_FEATURES,
+    get_max_tokens_path="vllm.entrypoints.utils:get_max_tokens",
+    supports_truncate_prompt_tokens=False,
+    supports_reasoning_parser_kwargs=False,
+    parser_attribute="reasoning_parser_cls",
+    honors_include_reasoning=False,
+)
+_TRANSITION_ENGINE_DIRECT = VllmEngineDirectBinding(
+    required_serving_features=_ENGINE_DIRECT_FEATURES,
+    get_max_tokens_path="vllm.entrypoints.utils:get_max_tokens",
+    supports_truncate_prompt_tokens=True,
+    supports_reasoning_parser_kwargs=True,
+    parser_attribute="reasoning_parser_cls",
+    honors_include_reasoning=True,
+)
+_CURRENT_ENGINE_DIRECT = VllmEngineDirectBinding(
+    required_serving_features=_ENGINE_DIRECT_FEATURES,
+    get_max_tokens_path="vllm.entrypoints.serve.utils.api_utils:get_max_tokens",
+    supports_truncate_prompt_tokens=True,
+    supports_reasoning_parser_kwargs=True,
+    parser_attribute="parser_cls",
+    honors_include_reasoning=True,
+)
 
 VLLM_COMPATIBILITY_BINDINGS = (
     VllmCompatibilityBinding(
@@ -42,7 +76,7 @@ VLLM_COMPATIBILITY_BINDINGS = (
         version_range=">=0.18.0,<0.19",
         request_type_path=_CHAT_COMPLETION_REQUEST_PATH,
         serving_method="create_chat_completion",
-        engine_direct_features=_ENGINE_DIRECT_FEATURES,
+        engine_direct=_LEGACY_ENGINE_DIRECT,
     ),
     VllmCompatibilityBinding(
         name="transition-0.22",
@@ -50,7 +84,7 @@ VLLM_COMPATIBILITY_BINDINGS = (
         version_range=">=0.22.0,<0.23",
         request_type_path=_CHAT_COMPLETION_REQUEST_PATH,
         serving_method="create_chat_completion",
-        engine_direct_features=_ENGINE_DIRECT_FEATURES,
+        engine_direct=_TRANSITION_ENGINE_DIRECT,
     ),
     VllmCompatibilityBinding(
         name="current-0.26",
@@ -58,7 +92,7 @@ VLLM_COMPATIBILITY_BINDINGS = (
         version_range=">=0.26.0,<0.27",
         request_type_path=_CHAT_COMPLETION_REQUEST_PATH,
         serving_method="create_chat_completion",
-        engine_direct_features=_ENGINE_DIRECT_FEATURES,
+        engine_direct=_CURRENT_ENGINE_DIRECT,
     ),
 )
 
@@ -94,12 +128,12 @@ def render_vllm_compatibility_table() -> str:
         f"The optional dependency accepts `{VLLM_INSTALLATION_RANGE}` for installation. Runtime support is",
         "limited to the named, feature-probed compatibility bindings below.",
         "",
-        "| Binding | Tested anchor | Accepted minor family | Required serving method |",
-        "| --- | --- | --- | --- |",
+        "| Binding | Tested anchor | Accepted minor family | Required serving method | Token-limit helper |",
+        "| --- | --- | --- | --- | --- |",
     ]
     rows.extend(
         f"| `{binding.name}` | `{binding.anchor_version}` | `{binding.version_range}` | "
-        f"`{binding.serving_method}` |"
+        f"`{binding.serving_method}` | `{binding.engine_direct.get_max_tokens_path}` |"
         for binding in VLLM_COMPATIBILITY_BINDINGS
     )
     rows.extend(

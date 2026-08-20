@@ -7,6 +7,8 @@ import uuid
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
+from .vllm_compat import VllmEngineDirectBinding
+
 CHAT_METHOD_CANDIDATES = (
     "create_chat_completion",
     "create_chat_completion_raw",
@@ -44,12 +46,23 @@ class VllmBackend:
         if body.get("stream", False):
             if not self._prefer_engine_direct:
                 raise VllmProductionBoundaryError("production streaming requires the engine-direct backend")
-            if not _supports_engine_direct(self._serving_chat, request, body):
+            engine_direct_binding = _engine_direct_binding(self._request_factory)
+            if engine_direct_binding is None or not _supports_engine_direct(
+                self._serving_chat,
+                request,
+                body,
+                engine_direct_binding,
+            ):
                 raise VllmProductionBoundaryError(
                     "request features or serving-object shape are not supported by the engine-direct backend"
                 )
             try:
-                return await _create_engine_direct_stream(self._serving_chat, request, body)
+                return await _create_engine_direct_stream(
+                    self._serving_chat,
+                    request,
+                    body,
+                    engine_direct_binding,
+                )
             except EngineDirectUnsupported as error:
                 raise VllmProductionBoundaryError("vLLM rejected the engine-direct request shape") from error
 
@@ -123,14 +136,19 @@ def _is_async_iterator(value: object) -> bool:
     return hasattr(value, "__aiter__") and hasattr(value, "__anext__")
 
 
-def _supports_engine_direct(serving_chat: object, request: object, body: Mapping[str, Any]) -> bool:
+def _supports_engine_direct(
+    serving_chat: object,
+    request: object,
+    body: Mapping[str, Any],
+    binding: VllmEngineDirectBinding,
+) -> bool:
     if not body.get("stream", False):
         return False
     if body.get("tools") or body.get("tool_choice"):
         return False
     if body.get("logprobs") or body.get("top_logprobs") or body.get("echo") or body.get("return_token_ids"):
         return False
-    if getattr(serving_chat, "reasoning_parser_cls", None) is not None:
+    if getattr(serving_chat, binding.parser_attribute, None) is not None:
         return False
     if getattr(serving_chat, "use_harmony", False):
         return False
@@ -138,7 +156,7 @@ def _supports_engine_direct(serving_chat: object, request: object, body: Mapping
         return False
     return all(
         callable(getattr(serving_chat, name, None))
-        for name in ("render_chat_request", "_extract_prompt_components", "_extract_prompt_len")
+        for name in binding.required_serving_features
     ) and hasattr(serving_chat, "engine_client")
 
 
@@ -146,6 +164,7 @@ async def _create_engine_direct_stream(
     serving_chat: object,
     request: object,
     body: Mapping[str, Any],
+    binding: VllmEngineDirectBinding,
 ) -> AsyncIterator[Mapping[str, Any]]:
     render_chat_request = _required_callable(serving_chat, "render_chat_request")
     rendered = render_chat_request(request)
@@ -165,7 +184,7 @@ async def _create_engine_direct_stream(
     request_id = _direct_request_id(request)
     lora_request = _call_optional(serving_chat, "_maybe_get_adapters", request, supports_default_mm_loras=True)
     model_name = _model_name(serving_chat, lora_request, body)
-    sampling_params = _sampling_params(serving_chat, request, engine_prompt)
+    sampling_params = _sampling_params(serving_chat, request, engine_prompt, binding)
     trace_headers = None
     data_parallel_rank = _call_optional(serving_chat, "_get_data_parallel_rank", None)
 
@@ -179,16 +198,16 @@ async def _create_engine_direct_stream(
     )
 
     engine_client = cast(Any, _required_attr(serving_chat, "engine_client"))
-    generator = engine_client.generate(
-        engine_prompt,
-        sampling_params,
-        request_id,
-        lora_request=lora_request,
-        trace_headers=trace_headers,
-        priority=_optional_int(_getattr_default(request, "priority", 0), default=0),
-        data_parallel_rank=data_parallel_rank,
-        reasoning_ended=None,
-    )
+    generate_kwargs: dict[str, object] = {
+        "lora_request": lora_request,
+        "trace_headers": trace_headers,
+        "priority": _optional_int(_getattr_default(request, "priority", 0), default=0),
+        "data_parallel_rank": data_parallel_rank,
+        "reasoning_ended": _reasoning_ended(request, binding),
+    }
+    if binding.supports_reasoning_parser_kwargs:
+        generate_kwargs["reasoning_parser_kwargs"] = None
+    generator = engine_client.generate(engine_prompt, sampling_params, request_id, **generate_kwargs)
     return EngineDirectChatStream(
         generator,
         engine_client=engine_client,
@@ -310,13 +329,18 @@ class _VllmBackendResponseError(RuntimeError):
         self.vllm_parameter = parameter
 
 
-def _sampling_params(serving_chat: object, request: object, engine_prompt: object) -> object:
+def _sampling_params(
+    serving_chat: object,
+    request: object,
+    engine_prompt: object,
+    binding: VllmEngineDirectBinding,
+) -> object:
     try:
-        utils = importlib.import_module("vllm.entrypoints.utils")
-    except ModuleNotFoundError as error:
+        module_name, symbol_name = binding.get_max_tokens_path.split(":", maxsplit=1)
+        utils = importlib.import_module(module_name)
+        get_max_tokens = _required_callable(utils, symbol_name)
+    except (ModuleNotFoundError, ValueError) as error:
         raise EngineDirectUnsupported from error
-
-    get_max_tokens = _required_callable(utils, "get_max_tokens")
     model_config = _required_attr(serving_chat, "model_config")
     default_sampling_params = _getattr_default(serving_chat, "default_sampling_params", {})
     max_model_len = _required_attr(model_config, "max_model_len")
@@ -325,17 +349,35 @@ def _sampling_params(serving_chat: object, request: object, engine_prompt: objec
     requested_max_tokens = max_completion_tokens if max_completion_tokens is not None else max_tokens
     prompt_len = _required_callable(serving_chat, "_extract_prompt_len")(engine_prompt)
     override_max_tokens = _getattr_default(serving_chat, "override_max_tokens", None)
-    resolved_max_tokens = get_max_tokens(
+    max_token_args = (
         max_model_len,
         requested_max_tokens,
         prompt_len,
         default_sampling_params,
         override_max_tokens,
     )
+    if binding.supports_truncate_prompt_tokens:
+        resolved_max_tokens = get_max_tokens(
+            *max_token_args,
+            truncate_prompt_tokens=_getattr_default(request, "truncate_prompt_tokens", None),
+        )
+    else:
+        resolved_max_tokens = get_max_tokens(*max_token_args)
     to_sampling_params = getattr(request, "to_sampling_params", None)
     if not callable(to_sampling_params):
         raise EngineDirectUnsupported
     return to_sampling_params(resolved_max_tokens, default_sampling_params)
+
+
+def _engine_direct_binding(request_factory: object | None) -> VllmEngineDirectBinding | None:
+    value = getattr(request_factory, "engine_direct_binding", None)
+    return value if isinstance(value, VllmEngineDirectBinding) else None
+
+
+def _reasoning_ended(request: object, binding: VllmEngineDirectBinding) -> bool | None:
+    if binding.honors_include_reasoning and not bool(_getattr_default(request, "include_reasoning", True)):
+        return True
+    return None
 
 
 def _direct_request_id(request: object) -> str:

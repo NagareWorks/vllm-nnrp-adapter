@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -75,6 +75,8 @@ def test_backend_records_selected_binding_and_version(monkeypatch: pytest.Monkey
 
     assert backend.compatibility_binding == "transition-0.22"
     assert backend.vllm_version == "0.22.1"
+    bound_factory = cast(Any, backend.__dict__["_request_factory"])
+    assert bound_factory.engine_direct_binding is VLLM_COMPATIBILITY_BINDINGS[1].engine_direct
 
 
 def test_compatibility_rejects_untested_minor_inside_installation_band() -> None:
