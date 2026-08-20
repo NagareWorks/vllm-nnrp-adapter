@@ -120,6 +120,7 @@ class ReplacementBackend:
     def __init__(self) -> None:
         self.old_started = threading.Event()
         self.old_closed = threading.Event()
+        self.old_close_calls = 0
 
     def create_chat_completion(self, body: Mapping[str, Any]) -> object:
         async def events() -> AsyncIterator[Mapping[str, Any]]:
@@ -133,7 +134,13 @@ class ReplacementBackend:
                 return
             yield {"choices": [{"index": 0, "delta": {"content": "new:complete"}}]}
 
-        return events()
+        stream = events()
+        if body["model"] == "old-model":
+            return AcceptedCloseStream(stream, self._record_old_close)
+        return stream
+
+    def _record_old_close(self) -> None:
+        self.old_close_calls += 1
 
 
 @dataclass
@@ -733,6 +740,7 @@ async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cann
 
     assert statistics.terminal_results == 1
     assert backend.closed.is_set()
+    assert backend.close_calls == 1
     assert operation.terminal_results == []
     assert len(operation.result_drops) == 1
     metadata, diagnostic = operation.result_drops[0]
@@ -791,6 +799,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
 
     assert statistics.terminal_results == 1
     assert backend.closed.is_set()
+    assert backend.close_calls == 1
     assert len(operation.result_drops) == 1
     assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.TRANSPORT_CLOSED
     assert operation.progress_results[-1][0].stage_code == 0x000A
@@ -845,6 +854,7 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
 
     assert statistics.terminal_results == 0
     assert backend.closed.is_set()
+    assert backend.close_calls == 1
     assert operation.terminal_results == []
     assert operation.result_drops == []
     assert session.closed is True
@@ -904,6 +914,7 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     assert statistics.accepted_operations == 1
     assert statistics.terminal_results == 1
     assert backend.closed.is_set()
+    assert backend.close_calls == 1
     assert [json.loads(body)["delta"] for _metadata, body in operation.partial_results] == ["first"]
     assert operation.terminal_results == []
     assert len(operation.result_drops) == 1
@@ -981,6 +992,7 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
     assert statistics.accepted_operations == 2
     assert statistics.terminal_results == 2
     assert backend.old_closed.is_set()
+    assert backend.old_close_calls == 1
     assert old_operation.terminal_results == []
     assert len(old_operation.result_drops) == 1
     assert old_operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.SUPERSEDED

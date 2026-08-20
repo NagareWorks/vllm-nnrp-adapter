@@ -28,7 +28,7 @@
   finish reasons, and tool-call deltas across each binding.
 - [ ] Normalize backend error objects without depending on rendered HTTP responses.
 - [x] Provide one idempotent backend abort operation and record whether vLLM accepted it.
-- [ ] Close or cancel the underlying async generator exactly once on cancellation, timeout, abort,
+- [x] Close or cancel the underlying async generator exactly once on cancellation, timeout, abort,
   shutdown, or client disconnect.
 
 ## Compatibility Tests

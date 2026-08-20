@@ -7,7 +7,12 @@ from typing import Any
 import pytest
 
 from vllm_nnrp_adapter import OpenAiNnrpAdapter
-from vllm_nnrp_adapter.adapter import _close_async_iterator, classify_backend_error, map_openai_stream_chunk
+from vllm_nnrp_adapter.adapter import (
+    _AsyncIteratorCloseGuard,
+    _close_async_iterator,
+    classify_backend_error,
+    map_openai_stream_chunk,
+)
 from vllm_nnrp_adapter.http_sse_smoke import HttpSseSmokeBackend
 from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
 from vllm_nnrp_adapter.vllm_backend import EngineDirectChatStream, VllmBackend, VllmProductionBoundaryError
@@ -180,6 +185,7 @@ class FakeNoUsageRequestOutput(FakeRequestOutput):
 class ClosableStreamingBackend:
     def __init__(self) -> None:
         self.closed = False
+        self.close_calls = 0
 
     def create_chat_completion(self, body: Mapping[str, Any]) -> AsyncIterator[Mapping[str, Any]]:
         backend = self
@@ -194,7 +200,30 @@ class ClosableStreamingBackend:
                 return {"choices": [{"index": 0, "delta": {"content": "hello"}}]}
 
             async def aclose(self) -> None:
+                backend.close_calls += 1
                 backend.closed = True
+
+        return Chunks()
+
+
+class SlowClosableStreamingBackend:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> AsyncIterator[Mapping[str, Any]]:
+        backend = self
+
+        class Chunks:
+            def __aiter__(self) -> AsyncIterator[Mapping[str, Any]]:
+                return self
+
+            async def __anext__(self) -> Mapping[str, Any]:
+                await asyncio.sleep(0.05)
+                return {"choices": [{"index": 0, "delta": {"content": "late"}}]}
+
+            async def aclose(self) -> bool:
+                backend.close_calls += 1
+                return True
 
         return Chunks()
 
@@ -269,7 +298,34 @@ async def test_adapter_closes_stream_when_cancellation_policy_fires() -> None:
     ]
 
     assert backend.closed is True
+    assert backend.close_calls == 1
     assert events[-1]["type"] == "response.cancelled"
+
+
+@pytest.mark.asyncio
+async def test_adapter_closes_timed_out_stream_once() -> None:
+    backend = SlowClosableStreamingBackend()
+    adapter = OpenAiNnrpAdapter(backend)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+                "nnrp": {"timeout_ms": 1},
+            }
+        )
+    ]
+
+    assert backend.close_calls == 1
+    assert events[-1]["type"] == "response.error"
+    assert events[-1]["error"]["code"] == "request_timeout"
 
 
 @pytest.mark.asyncio
@@ -720,6 +776,19 @@ async def test_close_iterator_records_unknown_when_close_is_unavailable() -> Non
 
     assert await _close_async_iterator(IteratorWithoutClose(), observer=observations.append) is None
     assert observations == [None]
+
+
+@pytest.mark.asyncio
+async def test_close_guard_closes_and_observes_once() -> None:
+    backend = SlowClosableStreamingBackend()
+    chunks = backend.create_chat_completion({})
+    observations: list[bool | None] = []
+    guard = _AsyncIteratorCloseGuard(chunks, observer=observations.append)
+
+    assert await guard.close() is True
+    assert await guard.close() is True
+    assert backend.close_calls == 1
+    assert observations == [True]
 
 
 @pytest.mark.asyncio

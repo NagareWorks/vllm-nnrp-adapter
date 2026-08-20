@@ -89,19 +89,20 @@ class OpenAiNnrpAdapter:
                 emitted_events = 0
                 cancel_after_events = _cancel_after_events(envelope.get("nnrp"))
                 chunks = cast(AsyncIterator[Mapping[str, Any]], result)
+                close_guard = _AsyncIteratorCloseGuard(chunks, observer=backend_abort_observer)
                 try:
                     async for event in self._map_streaming_chunks(chunks, timeout_s=timeout_s):
                         yield event
                         emitted_events += 1
                         if cancel_after_events is not None and emitted_events >= cancel_after_events:
-                            await _close_async_iterator(chunks, observer=backend_abort_observer)
+                            await close_guard.close()
                             yield build_cancelled_event()
                             return
                 except asyncio.CancelledError:
-                    await _close_async_iterator(chunks, observer=backend_abort_observer)
+                    await close_guard.close()
                     raise
                 except TimeoutError as error:
-                    await _close_async_iterator(chunks, observer=backend_abort_observer)
+                    await close_guard.close()
                     raise error
                 yield build_completed_event({"object": "chat.completion.stream", "status": "completed"})
                 return
@@ -265,6 +266,26 @@ async def _close_async_iterator(
     if observer is not None:
         observer(accepted)
     return accepted
+
+
+class _AsyncIteratorCloseGuard:
+    def __init__(
+        self,
+        chunks: AsyncIterator[Mapping[str, Any]],
+        *,
+        observer: Callable[[bool | None], None] | None = None,
+    ) -> None:
+        self._chunks = chunks
+        self._observer = observer
+        self._closed = False
+        self._result: bool | None = None
+
+    async def close(self) -> bool | None:
+        if self._closed:
+            return self._result
+        self._closed = True
+        self._result = await _close_async_iterator(self._chunks, observer=self._observer)
+        return self._result
 
 
 def classify_backend_error(error: Exception) -> tuple[str, str]:
