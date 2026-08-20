@@ -318,7 +318,10 @@ async def _serve_operation(
             await progress.emit(OperationProgressStage.ADMITTED)
             await progress.emit(OperationProgressStage.PREPROCESSING)
             await progress.emit(OperationProgressStage.EXECUTING)
-            async for event in adapter.handle_request(request):
+            async for event in adapter._handle_native_request(
+                request,
+                backend_abort_observer=observation.record_backend_abort,
+            ):
                 body = _encode_event(event)
                 observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):

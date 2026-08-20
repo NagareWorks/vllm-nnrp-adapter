@@ -27,7 +27,7 @@
 - [ ] Preserve request id, model id, LoRA selection, sampling parameters, multimodal inputs, usage,
   finish reasons, and tool-call deltas across each binding.
 - [ ] Normalize backend error objects without depending on rendered HTTP responses.
-- [ ] Provide one idempotent backend abort operation and record whether vLLM accepted it.
+- [x] Provide one idempotent backend abort operation and record whether vLLM accepted it.
 - [ ] Close or cancel the underlying async generator exactly once on cancellation, timeout, abort,
   shutdown, or client disconnect.
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Protocol, cast
 
 from .profile import (
@@ -48,6 +48,15 @@ class OpenAiNnrpAdapter:
         )
 
     async def handle_request(self, request: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        async for event in self._handle_native_request(request):
+            yield event
+
+    async def _handle_native_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        backend_abort_observer: Callable[[bool | None], None] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         try:
             envelope = validate_request(request, self.capabilities)
             if envelope["operation"] != CHAT_COMPLETIONS_CREATE:
@@ -85,14 +94,14 @@ class OpenAiNnrpAdapter:
                         yield event
                         emitted_events += 1
                         if cancel_after_events is not None and emitted_events >= cancel_after_events:
-                            await _close_async_iterator(chunks)
+                            await _close_async_iterator(chunks, observer=backend_abort_observer)
                             yield build_cancelled_event()
                             return
                 except asyncio.CancelledError:
-                    await _close_async_iterator(chunks)
+                    await _close_async_iterator(chunks, observer=backend_abort_observer)
                     raise
                 except TimeoutError as error:
-                    await _close_async_iterator(chunks)
+                    await _close_async_iterator(chunks, observer=backend_abort_observer)
                     raise error
                 yield build_completed_event({"object": "chat.completion.stream", "status": "completed"})
                 return
@@ -239,13 +248,23 @@ async def _iterate_with_timeout(
             raise TimeoutError("backend stream did not yield before nnrp.timeout_ms") from error
 
 
-async def _close_async_iterator(chunks: AsyncIterator[Mapping[str, Any]]) -> None:
+async def _close_async_iterator(
+    chunks: AsyncIterator[Mapping[str, Any]],
+    *,
+    observer: Callable[[bool | None], None] | None = None,
+) -> bool | None:
     closer = getattr(chunks, "aclose", None)
     if closer is None:
-        return
+        if observer is not None:
+            observer(None)
+        return None
     result = closer()
     if inspect.isawaitable(result):
-        await result
+        result = await result
+    accepted = result if isinstance(result, bool) else None
+    if observer is not None:
+        observer(accepted)
+    return accepted
 
 
 def classify_backend_error(error: Exception) -> tuple[str, str]:

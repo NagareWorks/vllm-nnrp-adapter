@@ -7,10 +7,10 @@ from typing import Any
 import pytest
 
 from vllm_nnrp_adapter import OpenAiNnrpAdapter
-from vllm_nnrp_adapter.adapter import classify_backend_error, map_openai_stream_chunk
+from vllm_nnrp_adapter.adapter import _close_async_iterator, classify_backend_error, map_openai_stream_chunk
 from vllm_nnrp_adapter.http_sse_smoke import HttpSseSmokeBackend
 from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
-from vllm_nnrp_adapter.vllm_backend import VllmBackend, VllmProductionBoundaryError
+from vllm_nnrp_adapter.vllm_backend import EngineDirectChatStream, VllmBackend, VllmProductionBoundaryError
 
 
 class StreamingBackend:
@@ -625,9 +625,10 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
     backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
     adapter = OpenAiNnrpAdapter(backend)
 
+    abort_observations: list[bool | None] = []
     events = [
         event
-        async for event in adapter.handle_request(
+        async for event in adapter._handle_native_request(
             {
                 "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
                 "operation": CHAT_COMPLETIONS_CREATE,
@@ -637,12 +638,88 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
                     "messages": [{"role": "user", "content": "hello"}],
                     "stream": True,
                 },
-            }
+            },
+            backend_abort_observer=abort_observations.append,
         )
     ]
 
     assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
     assert serving_chat.engine_client.aborted == ["chatcmpl-nnrp-test"]
+    assert abort_observations == [True]
+
+
+@pytest.mark.asyncio
+async def test_engine_direct_stream_abort_is_idempotent_and_stops_iteration() -> None:
+    engine_client = FakeEngineClient()
+
+    async def outputs() -> AsyncIterator[FakeRequestOutput]:
+        yield FakeRequestOutput(outputs=[FakeCompletionOutput(text="late", token_ids=[10])])
+
+    stream = EngineDirectChatStream(
+        outputs(),
+        engine_client=engine_client,
+        request_id="chatcmpl-nnrp-idempotent",
+        model_name="llama",
+        include_usage=False,
+    )
+
+    assert await stream.aclose() is True
+    assert await stream.aclose() is True
+    assert engine_client.aborted == ["chatcmpl-nnrp-idempotent"]
+    with pytest.raises(StopAsyncIteration):
+        await stream.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_engine_direct_stream_reports_unsupported_abort() -> None:
+    async def outputs() -> AsyncIterator[FakeRequestOutput]:
+        yield FakeRequestOutput(outputs=[])
+
+    stream = EngineDirectChatStream(
+        outputs(),
+        engine_client=object(),
+        request_id="chatcmpl-nnrp-unsupported",
+        model_name="llama",
+        include_usage=False,
+    )
+
+    assert await stream.aclose() is False
+    assert await stream.aclose() is False
+
+
+@pytest.mark.asyncio
+async def test_engine_direct_stream_reports_failed_abort() -> None:
+    class FailingAbortClient:
+        async def abort(self, request_id: str) -> None:
+            raise RuntimeError(f"cannot abort {request_id}")
+
+    async def outputs() -> AsyncIterator[FakeRequestOutput]:
+        yield FakeRequestOutput(outputs=[])
+
+    stream = EngineDirectChatStream(
+        outputs(),
+        engine_client=FailingAbortClient(),
+        request_id="chatcmpl-nnrp-failed",
+        model_name="llama",
+        include_usage=False,
+    )
+
+    assert await stream.aclose() is False
+
+
+@pytest.mark.asyncio
+async def test_close_iterator_records_unknown_when_close_is_unavailable() -> None:
+    class IteratorWithoutClose:
+        def __aiter__(self) -> AsyncIterator[Mapping[str, Any]]:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            raise StopAsyncIteration
+
+    observations: list[bool | None] = []
+
+    assert await _close_async_iterator(IteratorWithoutClose(), observer=observations.append) is None
+    assert observations == [None]
 
 
 @pytest.mark.asyncio

@@ -73,6 +73,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
         ),
         drop_reason=ResultDropReasonCode.PEER_CANCELLED,
     )
+    tracker.record_backend_abort(True)
     observation = tracker.finish(OperationState.DROPPED)
 
     assert observation.identity.selected_transport == "ipc"
@@ -101,6 +102,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.cancellation_kind == "abort"
     assert observation.cancellation_source == "client"
     assert observation.cancellation_reason_code == 19
+    assert observation.backend_abort_accepted is True
     assert observation.drop_reason == "peer_cancelled"
     assert observation.terminal_outcome == "dropped"
     with pytest.raises(FrozenInstanceError):
@@ -115,6 +117,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert payload["model_id"] == "test-model"
     assert payload["backend_binding"] == "current-0.26"
     assert payload["vllm_version"] == "0.26.0"
+    assert payload["backend_abort_accepted"] is True
     assert payload["terminal_outcome"] == "dropped"
 
 
@@ -139,6 +142,7 @@ def test_operation_observation_keeps_unavailable_values_absent() -> None:
     assert observation.first_event_latency_ms == 0.0001
     assert observation.prompt_tokens is None
     assert observation.error_family == "ValueError"
+    assert observation.backend_abort_accepted is None
 
 
 def _operation() -> Any:

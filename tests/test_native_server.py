@@ -74,6 +74,7 @@ class CancellableBackend:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.closed = threading.Event()
+        self.close_calls = 0
         self._release = asyncio.Event()
 
     def create_chat_completion(self, body: Mapping[str, Any]) -> object:
@@ -86,7 +87,33 @@ class CancellableBackend:
             finally:
                 self.closed.set()
 
-        return events()
+        return AcceptedCloseStream(events(), self._record_close)
+
+    def _record_close(self) -> None:
+        self.close_calls += 1
+
+
+class AcceptedCloseStream:
+    def __init__(self, iterator: Any, on_close: Callable[[], None]) -> None:
+        self._iterator = iterator
+        self._on_close = on_close
+        self._closed = False
+
+    def __aiter__(self) -> AcceptedCloseStream:
+        return self
+
+    async def __anext__(self) -> Mapping[str, Any]:
+        if self._closed:
+            raise StopAsyncIteration
+        return await self._iterator.__anext__()
+
+    async def aclose(self) -> bool:
+        if self._closed:
+            return True
+        self._closed = True
+        self._on_close()
+        await self._iterator.aclose()
+        return True
 
 
 class ReplacementBackend:
@@ -636,6 +663,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     assert statistics.accepted_operations == 1
     assert statistics.terminal_results == 1
     assert backend.closed.is_set()
+    assert backend.close_calls == 1
     assert [json.loads(body)["delta"] for _metadata, body in operation.partial_results] == ["first"]
     if expect_drop:
         assert operation.terminal_results == []
@@ -654,6 +682,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     assert observation["cancellation_kind"] == message_type.name.lower()
     assert observation["cancellation_source"] == "client"
     assert observation["cancellation_reason_code"] == 3
+    assert observation["backend_abort_accepted"] is True
     assert observation["drop_reason"] == ("peer_cancelled" if expect_drop else None)
 
 

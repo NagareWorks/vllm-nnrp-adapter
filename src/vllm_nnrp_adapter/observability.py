@@ -49,6 +49,7 @@ class _OperationObservation:
     cancellation_kind: str | None
     cancellation_source: str | None
     cancellation_reason_code: int | None
+    backend_abort_accepted: bool | None
     drop_reason: str | None
     terminal_outcome: str
 
@@ -80,6 +81,7 @@ class _OperationObservation:
             "cancellation_kind": self.cancellation_kind,
             "cancellation_source": self.cancellation_source,
             "cancellation_reason_code": self.cancellation_reason_code,
+            "backend_abort_accepted": self.backend_abort_accepted,
             "drop_reason": self.drop_reason,
             "terminal_outcome": self.terminal_outcome,
         }
@@ -108,6 +110,7 @@ class _OperationObservationTracker:
     _cancellation_kind: str | None = field(default=None, repr=False)
     _cancellation_source: str | None = field(default=None, repr=False)
     _cancellation_reason_code: int | None = field(default=None, repr=False)
+    _backend_abort_accepted: bool | None = field(default=None, repr=False)
     _drop_reason: str | None = field(default=None, repr=False)
     _finished: bool = field(default=False, repr=False)
 
@@ -186,6 +189,9 @@ class _OperationObservationTracker:
     def record_drop(self, drop_reason: object) -> None:
         self._drop_reason = _enum_value(drop_reason)
 
+    def record_backend_abort(self, accepted: bool | None) -> None:
+        self._backend_abort_accepted = accepted
+
     def finish(self, terminal_state: OperationState) -> _OperationObservation:
         if self._finished:
             raise RuntimeError(f"operation {self.identity.operation_id} observation already finished")
@@ -211,6 +217,7 @@ class _OperationObservationTracker:
             cancellation_kind=self._cancellation_kind,
             cancellation_source=self._cancellation_source,
             cancellation_reason_code=self._cancellation_reason_code,
+            backend_abort_accepted=self._backend_abort_accepted,
             drop_reason=self._drop_reason,
             terminal_outcome=terminal_state.value,
         )

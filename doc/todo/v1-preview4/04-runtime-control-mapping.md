@@ -8,7 +8,7 @@
 - [x] Map `SUPERSEDE` to atomic old-operation cancellation and new-operation admission.
 - [x] Map `DEADLINE` and `EXPIRE_AT` to absolute operation timers and discard stale backend output.
 - [x] Preserve control sequence ordering and reject stale or duplicate updates.
-- [ ] Record cancellation source, reason code, backend acceptance, and terminal state.
+- [x] Record cancellation source, reason code, backend acceptance, and terminal state.
 
 ## Scheduling And Budgets
 

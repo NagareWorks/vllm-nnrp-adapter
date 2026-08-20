@@ -215,11 +215,14 @@ class EngineDirectChatStream:
         self._prompt_tokens = 0
         self._final_usage_pending = False
         self._closed = False
+        self._abort_accepted: bool | None = None
 
     def __aiter__(self) -> EngineDirectChatStream:
         return self
 
     async def __anext__(self) -> Mapping[str, Any]:
+        if self._closed:
+            raise StopAsyncIteration
         if self._final_usage_pending:
             self._final_usage_pending = False
             raise StopAsyncIteration
@@ -230,16 +233,17 @@ class EngineDirectChatStream:
             self._final_usage_pending = True
         return chunk
 
-    async def aclose(self) -> None:
+    async def aclose(self) -> bool:
         if self._closed:
-            return
+            return self._abort_accepted is True
         self._closed = True
-        await _abort_request(self._engine_client, self._request_id)
+        self._abort_accepted = await _abort_request(self._engine_client, self._request_id)
         closer = getattr(self._generator, "aclose", None)
         if callable(closer):
             closed = closer()
             if inspect.isawaitable(closed):
                 await closed
+        return self._abort_accepted
 
     def _chunk_from_request_output(self, result: object) -> Mapping[str, Any]:
         prompt_token_ids = _getattr_default(result, "prompt_token_ids", None)
@@ -353,13 +357,17 @@ def _call_optional(owner: object, name: str, *args: object, **kwargs: object) ->
     return cast(object | None, method(*args, **kwargs))
 
 
-async def _abort_request(engine_client: object, request_id: str) -> None:
+async def _abort_request(engine_client: object, request_id: str) -> bool:
     abort = getattr(engine_client, "abort", None)
     if not callable(abort):
-        return
-    result = abort(request_id)
-    if inspect.isawaitable(result):
-        await result
+        return False
+    try:
+        result = abort(request_id)
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:
+        return False
+    return result if isinstance(result, bool) else True
 
 
 def _getattr_default(value: object, name: str, default: object) -> object:
