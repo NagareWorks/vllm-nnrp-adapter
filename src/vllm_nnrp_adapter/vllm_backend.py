@@ -98,7 +98,9 @@ def _normalize_chat_result(result: object) -> object:
         raise VllmProductionBoundaryError("production vLLM backend received an HTTP/SSE-shaped stream")
     if isinstance(result, str):
         raise VllmProductionBoundaryError("production vLLM backend received an HTTP/SSE string")
-    return _normalize_object(result)
+    normalized = _normalize_object(result)
+    _raise_for_backend_error(normalized)
+    return normalized
 
 
 def _normalize_object(value: object) -> object:
@@ -150,6 +152,7 @@ async def _create_engine_direct_stream(
     if inspect.isawaitable(rendered):
         rendered = await rendered
     if _looks_like_error_response(rendered):
+        _raise_for_backend_error(_normalize_object(rendered))
         raise EngineDirectUnsupported
     if not isinstance(rendered, tuple) or len(rendered) != 2:
         raise EngineDirectUnsupported
@@ -292,6 +295,21 @@ class VllmProductionBoundaryError(RuntimeError):
     pass
 
 
+class _VllmBackendResponseError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str | None,
+        status_code: int | None,
+        parameter: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.vllm_error_type = error_type
+        self.vllm_status_code = status_code
+        self.vllm_parameter = parameter
+
+
 def _sampling_params(serving_chat: object, request: object, engine_prompt: object) -> object:
     try:
         utils = importlib.import_module("vllm.entrypoints.utils")
@@ -347,7 +365,33 @@ def _request_output_finished(result: object) -> bool:
 
 
 def _looks_like_error_response(value: object) -> bool:
-    return hasattr(value, "error") or type(value).__name__ == "ErrorResponse"
+    return (
+        (isinstance(value, Mapping) and "error" in value)
+        or hasattr(value, "error")
+        or type(value).__name__ == "ErrorResponse"
+    )
+
+
+def _raise_for_backend_error(value: object) -> None:
+    error = value.get("error") if isinstance(value, Mapping) else getattr(value, "error", None)
+    if error is None:
+        return
+    if isinstance(error, Mapping):
+        message = error.get("message")
+        error_type = error.get("type")
+        status_code = error.get("code")
+        parameter = error.get("param")
+    else:
+        message = getattr(error, "message", error)
+        error_type = getattr(error, "type", None)
+        status_code = getattr(error, "code", None)
+        parameter = getattr(error, "param", None)
+    raise _VllmBackendResponseError(
+        message if isinstance(message, str) else str(message),
+        error_type=error_type if isinstance(error_type, str) else None,
+        status_code=status_code if type(status_code) is int else None,
+        parameter=parameter if isinstance(parameter, str) else None,
+    )
 
 
 def _call_optional(owner: object, name: str, *args: object, **kwargs: object) -> object | None:

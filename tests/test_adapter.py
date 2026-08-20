@@ -67,6 +67,19 @@ class PydanticLikeCompletion:
         return {"id": "chatcmpl-model", "choices": [{"message": {"content": "hello"}}]}
 
 
+class PydanticLikeErrorResponse:
+    def model_dump(self, *, mode: str = "python") -> Mapping[str, Any]:
+        assert mode == "json"
+        return {
+            "error": {
+                "message": "scheduler full",
+                "type": "SchedulerRejected",
+                "param": "priority",
+                "code": 503,
+            }
+        }
+
+
 class FakeRequestOutput:
     def __init__(self, *, outputs: list[object], finished: bool = False) -> None:
         self.request_id = "chatcmpl-nnrp-test"
@@ -172,7 +185,17 @@ class FakeDirectServingChat:
 
 class FakeErrorServingChat(FakeDirectServingChat):
     async def render_chat_request(self, request: FakeSamplingRequest) -> object:
-        return type("ErrorResponse", (), {"error": "bad model"})()
+        error = type(
+            "ErrorInfo",
+            (),
+            {
+                "message": "The requested model is not available.",
+                "type": "NotFoundError",
+                "param": "model",
+                "code": 404,
+            },
+        )()
+        return type("ErrorResponse", (), {"error": error})()
 
 
 class FakeNoUsageRequestOutput(FakeRequestOutput):
@@ -537,6 +560,27 @@ def test_backend_error_classifier_maps_scheduler_rejections_and_cancellation() -
     )
 
 
+@pytest.mark.parametrize(
+    ("status", "backend_type", "expected"),
+    [
+        (400, "BadRequestError", ("invalid_request_error", "invalid_backend_request")),
+        (422, "ValidationError", ("invalid_request_error", "invalid_backend_request")),
+        (429, "RateLimitError", ("server_error", "backend_overload")),
+        (503, "ServiceUnavailable", ("server_error", "backend_overload")),
+    ],
+)
+def test_backend_error_classifier_maps_structured_status(
+    status: int,
+    backend_type: str,
+    expected: tuple[str, str],
+) -> None:
+    error = RuntimeError("structured backend failure")
+    error.vllm_status_code = status  # type: ignore[attr-defined]
+    error.vllm_error_type = backend_type  # type: ignore[attr-defined]
+
+    assert classify_backend_error(error) == expected
+
+
 @pytest.mark.asyncio
 async def test_vllm_backend_probes_supported_method() -> None:
     class ServingChat:
@@ -546,6 +590,40 @@ async def test_vllm_backend_probes_supported_method() -> None:
     backend = VllmBackend(ServingChat())
 
     assert await backend.create_chat_completion({"model": "llama"}) == {"echo": "llama"}
+
+
+@pytest.mark.asyncio
+async def test_vllm_backend_normalizes_structured_non_streaming_error() -> None:
+    class ServingChat:
+        def create_chat_completion(self, body: dict[str, Any]) -> PydanticLikeErrorResponse:
+            return PydanticLikeErrorResponse()
+
+    events = [
+        event
+        async for event in OpenAiNnrpAdapter(VllmBackend(ServingChat())).handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            }
+        )
+    ]
+
+    assert events[0]["error"] == {
+        "type": "server_error",
+        "code": "scheduler_rejected",
+        "message": "scheduler full",
+    }
+    assert events[0]["diagnostics"] == {
+        "backend_error_family": "_VllmBackendResponseError",
+        "vllm_error_type": "SchedulerRejected",
+        "vllm_status_code": 503,
+        "vllm_parameter": "priority",
+    }
 
 
 @pytest.mark.asyncio
@@ -820,8 +898,29 @@ async def test_vllm_backend_rejects_direct_render_error_without_sse_fallback(mon
     serving_chat = FakeErrorServingChat()
     backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
 
-    with pytest.raises(VllmProductionBoundaryError, match="rejected the engine-direct request shape"):
-        await backend.create_chat_completion({"model": "llama", "stream": True})
+    events = [
+        event
+        async for event in OpenAiNnrpAdapter(backend).handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            }
+        )
+    ]
+
+    assert events[0]["error"] == {
+        "type": "invalid_request_error",
+        "code": "unsupported_model",
+        "message": "The requested model is not available.",
+    }
+    assert events[0]["diagnostics"]["vllm_error_type"] == "NotFoundError"
+    assert events[0]["diagnostics"]["vllm_status_code"] == 404
+    assert events[0]["diagnostics"]["vllm_parameter"] == "model"
     assert serving_chat.fallback_calls == 0
 
 

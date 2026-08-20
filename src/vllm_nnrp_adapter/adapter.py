@@ -118,7 +118,7 @@ class OpenAiNnrpAdapter:
                 error_type,
                 code,
                 str(error),
-                diagnostics={"backend_error_family": type(error).__name__},
+                diagnostics=_backend_error_diagnostics(error),
             )
 
     async def _map_streaming_chunks(
@@ -291,12 +291,33 @@ class _AsyncIteratorCloseGuard:
 def classify_backend_error(error: Exception) -> tuple[str, str]:
     class_name = type(error).__name__.lower()
     message = str(error).lower()
-    haystack = f"{class_name} {message}"
+    backend_type = getattr(error, "vllm_error_type", None)
+    backend_status = getattr(error, "vllm_status_code", None)
+    haystack = f"{class_name} {message} {backend_type or ''}".lower()
 
-    if "overload" in haystack or "rate limit" in haystack or "too many" in haystack:
+    if backend_status == 404:
+        return "invalid_request_error", "unsupported_model"
+    if backend_status == 429 or "overload" in haystack or "rate limit" in haystack or "too many" in haystack:
         return "server_error", "backend_overload"
     if "scheduler" in haystack and ("reject" in haystack or "full" in haystack):
         return "server_error", "scheduler_rejected"
     if "cancel" in haystack or "abort" in haystack:
         return "server_error", "backend_cancelled"
+    if backend_status in {400, 422}:
+        return "invalid_request_error", "invalid_backend_request"
+    if backend_status == 503:
+        return "server_error", "backend_overload"
     return "server_error", "backend_error"
+
+
+def _backend_error_diagnostics(error: Exception) -> dict[str, object]:
+    diagnostics: dict[str, object] = {"backend_error_family": type(error).__name__}
+    for attribute, field in (
+        ("vllm_error_type", "vllm_error_type"),
+        ("vllm_status_code", "vllm_status_code"),
+        ("vllm_parameter", "vllm_parameter"),
+    ):
+        value = getattr(error, attribute, None)
+        if value is not None:
+            diagnostics[field] = value
+    return diagnostics
