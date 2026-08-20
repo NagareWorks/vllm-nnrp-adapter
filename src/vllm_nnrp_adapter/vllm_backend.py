@@ -247,7 +247,7 @@ class EngineDirectChatStream:
             raise StopAsyncIteration
         if self._final_usage_pending:
             self._final_usage_pending = False
-            raise StopAsyncIteration
+            return self._usage_chunk()
 
         result = await self._generator.__anext__()
         chunk = self._chunk_from_request_output(result)
@@ -268,12 +268,18 @@ class EngineDirectChatStream:
         return self._abort_accepted
 
     def _chunk_from_request_output(self, result: object) -> Mapping[str, Any]:
+        observed_prompt_tokens = False
+        prompt_tokens = 0
         prompt_token_ids = _getattr_default(result, "prompt_token_ids", None)
         if prompt_token_ids is not None:
-            self._prompt_tokens = len(cast(list[object], prompt_token_ids))
+            observed_prompt_tokens = True
+            prompt_tokens += len(cast(list[object], prompt_token_ids))
         encoder_prompt_token_ids = _getattr_default(result, "encoder_prompt_token_ids", None)
         if encoder_prompt_token_ids is not None:
-            self._prompt_tokens += len(cast(list[object], encoder_prompt_token_ids))
+            observed_prompt_tokens = True
+            prompt_tokens += len(cast(list[object], encoder_prompt_token_ids))
+        if observed_prompt_tokens:
+            self._prompt_tokens = prompt_tokens
 
         choices = []
         for output in cast(list[object], _getattr_default(result, "outputs", [])):
@@ -290,20 +296,27 @@ class EngineDirectChatStream:
                 choice["stop_reason"] = stop_reason
             choices.append(choice)
 
-        chunk: dict[str, Any] = {
+        return {
             "id": self._request_id,
             "object": "chat.completion.chunk",
             "created": self._created,
             "choices": choices,
             "model": self._model_name,
         }
-        if self._include_usage and _request_output_finished(result):
-            chunk["usage"] = {
+
+    def _usage_chunk(self) -> Mapping[str, Any]:
+        return {
+            "id": self._request_id,
+            "object": "chat.completion.chunk",
+            "created": self._created,
+            "choices": [],
+            "model": self._model_name,
+            "usage": {
                 "prompt_tokens": self._prompt_tokens,
                 "completion_tokens": self._completion_tokens,
                 "total_tokens": self._prompt_tokens + self._completion_tokens,
-            }
-        return chunk
+            },
+        }
 
 
 class EngineDirectUnsupported(Exception):

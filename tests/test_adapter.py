@@ -753,13 +753,13 @@ async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch
     assert serving_chat.fallback_calls == 0
     assert [event["type"] for event in events] == [
         "response.output_text.delta",
-        "response.usage",
         "response.output_text.delta",
+        "response.usage",
         "response.completed",
     ]
     assert events[0]["delta"] == "hello"
-    assert events[1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-    assert events[2]["delta"] == " world"
+    assert events[1]["delta"] == " world"
+    assert events[2]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
 
 
 @pytest.mark.asyncio
@@ -862,6 +862,33 @@ async def test_engine_direct_stream_abort_is_idempotent_and_stops_iteration() ->
     assert await stream.aclose() is True
     assert await stream.aclose() is True
     assert engine_client.aborted == ["chatcmpl-nnrp-idempotent"]
+    with pytest.raises(StopAsyncIteration):
+        await stream.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_engine_direct_stream_emits_usage_after_terminal_delta_without_recounting_prompt() -> None:
+    first = FakeNoUsageRequestOutput()
+    terminal = FakeNoUsageRequestOutput()
+    terminal.finished = True
+
+    async def outputs() -> AsyncIterator[FakeRequestOutput]:
+        yield first
+        yield terminal
+
+    stream = EngineDirectChatStream(
+        outputs(),
+        engine_client=object(),
+        request_id="chatcmpl-nnrp-usage",
+        model_name="llama",
+        include_usage=True,
+    )
+
+    assert "usage" not in await stream.__anext__()
+    assert "usage" not in await stream.__anext__()
+    usage_chunk = await stream.__anext__()
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"] == {"prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2}
     with pytest.raises(StopAsyncIteration):
         await stream.__anext__()
 
