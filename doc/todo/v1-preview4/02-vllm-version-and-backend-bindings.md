@@ -40,5 +40,5 @@
 - [x] Test feature probing, exact unsupported-version diagnostics, and rejection of a version that
   falls inside the installation band but has no tested binding.
 - [x] Test that the production backend never enters the HTTP/SSE parser.
-- [ ] Record the vLLM version, compatibility binding, model, engine configuration, and GPU in every
+- [x] Record the vLLM version, compatibility binding, model, engine configuration, and GPU in every
   integration result.

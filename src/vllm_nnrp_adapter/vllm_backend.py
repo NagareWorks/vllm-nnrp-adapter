@@ -41,6 +41,19 @@ class VllmBackend:
         value = getattr(self._request_factory, "vllm_version", None)
         return value if isinstance(value, str) else None
 
+    def benchmark_metadata(self) -> Mapping[str, object]:
+        model_config = _getattr_default(self._serving_chat, "model_config", None)
+        engine_configuration = {
+            name: _metadata_value(_getattr_default(model_config, name, None))
+            for name in ("max_model_len", "dtype", "quantization", "task")
+            if _getattr_default(model_config, name, None) is not None
+        }
+        return {
+            "vllm_version": self.vllm_version or "unknown",
+            "compatibility_binding": self.compatibility_binding or "unknown",
+            "engine_configuration": engine_configuration or {"status": "unknown"},
+        }
+
     async def create_chat_completion(self, body: Mapping[str, Any]) -> Any:
         request = self._build_request(body)
         if body.get("stream", False):
@@ -495,3 +508,9 @@ def _optional_int(value: object, *, default: int) -> int:
         except ValueError:
             return default
     return default
+
+
+def _metadata_value(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)

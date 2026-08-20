@@ -30,6 +30,12 @@ class FakeChatCompletionRequest:
 
 
 class FakeServingChat:
+    model_config = type(
+        "FakeModelConfig",
+        (),
+        {"max_model_len": 4096, "dtype": "float16", "quantization": None, "task": "generate"},
+    )()
+
     def create_chat_completion(self, request: FakeChatCompletionRequest) -> dict[str, Any]:
         return {"model": request.payload["model"]}
 
@@ -77,6 +83,11 @@ def test_backend_records_selected_binding_and_version(monkeypatch: pytest.Monkey
     assert backend.vllm_version == "0.22.1"
     bound_factory = cast(Any, backend.__dict__["_request_factory"])
     assert bound_factory.engine_direct_binding is VLLM_COMPATIBILITY_BINDINGS[1].engine_direct
+    assert backend.benchmark_metadata() == {
+        "vllm_version": "0.22.1",
+        "compatibility_binding": "transition-0.22",
+        "engine_configuration": {"max_model_len": 4096, "dtype": "float16", "task": "generate"},
+    }
 
 
 def test_compatibility_rejects_untested_minor_inside_installation_band() -> None:

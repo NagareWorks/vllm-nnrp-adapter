@@ -31,7 +31,8 @@ async def make_async_mock_backend() -> MockChatCompletionBackend:
 
 
 @pytest.mark.asyncio
-async def test_benchmark_reports_core_latency_scenarios() -> None:
+async def test_benchmark_reports_core_latency_scenarios(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("vllm_nnrp_adapter.benchmark._detect_gpu_metadata", lambda: {"status": "unavailable"})
     report = await run_benchmark(
         backend=MockChatCompletionBackend(),
         config=BenchmarkConfig(iterations=3, warmup=1),
@@ -39,6 +40,14 @@ async def test_benchmark_reports_core_latency_scenarios() -> None:
 
     assert report["profile"] == "openai-compatible"
     assert report["iterations"] == 3
+    assert report["integration"] == {
+        "backend_family": "MockChatCompletionBackend",
+        "vllm_version": "unknown",
+        "compatibility_binding": "unknown",
+        "model": "mock-model",
+        "engine_configuration": {"status": "unknown"},
+        "gpu": {"status": "unavailable"},
+    }
     scenario_names = {scenario["name"] for scenario in report["scenarios"]}
     assert scenario_names == {
         "chat.non_streaming.roundtrip",
@@ -97,6 +106,7 @@ async def test_comparison_benchmark_reports_long_context_matrix() -> None:
     )
 
     assert report["benchmark_kind"] == "in_process_comparison"
+    assert report["integration"]["model"] == "mock-model"
     assert report["paths"] == ["nnrp.direct_profile_events"]
     assert len(report["scenarios"]) == 4
     for scenario in report["scenarios"]:

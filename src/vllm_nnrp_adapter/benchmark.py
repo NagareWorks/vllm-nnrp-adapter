@@ -100,6 +100,7 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "adapter": "vllm-nnrp-adapter",
         "iterations": config.iterations,
         "warmup": config.warmup,
+        "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
 
@@ -182,6 +183,7 @@ async def run_in_process_comparison_benchmark(
         "iterations": config.iterations,
         "warmup": config.warmup,
         "model": config.model,
+        "integration": _integration_metadata(backend, config.model),
         "max_completion_tokens": config.max_completion_tokens,
         "paths": (
             ["nnrp.direct_profile_events", "openai.http_sse"]
@@ -190,6 +192,44 @@ async def run_in_process_comparison_benchmark(
         ),
         "scenarios": scenarios,
     }
+
+
+def _integration_metadata(backend: ChatCompletionBackend, model: str) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "backend_family": type(backend).__name__,
+        "vllm_version": "unknown",
+        "compatibility_binding": "unknown",
+        "model": model,
+        "engine_configuration": {"status": "unknown"},
+        "gpu": _detect_gpu_metadata(),
+    }
+    provider = getattr(backend, "benchmark_metadata", None)
+    if callable(provider):
+        supplied = provider()
+        if isinstance(supplied, Mapping):
+            for key in ("vllm_version", "compatibility_binding", "engine_configuration"):
+                if key in supplied:
+                    metadata[key] = supplied[key]
+    return metadata
+
+
+def _detect_gpu_metadata() -> Mapping[str, object]:
+    try:
+        import torch  # type: ignore[import-not-found]
+    except (ImportError, OSError):
+        return {"status": "unavailable"}
+
+    try:
+        if not torch.cuda.is_available():
+            return {"status": "unavailable"}
+        count = torch.cuda.device_count()
+        return {
+            "status": "available",
+            "count": count,
+            "devices": [torch.cuda.get_device_name(index) for index in range(count)],
+        }
+    except (AssertionError, RuntimeError):
+        return {"status": "unavailable"}
 
 
 async def _measure_non_streaming_roundtrip(
