@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from nnrp import NativeTransportServerSecurity, TransportPolicy  # type: ignore[import-untyped]
+from nnrp import (  # type: ignore[import-untyped]
+    NativeTransportServerSecurity,
+    TransportPolicy,
+    load_native_transport_binding,
+)
 from nnrp.server import NativeServerProviderRoute  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark_sync, run_comparison_benchmark_sync
 from .conformance import load_backend_async, run_conformance_plan_sync
-from .nnrp_runtime import NnrpServerConfig, serve
+from .nnrp_runtime import NnrpServerConfig, _serve_with_ready, serve
 
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
 _TRANSPORT_POLICIES = {policy.name.lower(): policy for policy in TransportPolicy}
@@ -101,6 +106,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     server.add_argument("--max-operations-per-session", type=int, default=4)
     server.add_argument("--native-workers", type=int, default=9)
 
+    wire_target = subcommands.add_parser(
+        "serve-wire-target",
+        help="Serve the adapter as an external OpenAI-profile wire conformance target.",
+    )
+    wire_target.add_argument("--ready-output", type=Path, required=True)
+    wire_target.add_argument("--backend", default="mock")
+    wire_target.add_argument("--suite-version", default="0.1.0")
+
     args = parser.parse_args(argv)
     if args.command == "run-conformance-plan":
         run_conformance_plan_sync(args.plan, args.output, args.backend)
@@ -141,6 +154,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 130
         return 0
+    if args.command == "serve-wire-target":
+        try:
+            asyncio.run(_serve_wire_target(args.backend, args.ready_output, args.suite_version))
+        except KeyboardInterrupt:
+            return 130
+        return 0
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -158,6 +177,47 @@ def _parse_int_tuple(value: str, *, option_name: str) -> tuple[int, ...]:
 async def _serve_backend(backend_spec: str, config: NnrpServerConfig) -> None:
     backend = await load_backend_async(backend_spec)
     await serve(OpenAiNnrpAdapter(backend), config=config)
+
+
+async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_version: str) -> None:
+    backend = await load_backend_async(backend_spec)
+    config = NnrpServerConfig(
+        endpoint="nnrp://wire-target.local/vllm",
+        provider_routes={"tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0")},
+        transports=(load_native_transport_binding("tcp"),),
+        max_active_sessions=1,
+        max_operations_per_session=1,
+        native_worker_count=2,
+    )
+
+    def publish_ready(bound_endpoints: Mapping[str, object]) -> None:
+        endpoint = bound_endpoints.get("tcp")
+        address = getattr(endpoint, "address", None)
+        if not isinstance(address, str) or not address:
+            raise RuntimeError("wire target did not expose its bound TCP endpoint")
+        document = {
+            "$schema": "https://github.com/NagareWorks/nnrp-conformance/schemas/wire-conformance-target.schema.json",
+            "target_name": "vllm-nnrp-adapter",
+            "protocol_version": "nnrp-1-preview4",
+            "suite_version": suite_version,
+            "wire_conformance": {
+                "modes": ["suite_as_client"],
+                "transports": [{"name": "tcp", "endpoint": address, "tls": False}],
+                "host_route_providers": [],
+                "capabilities": ["profile.openai-compatible.level1.wire"],
+                "limits": {"max_frame_bytes": 67_108_864, "max_in_flight": 1},
+            },
+        }
+        ready_output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = ready_output.with_suffix(f"{ready_output.suffix}.tmp")
+        temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(ready_output)
+
+    await _serve_with_ready(
+        OpenAiNnrpAdapter(backend),
+        config=config,
+        on_ready=publish_ready,
+    )
 
 
 def _provider_routes(

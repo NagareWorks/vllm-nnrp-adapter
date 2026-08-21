@@ -12,7 +12,7 @@
 
 ## Wire-Level Conformance
 
-- [ ] Start the real Rust-backed adapter server as an external wire target.
+- [x] Start the real Rust-backed adapter server as an external wire target.
 - [ ] Let `nnrp-conformance` act as client, server, and proxy where each scenario requires.
 - [ ] Cover native handshake, submit/result order, cancellation/abort, priority/deadline, progress,
   pressure/credit, capability costs, route hints, trace context, result-drop reasons, objects,

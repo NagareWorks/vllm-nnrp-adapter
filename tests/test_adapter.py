@@ -417,7 +417,9 @@ async def test_adapter_maps_streaming_chat_chunks() -> None:
     assert events[0]["type"] == "response.output_text.delta"
     assert events[0]["delta"] == "hello"
     assert events[1]["type"] == "response.usage"
-    assert len(events) == 2
+    assert events[2]["type"] == "response.completed"
+    assert events[2]["body"]["choices"][0]["message"]["content"] == "hello"
+    assert events[2]["body"]["usage"] == {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
 
 
 @pytest.mark.asyncio
@@ -814,7 +816,12 @@ def test_stream_chunk_mapper_completes_interleaved_tool_calls_in_order() -> None
         ("call-a", '{"a":1}'),
         ("call-b", '{"b":2}'),
     ]
-    assert mapper.finish() == []
+    terminal = mapper.finish()
+    assert [event["type"] for event in terminal] == ["response.completed"]
+    assert [call["id"] for call in terminal[0]["body"]["choices"][0]["message"]["tool_calls"]] == [
+        "call-a",
+        "call-b",
+    ]
 
 
 def test_stream_chunk_mapper_reports_malformed_and_interrupted_tool_calls() -> None:
@@ -980,7 +987,7 @@ async def test_explicit_smoke_backend_normalizes_in_process_sse_stream() -> None
         )
     ]
 
-    assert [event["type"] for event in events] == ["response.output_text.delta"]
+    assert [event["type"] for event in events] == ["response.output_text.delta", "response.completed"]
     assert events[0]["delta"] == "hello"
     assert adapter.capabilities.operations[0]["tool_calls"] is True
 
@@ -1050,6 +1057,7 @@ async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch
         "response.output_text.delta",
         "response.output_text.delta",
         "response.usage",
+        "response.completed",
     ]
     assert events[0]["delta"] == "hello"
     assert events[1]["delta"] == " world"
@@ -1410,6 +1418,7 @@ async def test_engine_direct_tool_calls_follow_each_vllm_parser_family(
         "response.tool_call.delta",
         "response.tool_call.delta",
         "response.tool_call.completed",
+        "response.completed",
     ]
     assert events[0]["call_id"] == "call-parser"
     assert events[3]["arguments"] == "{}"

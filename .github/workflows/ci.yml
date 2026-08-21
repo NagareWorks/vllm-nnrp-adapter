@@ -81,10 +81,57 @@ jobs:
       - name: Validate distribution metadata
         run: python scripts/check_distribution_metadata.py dist
 
+  wire-e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout adapter
+        uses: actions/checkout@v5
+
+      - name: Checkout pinned conformance suite
+        uses: actions/checkout@v5
+        with:
+          repository: NagareWorks/nnrp-conformance
+          ref: a2c124bc98dd6844bb5699816f00ae089e7d328d
+          path: nnrp-conformance
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nnrp-conformance
+
+      - name: Install adapter and native providers
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Run independent OpenAI profile wire E2E
+        run: |
+          python scripts/run_wire_e2e.py \
+            --conformance-root nnrp-conformance \
+            --artifact-directory artifacts/wire-e2e
+
+      - name: Upload wire evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: openai-profile-wire-e2e
+          path: artifacts/wire-e2e
+          if-no-files-found: error
+
   required-checks:
     needs:
       - commit-policy
       - test
+      - wire-e2e
     if: always()
     runs-on: ubuntu-latest
 
@@ -99,5 +146,10 @@ jobs:
 
           if [ "${{ needs.test.result }}" != "success" ]; then
             echo "Lint, type check, test, coverage, or package build validation failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.wire-e2e.result }}" != "success" ]; then
+            echo "Independent OpenAI profile wire E2E failed."
             exit 1
           fi

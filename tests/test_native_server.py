@@ -20,9 +20,22 @@ from nnrp import (
     NativeTransportProviderMetadata,
     NativeTransportSelectionError,
     NativeWouldBlockError,
+    StreamSemantics,
     TransportId,
 )
-from nnrp.core import FrameSubmitMetadata, InputProfile, MessageType, PayloadKind, ResultClass, ResultPushMetadata
+from nnrp.core import (
+    FrameSubmitMetadata,
+    InputProfile,
+    MessageType,
+    PayloadKind,
+    ResultClass,
+    ResultPushMetadata,
+    build_typed_payload_frame,
+    pack_body,
+    pack_typed_payload_frames,
+    unpack_typed_payload_frames,
+    validate_result_push_body,
+)
 from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
 from nnrp.runtime import (
     ControlRequestMetadata,
@@ -393,7 +406,7 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     operation = FakeOperation(
         operation_id=71,
         frame_id=19,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=71),
         terminal_results=[],
     )
@@ -453,13 +466,13 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     ]
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "completed"
-    assert observation["output_event_count"] == 2
+    assert observation["output_event_count"] == 3
     assert observation["total_tokens"] == 2
     terminal_metadata, terminal_body = operation.terminal_results[0]
     assert terminal_metadata.result_class is ResultClass.COMPLETE
-    assert terminal_metadata.payload_kind_bitmap == PayloadKind(0)
-    assert terminal_metadata.payload_frame_count == 0
-    assert terminal_body == b""
+    assert terminal_metadata.payload_kind_bitmap == PayloadKind.STRUCTURED_EVENT
+    assert terminal_metadata.payload_frame_count == 1
+    assert _decode_terminal_profile_body(terminal_metadata, terminal_body)["type"] == "response.completed"
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
     assert config.transports == bindings
@@ -527,16 +540,24 @@ async def test_production_entrypoint_rejects_preview3_runtime_config() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_body_kind", ["raw-json", "non-snapshot", "trailing-byte"])
 async def test_invalid_submit_body_produces_one_terminal_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    invalid_body_kind: str,
 ) -> None:
     _capture_observations(caplog)
     stop_event = asyncio.Event()
+    if invalid_body_kind == "raw-json":
+        invalid_body = json.dumps(_chat_request()).encode("utf-8")
+    elif invalid_body_kind == "non-snapshot":
+        invalid_body = _typed_profile_body(_chat_request(), stream_semantics=StreamSemantics.APPEND)
+    else:
+        invalid_body = _typed_profile_body(_chat_request()) + b"unexpected"
     operation = FakeOperation(
         operation_id=72,
         frame_id=20,
-        body=b"not-json",
+        body=invalid_body,
         metadata=_submit_metadata(operation_id=72),
         terminal_results=[],
     )
@@ -564,7 +585,7 @@ async def test_invalid_submit_body_produces_one_terminal_error(
     assert len(operation.terminal_results) == 1
     metadata, body = operation.terminal_results[0]
     assert metadata.status_code == 500
-    assert json.loads(body)["error"]["code"] == "invalid_submit_body"
+    assert _decode_terminal_profile_body(metadata, body)["error"]["code"] == "invalid_submit_body"
     assert [metadata.stage_code for metadata, _body in operation.progress_results] == [0x0001, 0x0003, 0x0008, 0x000B]
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "failed"
@@ -582,7 +603,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         FakeOperation(
             operation_id=operation_id,
             frame_id=operation_id + 100,
-            body=json.dumps(_chat_request(model=f"model-{operation_id}")).encode("utf-8"),
+            body=_typed_profile_body(_chat_request(model=f"model-{operation_id}")),
             metadata=_submit_metadata(operation_id=operation_id),
             terminal_results=[],
         )
@@ -659,7 +680,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         assert observation["backend_binding"] is None
         assert observation["vllm_version"] is None
         assert observation["selected_transport"] == "ipc"
-        assert observation["output_event_count"] == 2
+        assert observation["output_event_count"] == 3
         assert observation["terminal_outcome"] == "completed"
 
 
@@ -673,7 +694,7 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
         FakeOperation(
             operation_id=91,
             frame_id=frame_id,
-            body=json.dumps(_chat_request()).encode("utf-8"),
+            body=_typed_profile_body(_chat_request()),
             metadata=_submit_metadata(operation_id=91),
             terminal_results=[],
         )
@@ -709,8 +730,8 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
 
     assert statistics.accepted_operations == 1
     assert statistics.terminal_results == 2
-    assert operations[0].terminal_results[0][1] == b""
-    duplicate_event = json.loads(operations[1].terminal_results[0][1])
+    assert _decode_terminal_profile_body(*operations[0].terminal_results[0])["type"] == "response.completed"
+    duplicate_event = _decode_terminal_profile_body(*operations[1].terminal_results[0])
     assert duplicate_event["type"] == "response.error"
     assert duplicate_event["error"]["code"] == "duplicate_operation_id"
 
@@ -729,7 +750,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     operation = FakeOperation(
         operation_id=101,
         frame_id=201,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=101),
         terminal_results=[],
     )
@@ -772,7 +793,7 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     else:
         assert operation.result_drops == []
         assert len(operation.terminal_results) == 1
-        assert json.loads(operation.terminal_results[0][1]) == {
+        assert _decode_terminal_profile_body(*operation.terminal_results[0]) == {
             "reason": "peer_cancelled",
             "type": "response.cancelled",
         }
@@ -797,7 +818,7 @@ async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cann
     operation = FakeOperation(
         operation_id=107,
         frame_id=207,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=107),
         terminal_results=[],
         on_terminal=stop_event.set,
@@ -858,7 +879,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     operation = FakeOperation(
         operation_id=102,
         frame_id=202,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=102),
         terminal_results=[],
     )
@@ -921,7 +942,7 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     operation = FakeOperation(
         operation_id=103,
         frame_id=203,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=103),
         terminal_results=[],
     )
@@ -977,7 +998,7 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     operation = FakeOperation(
         operation_id=104,
         frame_id=204,
-        body=json.dumps(_chat_request()).encode("utf-8"),
+        body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=104),
         terminal_results=[],
         on_terminal=stop_event.set,
@@ -1044,14 +1065,14 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
     old_operation = FakeOperation(
         operation_id=105,
         frame_id=205,
-        body=json.dumps(_chat_request(model="old-model")).encode("utf-8"),
+        body=_typed_profile_body(_chat_request(model="old-model")),
         metadata=_submit_metadata(operation_id=105),
         terminal_results=[],
     )
     new_operation = FakeOperation(
         operation_id=106,
         frame_id=206,
-        body=json.dumps(_chat_request(model="new-model")).encode("utf-8"),
+        body=_typed_profile_body(_chat_request(model="new-model")),
         metadata=_submit_metadata(operation_id=106),
         terminal_results=[],
     )
@@ -1106,7 +1127,7 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
     assert old_operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.SUPERSEDED
     assert old_operation.result_drops[0][1] == b"newer_request"
     assert len(new_operation.terminal_results) == 1
-    assert new_operation.terminal_results[0][1] == b""
+    assert _decode_terminal_profile_body(*new_operation.terminal_results[0])["type"] == "response.completed"
     observations = {record["operation_id"]: record for record in _observation_records(caplog)}
     assert observations[105]["terminal_outcome"] == "dropped"
     assert observations[105]["cancellation_kind"] == "supersede"
@@ -1200,6 +1221,48 @@ def _chat_request(*, model: str = "mock-model") -> dict[str, Any]:
             "stream": True,
         },
     }
+
+
+def _typed_profile_body(
+    document: Mapping[str, Any],
+    *,
+    stream_semantics: StreamSemantics = StreamSemantics.SNAPSHOT,
+) -> bytes:
+    payload = json.dumps(dict(document), separators=(",", ":"), sort_keys=True).encode("utf-8")
+    frame = build_typed_payload_frame(
+        PayloadKind.STRUCTURED_EVENT,
+        payload,
+        profile_id=0,
+        descriptor_flags=0,
+        schema_id=0,
+        schema_version=0,
+        stream_semantics=stream_semantics,
+    )
+    descriptors, frames = pack_typed_payload_frames((frame,))
+    return pack_body(
+        typed_payload_descriptor_region=descriptors,
+        typed_payload_frame_region=frames,
+    )
+
+
+def _decode_terminal_profile_body(metadata: ResultPushMetadata, body: bytes) -> dict[str, Any]:
+    body_view = validate_result_push_body(metadata, body)
+    frames = unpack_typed_payload_frames(
+        body_view.typed_payload_descriptor_region,
+        body_view.typed_payload_frame_region,
+        payload_kind_bitmap=metadata.payload_kind_bitmap,
+    )
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame.payload_kind is PayloadKind.STRUCTURED_EVENT
+    assert frame.profile_id == 0
+    assert int(frame.descriptor_flags) == 0
+    assert frame.schema_id == 0
+    assert frame.schema_version == 0
+    assert int(frame.stream_semantics) == int(StreamSemantics.SNAPSHOT)
+    value = json.loads(frame.payload)
+    assert isinstance(value, dict)
+    return value
 
 
 def _submit_metadata(*, operation_id: int) -> FrameSubmitMetadata:

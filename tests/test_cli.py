@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Coroutine
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -115,3 +117,38 @@ async def test_serve_backend_loads_factory_and_enters_native_runtime(monkeypatch
     assert isinstance(adapter, OpenAiNnrpAdapter)
     assert adapter._backend is backend
     assert captured_config is config
+
+
+@pytest.mark.asyncio
+async def test_wire_target_publishes_bound_tcp_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    backend = object()
+    ready_output = tmp_path / "target.json"
+
+    async def fake_load_backend(spec: str) -> object:
+        assert spec == "mock"
+        return backend
+
+    async def fake_serve_with_ready(
+        adapter: OpenAiNnrpAdapter,
+        *,
+        config: cli.NnrpServerConfig,
+        on_ready: Any,
+    ) -> None:
+        assert adapter._backend is backend
+        assert config.endpoint == "nnrp://wire-target.local/vllm"
+        assert config.provider_routes["tcp"].provider_endpoint == "tcp://127.0.0.1:0"
+        on_ready({"tcp": SimpleNamespace(address="127.0.0.1:39123")})
+
+    monkeypatch.setattr(cli, "load_backend_async", fake_load_backend)
+    monkeypatch.setattr(cli, "_serve_with_ready", fake_serve_with_ready)
+
+    await cli._serve_wire_target("mock", ready_output, "0.1.0")
+
+    manifest = json.loads(ready_output.read_text(encoding="utf-8"))
+    assert manifest["target_name"] == "vllm-nnrp-adapter"
+    assert manifest["protocol_version"] == "nnrp-1-preview4"
+    assert manifest["suite_version"] == "0.1.0"
+    assert manifest["wire_conformance"]["transports"] == [
+        {"name": "tcp", "endpoint": "127.0.0.1:39123", "tls": False}
+    ]
+    assert manifest["wire_conformance"]["capabilities"] == ["profile.openai-compatible.level1.wire"]

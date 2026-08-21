@@ -12,11 +12,24 @@ from nnrp import (  # type: ignore[import-untyped]
     NativeRuntimeServerOperation,
     NativeRuntimeServerSession,
     NativeTransportBinding,
+    NativeTransportEndpoint,
     NativeWouldBlockError,
     PayloadKind,
+    StreamSemantics,
     TransportPolicy,
 )
-from nnrp.core import MessageType, ResultClass, ResultFlags, ResultPushMetadata  # type: ignore[import-untyped]
+from nnrp.core import (  # type: ignore[import-untyped]
+    FrameSubmitMetadata,
+    MessageType,
+    ResultClass,
+    ResultFlags,
+    ResultPushMetadata,
+    build_typed_payload_frame,
+    pack_body,
+    pack_typed_payload_frames,
+    unpack_typed_payload_frames,
+    validate_frame_submit_body,
+)
 from nnrp.runtime import (  # type: ignore[import-untyped]
     NativeRuntimeEvent,
     PartialResultMetadata,
@@ -134,6 +147,26 @@ async def serve(
     config: NnrpServerConfig,
     stop_event: asyncio.Event | None = None,
 ) -> NnrpServeStatistics:
+    return await _serve(adapter, config=config, stop_event=stop_event, on_ready=None)
+
+
+async def _serve_with_ready(
+    adapter: OpenAiNnrpAdapter,
+    *,
+    config: NnrpServerConfig,
+    on_ready: Callable[[Mapping[str, NativeTransportEndpoint]], None],
+    stop_event: asyncio.Event | None = None,
+) -> NnrpServeStatistics:
+    return await _serve(adapter, config=config, stop_event=stop_event, on_ready=on_ready)
+
+
+async def _serve(
+    adapter: OpenAiNnrpAdapter,
+    *,
+    config: NnrpServerConfig,
+    stop_event: asyncio.Event | None,
+    on_ready: Callable[[Mapping[str, NativeTransportEndpoint]], None] | None,
+) -> NnrpServeStatistics:
     if not isinstance(adapter, OpenAiNnrpAdapter):
         raise TypeError("adapter must be an OpenAiNnrpAdapter Preview4 profile mapper")
     if not isinstance(config, NnrpServerConfig):
@@ -155,6 +188,8 @@ async def serve(
     server = None
     try:
         server = await native.call(server_context.__enter__)
+        if on_ready is not None:
+            on_ready(server.bound_provider_endpoints)
         while not shutdown.is_set():
             _retire_completed_tasks(sessions)
             if len(sessions) >= config.max_active_sessions:
@@ -228,9 +263,10 @@ async def _serve_session(
                 continue
             if len(operations) >= config.max_operations_per_session:
                 capacity_event = _operation_capacity_event(config.max_operations_per_session)
+                metadata, body = _terminal_reply(operation, capacity_event)
                 await operation.send_result(
-                    _terminal_metadata(operation, capacity_event),
-                    _encode_event(capacity_event),
+                    metadata,
+                    body,
                 )
                 counters.terminal_results += 1
                 continue
@@ -242,7 +278,8 @@ async def _serve_session(
                 record.transition(OperationState.QUEUED)
             except OperationStateError as error:
                 event = _duplicate_operation_event(error)
-                await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
+                metadata, body = _terminal_reply(operation, event)
+                await operation.send_result(metadata, body)
                 counters.terminal_results += 1
                 continue
             counters.accepted_operations += 1
@@ -317,7 +354,7 @@ async def _serve_operation(
         try:
             await progress.emit(OperationProgressStage.QUEUED)
             await progress.emit(OperationProgressStage.INPUT_RECEIVED)
-            request = _decode_request(operation.submit.tail.body)
+            request = _decode_request(operation.submit.metadata.value, operation.submit.tail.body)
             observation.record_request(request)
             request.setdefault("request_id", record.backend_request_id)
             record.transition(OperationState.ADMITTED)
@@ -336,7 +373,8 @@ async def _serve_operation(
                     record.terminate(_terminal_operation_state(event))
                     await progress.emit(_terminal_progress_stage(event))
                     terminal_sent = True
-                    await operation.send_result(_terminal_metadata(operation, event), body)
+                    metadata, terminal_body = _terminal_reply(operation, event, encoded_event=body)
+                    await operation.send_result(metadata, terminal_body)
                     counters.terminal_results += 1
                     break
                 record.mark_partial()
@@ -433,7 +471,8 @@ async def _serve_operation(
             body = _encode_event(event)
             observation.record_event(event, body_bytes=len(body))
             terminal_sent = True
-            await operation.send_result(_terminal_metadata(operation, event), body)
+            metadata, terminal_body = _terminal_reply(operation, event, encoded_event=body)
+            await operation.send_result(metadata, terminal_body)
             counters.terminal_results += 1
     finally:
         try:
@@ -498,7 +537,8 @@ async def _send_cancelled_outcome(
 ) -> ResultDropReasonCode | None:
     fallback_drop = None
     try:
-        await operation.send_result(_terminal_metadata(operation, event), _encode_event(event))
+        metadata, body = _terminal_reply(operation, event)
+        await operation.send_result(metadata, body)
     except Exception:
         diagnostic = control_request.diagnostic or b"peer_cancelled"
         await operation.send_result_drop(
@@ -518,9 +558,34 @@ async def _send_cancelled_outcome(
     return fallback_drop
 
 
-def _decode_request(body: bytes) -> dict[str, Any]:
+def _decode_request(metadata: object, body: bytes) -> dict[str, Any]:
+    if not isinstance(metadata, FrameSubmitMetadata):
+        raise ValueError("native FRAME_SUBMIT metadata must use the current data-plane contract")
+    if metadata.payload_kind_bitmap != PayloadKind.STRUCTURED_EVENT or metadata.payload_frame_count != 1:
+        raise ValueError("OpenAI profile submit must declare exactly one STRUCTURED_EVENT payload frame")
     try:
-        value = json.loads(body.decode("utf-8"))
+        body_view = validate_frame_submit_body(metadata, body)
+        frames = unpack_typed_payload_frames(
+            body_view.typed_payload_descriptor_region,
+            body_view.typed_payload_frame_region,
+            payload_kind_bitmap=metadata.payload_kind_bitmap,
+        )
+    except ValueError as error:
+        raise ValueError("OpenAI profile submit has an invalid typed payload body") from error
+    if len(frames) != 1:
+        raise ValueError("OpenAI profile submit must contain exactly one typed payload frame")
+    frame = frames[0]
+    if (
+        frame.payload_kind is not PayloadKind.STRUCTURED_EVENT
+        or frame.profile_id != 0
+        or int(frame.descriptor_flags) != 0
+        or frame.schema_id != 0
+        or frame.schema_version != 0
+        or int(frame.stream_semantics) != int(StreamSemantics.SNAPSHOT)
+    ):
+        raise ValueError("OpenAI profile submit descriptor does not match the frozen wire mapping")
+    try:
+        value = json.loads(frame.payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("native FRAME_SUBMIT body must contain a UTF-8 OpenAI profile request") from error
     if not isinstance(value, dict):
@@ -530,6 +595,38 @@ def _decode_request(body: bytes) -> dict[str, Any]:
 
 def _encode_event(event: Mapping[str, Any]) -> bytes:
     return json.dumps(dict(event), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _encode_typed_profile_body(payload: bytes) -> bytes:
+    frame = build_typed_payload_frame(
+        PayloadKind.STRUCTURED_EVENT,
+        payload,
+        profile_id=0,
+        descriptor_flags=0,
+        schema_id=0,
+        schema_version=0,
+        stream_semantics=StreamSemantics.SNAPSHOT,
+    )
+    descriptors, frames = pack_typed_payload_frames((frame,))
+    return bytes(
+        pack_body(
+            typed_payload_descriptor_region=descriptors,
+            typed_payload_frame_region=frames,
+        )
+    )
+
+
+def _terminal_reply(
+    operation: NativeRuntimeServerOperation,
+    event: Mapping[str, Any] | None,
+    *,
+    encoded_event: bytes | None = None,
+) -> tuple[ResultPushMetadata, bytes]:
+    metadata = _terminal_metadata(operation, event)
+    if event is None:
+        return metadata, b""
+    payload = _encode_event(event) if encoded_event is None else encoded_event
+    return metadata, _encode_typed_profile_body(payload)
 
 
 def _is_terminal_event(event: Mapping[str, Any]) -> bool:

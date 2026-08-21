@@ -161,15 +161,39 @@ class _ToolCallState:
     closed: bool = False
 
 
+@dataclass
+class _ChoiceResponseState:
+    index: int
+    role: str = "assistant"
+    content_parts: list[str] = dataclass_field(default_factory=list)
+    finish_reason: object = None
+
+
 class OpenAiStreamEventMapper:
     def __init__(self) -> None:
         self._tool_calls: dict[tuple[int, int], _ToolCallState] = {}
+        self._choices: dict[int, _ChoiceResponseState] = {}
+        self._response_id: str | None = None
+        self._model: str | None = None
+        self._created: int | None = None
+        self._usage: Mapping[str, Any] | None = None
 
     def map_chunk(self, chunk: Mapping[str, Any]) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
 
+        response_id = chunk.get("id")
+        if self._response_id is None and isinstance(response_id, str) and response_id:
+            self._response_id = response_id
+        model = chunk.get("model")
+        if self._model is None and isinstance(model, str) and model:
+            self._model = model
+        created = chunk.get("created")
+        if self._created is None and isinstance(created, int) and created >= 0:
+            self._created = created
+
         usage = chunk.get("usage")
         if isinstance(usage, Mapping):
+            self._usage = dict(usage)
             events.append(build_usage_event(usage))
 
         choices = chunk.get("choices")
@@ -181,10 +205,15 @@ class OpenAiStreamEventMapper:
                 continue
 
             choice_index = _non_negative_index(choice.get("index"), default=0)
+            choice_state = self._choices.setdefault(choice_index, _ChoiceResponseState(choice_index))
             delta = choice.get("delta")
             if isinstance(delta, Mapping):
+                role = delta.get("role")
+                if isinstance(role, str) and role:
+                    choice_state.role = role
                 content = delta.get("content")
                 if isinstance(content, str) and content:
+                    choice_state.content_parts.append(content)
                     events.append(build_text_delta_event(content, index=choice_index, openai_chunk=chunk))
 
                 tool_calls = delta.get("tool_calls")
@@ -201,12 +230,17 @@ class OpenAiStreamEventMapper:
                             )
 
             if choice.get("finish_reason") is not None:
+                choice_state.finish_reason = choice.get("finish_reason")
                 events.extend(self._complete_choice(choice_index, chunk))
 
         return events
 
     def finish(self) -> list[dict[str, Any]]:
-        return self._complete_states(self._open_states(), openai_chunk=None)
+        events = self._complete_states(self._open_states(), openai_chunk=None)
+        completed_body = self._completed_body()
+        if completed_body is not None:
+            events.append(build_completed_event(completed_body))
+        return events
 
     def fail(self, error: BaseException) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -338,6 +372,50 @@ class OpenAiStreamEventMapper:
 
     def _open_states(self) -> list[_ToolCallState]:
         return [state for state in self._tool_calls.values() if not state.closed]
+
+    def _completed_body(self) -> dict[str, Any] | None:
+        if not self._choices:
+            return None
+        choices: list[dict[str, Any]] = []
+        for choice_index, state in sorted(self._choices.items()):
+            tool_calls = [
+                {
+                    "id": tool_state.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_state.name,
+                        "arguments": "".join(tool_state.argument_parts),
+                    },
+                }
+                for (owner_choice, _tool_index), tool_state in sorted(self._tool_calls.items())
+                if owner_choice == choice_index and tool_state.started
+            ]
+            message: dict[str, Any] = {
+                "role": state.role,
+                "content": "".join(state.content_parts) if state.content_parts else None,
+            }
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            choices.append(
+                {
+                    "index": choice_index,
+                    "message": message,
+                    "finish_reason": state.finish_reason,
+                }
+            )
+        body: dict[str, Any] = {
+            "object": "chat.completion",
+            "choices": choices,
+        }
+        if self._response_id is not None:
+            body["id"] = self._response_id
+        if self._model is not None:
+            body["model"] = self._model
+        if self._created is not None:
+            body["created"] = self._created
+        if self._usage is not None:
+            body["usage"] = dict(self._usage)
+        return body
 
 
 def _non_negative_index(value: object, *, default: int) -> int:
