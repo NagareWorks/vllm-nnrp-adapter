@@ -17,7 +17,7 @@
   ],
   "extensions": [
     {
-      "name": "diagnostics",
+      "name": "vllm.diagnostics",
       "critical": false,
       "description": "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail."
     }

@@ -15,7 +15,11 @@ from vllm_nnrp_adapter.adapter import (
     map_openai_stream_chunk,
 )
 from vllm_nnrp_adapter.http_sse_smoke import HttpSseSmokeBackend
-from vllm_nnrp_adapter.profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
+from vllm_nnrp_adapter.profile import (
+    CHAT_COMPLETIONS_CREATE,
+    OPENAI_COMPATIBLE_SCHEMA_VERSION,
+    OpenAiNnrpCapabilityDocument,
+)
 from vllm_nnrp_adapter.vllm_backend import EngineDirectChatStream, VllmBackend, VllmProductionBoundaryError
 from vllm_nnrp_adapter.vllm_compat import VLLM_COMPATIBILITY_BINDINGS, VllmEngineDirectBinding
 
@@ -701,6 +705,34 @@ async def test_adapter_emits_request_diagnostics_when_requested() -> None:
     assert events[0]["type"] == "response.diagnostics"
     assert events[0]["diagnostics"]["selected_model"] == "llama"
     assert events[1]["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_adapter_ignores_diagnostics_policy_when_extension_is_not_declared() -> None:
+    baseline = OpenAiNnrpCapabilityDocument.level1()
+    capabilities = OpenAiNnrpCapabilityDocument(
+        compatibility_levels=baseline.compatibility_levels,
+        operations=baseline.operations,
+    )
+    adapter = OpenAiNnrpAdapter(NonStreamingBackend(), capabilities=capabilities)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+                "nnrp": {"diagnostics": True},
+            }
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["response.completed"]
 
 
 @pytest.mark.asyncio

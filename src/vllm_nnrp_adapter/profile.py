@@ -7,6 +7,7 @@ from typing import Any, NotRequired, TypedDict, cast
 OPENAI_COMPATIBLE_PROFILE = "openai-compatible"
 OPENAI_COMPATIBLE_SCHEMA_VERSION = "openai-compatible/1"
 CHAT_COMPLETIONS_CREATE = "chat.completions.create"
+VLLM_DIAGNOSTICS_EXTENSION = "vllm.diagnostics"
 
 
 class OpenAiNnrpError(Exception):
@@ -61,7 +62,7 @@ class OpenAiNnrpCapabilityDocument:
             models=tuple({"id": model, "owned_by": "adapter"} for model in models),
             extensions=(
                 {
-                    "name": "diagnostics",
+                    "name": VLLM_DIAGNOSTICS_EXTENSION,
                     "critical": False,
                     "description": (
                         "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail."
@@ -82,6 +83,12 @@ class OpenAiNnrpCapabilityDocument:
 
     def supports_operation(self, operation: str) -> bool:
         return any(item.get("name") == operation for item in self.operations)
+
+    def supports_non_critical_extension(self, extension: str) -> bool:
+        return any(
+            item.get("name") == extension and item.get("critical") is False
+            for item in self.extensions
+        )
 
 
 def validate_request(request: Mapping[str, Any], capabilities: OpenAiNnrpCapabilityDocument) -> OpenAiNnrpRequest:

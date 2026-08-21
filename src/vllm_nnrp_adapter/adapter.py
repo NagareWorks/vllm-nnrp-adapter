@@ -9,6 +9,7 @@ from typing import Any, Protocol, cast
 
 from .profile import (
     CHAT_COMPLETIONS_CREATE,
+    VLLM_DIAGNOSTICS_EXTENSION,
     OpenAiNnrpCapabilityDocument,
     OpenAiNnrpError,
     build_cancelled_event,
@@ -73,7 +74,7 @@ class OpenAiNnrpAdapter:
 
             policy = envelope.get("nnrp")
             timeout_s = _timeout_seconds(policy)
-            if _diagnostics_enabled(policy):
+            if _diagnostics_enabled(policy, self.capabilities):
                 yield build_diagnostics_event(
                     {
                         "selected_model": envelope["body"].get("model"),
@@ -461,8 +462,15 @@ def _cancel_after_events(policy: object) -> int | None:
     return None
 
 
-def _diagnostics_enabled(policy: object) -> bool:
-    return isinstance(policy, Mapping) and policy.get("diagnostics") is True
+def _diagnostics_enabled(
+    policy: object,
+    capabilities: OpenAiNnrpCapabilityDocument,
+) -> bool:
+    return (
+        isinstance(policy, Mapping)
+        and policy.get("diagnostics") is True
+        and capabilities.supports_non_critical_extension(VLLM_DIAGNOSTICS_EXTENSION)
+    )
 
 
 def _timeout_seconds(policy: object) -> float | None:

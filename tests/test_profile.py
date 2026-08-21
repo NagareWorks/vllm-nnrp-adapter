@@ -7,6 +7,7 @@ from vllm_nnrp_adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.profile import (
     CHAT_COMPLETIONS_CREATE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
+    VLLM_DIAGNOSTICS_EXTENSION,
     OpenAiNnrpCapabilityDocument,
     OpenAiNnrpError,
     validate_request,
@@ -24,7 +25,7 @@ def test_level1_capability_document_shape() -> None:
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
     assert document["extensions"] == [
         {
-            "name": "diagnostics",
+            "name": VLLM_DIAGNOSTICS_EXTENSION,
             "critical": False,
             "description": "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail.",
         }
@@ -72,6 +73,20 @@ def test_runtime_capabilities_only_downgrade_backend_dependent_tool_calls() -> N
         }
     ]
     assert capabilities["extensions"] == OpenAiNnrpCapabilityDocument.level1().to_dict()["extensions"]
+
+
+def test_capability_document_requires_declared_non_critical_extension() -> None:
+    capabilities = OpenAiNnrpCapabilityDocument.level1()
+
+    assert capabilities.supports_non_critical_extension(VLLM_DIAGNOSTICS_EXTENSION)
+    assert not capabilities.supports_non_critical_extension("provider.private")
+
+    critical = OpenAiNnrpCapabilityDocument(
+        compatibility_levels=(1,),
+        operations=capabilities.operations,
+        extensions=({"name": VLLM_DIAGNOSTICS_EXTENSION, "critical": True},),
+    )
+    assert not critical.supports_non_critical_extension(VLLM_DIAGNOSTICS_EXTENSION)
 
 
 def test_validate_chat_request_preserves_body_and_policy() -> None:

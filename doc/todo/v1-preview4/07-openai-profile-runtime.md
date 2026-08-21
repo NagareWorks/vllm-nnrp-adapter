@@ -36,5 +36,5 @@
 - [x] Generate the Level 1 capability document from real backend and adapter behavior.
 - [ ] Advertise streaming, non-streaming, cancellation, usage, tool calls, diagnostics, limits, and
   extensions only when tested.
-- [ ] Validate provider-specific extensions as declared, non-critical, and ignorable for the Level 1
+- [x] Validate provider-specific extensions as declared, non-critical, and ignorable for the Level 1
   baseline.
