@@ -90,6 +90,28 @@ def test_backend_records_selected_binding_and_version(monkeypatch: pytest.Monkey
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("installed_version", "binding_name"),
+    (("0.18.1", "legacy-0.18"), ("0.22.1", "transition-0.22"), ("0.26.0", "current-0.26")),
+)
+async def test_non_streaming_chat_uses_each_named_request_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    installed_version: str,
+    binding_name: str,
+) -> None:
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.vllm_compat._installed_vllm_version",
+        lambda: installed_version,
+    )
+    backend = create_vllm_backend(FakeServingChat())
+
+    result = await backend.create_chat_completion({"model": "llama", "messages": [], "stream": False})
+
+    assert result == {"model": "llama"}
+    assert backend.compatibility_binding == binding_name
+
+
 def test_compatibility_rejects_untested_minor_inside_installation_band() -> None:
     with pytest.raises(VllmCompatibilityError) as captured:
         resolve_vllm_compatibility(FakeServingChat(), installed_version="0.20.0")

@@ -1001,14 +1001,27 @@ async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.entrypoints.utils",
-        _module_with_get_max_tokens(),
+@pytest.mark.parametrize(
+    ("binding_index", "module_name"),
+    (
+        (0, "vllm.entrypoints.utils"),
+        (1, "vllm.entrypoints.utils"),
+        (2, "vllm.entrypoints.serve.utils.api_utils"),
+    ),
+)
+async def test_vllm_backend_engine_direct_cancel_aborts_request_in_each_family(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
     )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
     serving_chat = FakeDirectServingChat()
-    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory())
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
     adapter = OpenAiNnrpAdapter(backend)
 
     abort_observations: list[bool | None] = []
@@ -1032,6 +1045,71 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
     assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
     assert serving_chat.engine_client.aborted == ["chatcmpl-test"]
     assert abort_observations == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name"),
+    (
+        (0, "vllm.entrypoints.utils"),
+        (1, "vllm.entrypoints.utils"),
+        (2, "vllm.entrypoints.serve.utils.api_utils"),
+    ),
+)
+async def test_vllm_backend_maps_engine_scheduler_rejection_in_each_family(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+
+    class RejectingEngineClient(FakeEngineClient):
+        def generate(
+            self,
+            engine_prompt: object,
+            sampling_params: object,
+            request_id: str,
+            **kwargs: object,
+        ) -> AsyncIterator[FakeRequestOutput]:
+            async def outputs() -> AsyncIterator[FakeRequestOutput]:
+                raise RuntimeError("scheduler full: reject request")
+                yield FakeRequestOutput(outputs=[])
+
+            return outputs()
+
+    serving_chat = FakeDirectServingChat()
+    serving_chat.engine_client = RejectingEngineClient()
+    adapter = OpenAiNnrpAdapter(
+        VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+    )
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            }
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["response.error"]
+    assert events[0]["error"] == {
+        "type": "server_error",
+        "code": "scheduler_rejected",
+        "message": "scheduler full: reject request",
+    }
+    assert serving_chat.fallback_calls == 0
 
 
 @pytest.mark.asyncio

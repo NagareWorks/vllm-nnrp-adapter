@@ -35,7 +35,7 @@
 
 - [x] Test method selection and request construction against version-specific fakes generated from
   the three compatibility anchors.
-- [ ] Test streaming, non-streaming, usage, tool calls, scheduler rejection, and backend cancellation
+- [x] Test streaming, non-streaming, usage, tool calls, scheduler rejection, and backend cancellation
   in every compatibility family.
 - [x] Test feature probing, exact unsupported-version diagnostics, and rejection of a version that
   falls inside the installation band but has no tested binding.
