@@ -345,16 +345,17 @@ class FakeServerContext:
         self.exited = True
 
 
-def _unavailable_ipc_binding() -> NativeTransportBinding:
+def _unavailable_binding(transport_id: TransportId) -> NativeTransportBinding:
+    transport_name = transport_id.name.lower()
     provider = NativeTransportProvider(
-        name="test-ipc",
+        name=f"test-{transport_name}",
         version="1",
-        transport_id=TransportId.IPC,
+        transport_id=transport_id,
         kind=NativeTransportProviderKind.NATIVE_DYNAMIC,
         available=False,
         library_path=None,
         metadata=NativeTransportProviderMetadata(
-            id="test.ipc",
+            id=f"test.{transport_name}",
             cost=NativeTransportProviderCost(model_id=0, units=0),
             preference_rank=1,
             limits=NativeTransportProviderLimits(max_frame_bytes=1024),
@@ -410,11 +411,14 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         return server_context
 
     monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", fake_listen)
-    binding = _unavailable_ipc_binding()
+    bindings = (
+        _unavailable_binding(TransportId.IPC),
+        _unavailable_binding(TransportId.WEBSOCKET),
+    )
     config = NnrpServerConfig(
         endpoint="nnrp://runtime.local/vllm",
         provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm")},
-        transports=[binding],
+        transports=list(bindings),
         accept_timeout_ms=10,
         receive_timeout_ms=10,
         max_active_sessions=1,
@@ -457,8 +461,8 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert terminal_body == b""
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
-    assert config.transports == (binding,)
-    assert captured_transports == [(binding,)]
+    assert config.transports == bindings
+    assert captured_transports == [bindings]
     assert session.closed is True
     assert server_context.exited is True
     assert operation.native_thread_ids

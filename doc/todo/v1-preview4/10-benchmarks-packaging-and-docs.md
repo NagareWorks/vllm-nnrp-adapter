@@ -34,8 +34,8 @@
 ## Documentation
 
 - [x] Update README and usage examples from `serve-tcp` to provider-neutral native server startup.
-- [ ] Document application endpoints, provider routes, security, single-provider selection, and
-  multi-provider probing.
+- [ ] Document application endpoints, provider routes, security, single-provider binding, and
+  multi-provider server binding behavior.
 - [ ] Document cancellation, abort, deadlines, priorities, budgets, progress, pressure, capability
   costs, route hints, traces, drops, recovery, objects, and cache behavior.
 - [ ] Document the exact Level 1 JSON boundary and the typed binary runtime-control boundary.

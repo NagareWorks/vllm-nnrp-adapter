@@ -7,10 +7,10 @@
   security material.
 - [x] Pass an explicit provider registry through to `listen_native_server` when supplied; otherwise
   use official installed-provider discovery.
-- [ ] Select the only installed provider directly and probe only when multiple eligible providers
-  are installed.
-- [ ] Expose selected provider, bound provider endpoints, probe diagnostics, and active transport in
-  startup and session observations.
+- [x] Preserve every explicit provider binding for the official listener so Auto and Prefer can
+  bind every eligible server route; never apply client-side single-provider selection or probing.
+- [ ] Expose eligible providers and bound provider endpoints in startup observations, then record
+  the active transport for each accepted session.
 
 ## Provider Boundaries
 
@@ -28,6 +28,6 @@
 - [ ] Require QUIC and WSS security material according to the frozen endpoint contract.
 - [ ] Reject WebSocket text messages; accept only NNRP binary runtime frames.
 - [ ] Test single-provider TCP, QUIC, IPC, and WebSocket startup and active-session exchange.
-- [ ] Test multi-provider auto, prefer, force, and probe policy with real provider evidence.
+- [ ] Test multi-provider auto, prefer, and force binding policy with real provider evidence.
 - [ ] Test missing artifacts, incompatible platform routes, listener rollback, handshake rejection,
   and active-provider diagnostics.
