@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from nnrp import (
     NativeTransportBinding,
+    NativeTransportEndpoint,
     NativeTransportProvider,
     NativeTransportProviderCost,
     NativeTransportProviderKind,
@@ -321,10 +322,16 @@ class ScriptedEventSession:
 
 
 class FakeServer:
-    def __init__(self, session: FakeSession) -> None:
+    def __init__(
+        self,
+        session: FakeSession,
+        *,
+        bound_provider_endpoints: Mapping[str, NativeTransportEndpoint] | None = None,
+    ) -> None:
         self._session = session
         self._accepted = False
         self.closed = False
+        self.bound_provider_endpoints = dict(bound_provider_endpoints or {})
 
     async def accept(self, options: NativeServerAcceptOptions | None = None) -> FakeSession:
         assert options is not None
@@ -338,6 +345,7 @@ class FakeServer:
 class MultiSessionFakeServer:
     def __init__(self, sessions: list[Any]) -> None:
         self._pending = list(sessions)
+        self.bound_provider_endpoints: dict[str, NativeTransportEndpoint] = {}
 
     async def accept(self, options: NativeServerAcceptOptions | None = None) -> Any:
         assert options is not None
@@ -411,7 +419,21 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         terminal_results=[],
     )
     session = FakeSession(operation, stop_event)
-    server_context = FakeServerContext(FakeServer(session))
+    server_context = FakeServerContext(
+        FakeServer(
+            session,
+            bound_provider_endpoints={
+                "ipc": NativeTransportEndpoint(
+                    uri="npipe://nnrp-vllm",
+                    scheme="npipe",
+                    transport_name="ipc",
+                    transport_id=TransportId.IPC,
+                    address="nnrp-vllm",
+                    secure=False,
+                )
+            },
+        )
+    )
     captured_options: list[NativeServerBootstrapOptions] = []
     captured_transports: list[tuple[NativeTransportBinding, ...] | None] = []
 
@@ -475,6 +497,13 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert _decode_terminal_profile_body(terminal_metadata, terminal_body)["type"] == "response.completed"
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
+    startup = _startup_observation_records(caplog)[0]
+    assert startup == {
+        "application_endpoint": "nnrp://runtime.local/vllm",
+        "bound_provider_endpoints": {"ipc": "npipe://nnrp-vllm"},
+        "eligible_providers": ["ipc"],
+        "transport_policy": "auto",
+    }
     assert config.transports == bindings
     assert captured_transports == [bindings]
     assert session.closed is True
@@ -1291,6 +1320,7 @@ def _submit_metadata(*, operation_id: int) -> FrameSubmitMetadata:
 
 def _capture_observations(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
+    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.server")
 
 
 def _observation_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
@@ -1298,4 +1328,12 @@ def _observation_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any
         json.loads(record.getMessage().removeprefix("nnrp_operation_observation "))
         for record in caplog.records
         if record.getMessage().startswith("nnrp_operation_observation ")
+    ]
+
+
+def _startup_observation_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        json.loads(record.getMessage().removeprefix("nnrp_server_startup "))
+        for record in caplog.records
+        if record.getMessage().startswith("nnrp_server_startup ")
     ]

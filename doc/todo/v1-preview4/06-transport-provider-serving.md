@@ -9,7 +9,7 @@
   use official installed-provider discovery.
 - [x] Preserve every explicit provider binding for the official listener so Auto and Prefer can
   bind every eligible server route; never apply client-side single-provider selection or probing.
-- [ ] Expose eligible providers and bound provider endpoints in startup observations, then record
+- [x] Expose eligible providers and bound provider endpoints in startup observations, then record
   the active transport for each accepted session.
 
 ## Provider Boundaries

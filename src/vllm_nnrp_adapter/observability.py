@@ -7,13 +7,45 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from nnrp import NativeRuntimeServerOperation  # type: ignore[import-untyped]
+from nnrp import NativeRuntimeServerOperation, NativeTransportEndpoint  # type: ignore[import-untyped]
 from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
 
 from .operation_state import OperationState
 from .runtime_control import RuntimeControlRequest
 
 _LOGGER = logging.getLogger("vllm_nnrp_adapter.operation")
+_SERVER_LOGGER = logging.getLogger("vllm_nnrp_adapter.server")
+
+
+@dataclass(frozen=True, slots=True)
+class _ServerStartupObservation:
+    application_endpoint: str
+    transport_policy: str
+    bound_provider_endpoints: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def from_bound_endpoints(
+        cls,
+        *,
+        application_endpoint: str,
+        transport_policy: str,
+        bound_provider_endpoints: Mapping[str, NativeTransportEndpoint],
+    ) -> _ServerStartupObservation:
+        return cls(
+            application_endpoint=application_endpoint,
+            transport_policy=transport_policy,
+            bound_provider_endpoints=tuple(
+                sorted((provider, endpoint.uri) for provider, endpoint in bound_provider_endpoints.items())
+            ),
+        )
+
+    def to_log_fields(self) -> dict[str, object]:
+        return {
+            "application_endpoint": self.application_endpoint,
+            "transport_policy": self.transport_policy,
+            "eligible_providers": [provider for provider, _endpoint in self.bound_provider_endpoints],
+            "bound_provider_endpoints": dict(self.bound_provider_endpoints),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +266,11 @@ class _OperationObservationTracker:
 def _emit_operation_observation(observation: _OperationObservation) -> None:
     fields = observation.to_log_fields()
     _LOGGER.info("nnrp_operation_observation %s", json.dumps(fields, sort_keys=True, separators=(",", ":")))
+
+
+def _emit_server_startup_observation(observation: _ServerStartupObservation) -> None:
+    fields = observation.to_log_fields()
+    _SERVER_LOGGER.info("nnrp_server_startup %s", json.dumps(fields, sort_keys=True, separators=(",", ":")))
 
 
 def _optional_int(value: object) -> int | None:

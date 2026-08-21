@@ -47,7 +47,12 @@ from nnrp.server import (  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
-from .observability import _emit_operation_observation, _OperationObservationTracker
+from .observability import (
+    _emit_operation_observation,
+    _emit_server_startup_observation,
+    _OperationObservationTracker,
+    _ServerStartupObservation,
+)
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
 from .profile import build_cancelled_event
@@ -188,6 +193,13 @@ async def _serve(
     server = None
     try:
         server = await native.call(server_context.__enter__)
+        _emit_server_startup_observation(
+            _ServerStartupObservation.from_bound_endpoints(
+                application_endpoint=config.endpoint,
+                transport_policy=config.transport_policy.name.lower(),
+                bound_provider_endpoints=server.bound_provider_endpoints,
+            )
+        )
         if on_ready is not None:
             on_ready(server.bound_provider_endpoints)
         while not shutdown.is_set():

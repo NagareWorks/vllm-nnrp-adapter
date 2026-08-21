@@ -20,7 +20,9 @@ from nnrp.runtime import (
 
 from vllm_nnrp_adapter.observability import (
     _emit_operation_observation,
+    _emit_server_startup_observation,
     _OperationObservationTracker,
+    _ServerStartupObservation,
 )
 from vllm_nnrp_adapter.operation_state import OperationState
 from vllm_nnrp_adapter.runtime_control import RuntimeControlKind, RuntimeControlRequest
@@ -143,6 +145,39 @@ def test_operation_observation_keeps_unavailable_values_absent() -> None:
     assert observation.prompt_tokens is None
     assert observation.error_family == "ValueError"
     assert observation.backend_abort_accepted is None
+
+
+def test_server_startup_observation_is_immutable_sorted_and_structured(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observation = _ServerStartupObservation.from_bound_endpoints(
+        application_endpoint="nnrp://runtime.local/vllm",
+        transport_policy="auto",
+        bound_provider_endpoints={
+            "websocket": SimpleNamespace(uri="ws://127.0.0.1:9001/nnrp"),
+            "ipc": SimpleNamespace(uri="unix:///tmp/nnrp.sock"),
+        },  # type: ignore[arg-type]
+    )
+
+    assert observation.bound_provider_endpoints == (
+        ("ipc", "unix:///tmp/nnrp.sock"),
+        ("websocket", "ws://127.0.0.1:9001/nnrp"),
+    )
+    with pytest.raises(FrozenInstanceError):
+        observation.transport_policy = "force_tcp"  # type: ignore[misc]
+
+    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.server")
+    _emit_server_startup_observation(observation)
+    payload = json.loads(caplog.records[-1].getMessage().removeprefix("nnrp_server_startup "))
+    assert payload == {
+        "application_endpoint": "nnrp://runtime.local/vllm",
+        "bound_provider_endpoints": {
+            "ipc": "unix:///tmp/nnrp.sock",
+            "websocket": "ws://127.0.0.1:9001/nnrp",
+        },
+        "eligible_providers": ["ipc", "websocket"],
+        "transport_policy": "auto",
+    }
 
 
 def _operation() -> Any:
