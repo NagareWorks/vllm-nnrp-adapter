@@ -17,7 +17,7 @@
 - [ ] Require each available binding to own its carrier implementation, listener, role adoption, and
   transport-scoped native artifact.
 - [x] Keep adapter, client, server, and profile packages free of hidden provider artifacts.
-- [ ] Treat unavailable bindings as diagnostics and never bind them.
+- [x] Treat unavailable bindings as diagnostics and never bind them.
 - [x] Keep `unix://`, `npipe://`, `ws://`, and `wss://` locators inside provider routes while public
   application endpoints remain `nnrp://` or `nnrps://`.
 - [ ] Fail the logical server atomically when mandatory provider listeners cannot be established.

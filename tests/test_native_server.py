@@ -18,6 +18,7 @@ from nnrp import (
     NativeTransportProviderLimitation,
     NativeTransportProviderLimits,
     NativeTransportProviderMetadata,
+    NativeTransportSelectionError,
     NativeWouldBlockError,
     TransportId,
 )
@@ -485,6 +486,19 @@ def test_server_config_rejects_non_binding_transport_entries() -> None:
         NnrpServerConfig(
             endpoint="nnrp://runtime.local/vllm",
             transports=[object()],  # type: ignore[list-item]
+        )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_explicit_binding_never_starts_a_provider_listener() -> None:
+    with pytest.raises(NativeTransportSelectionError):
+        await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm")},
+                transports=[_unavailable_binding(TransportId.IPC)],
+            ),
         )
 
 
