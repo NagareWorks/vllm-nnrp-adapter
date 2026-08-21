@@ -138,6 +138,7 @@ class MockChatCompletionBackend:
                                 }
                             ]
                         },
+                        "finish_reason": "tool_calls",
                     }
                 ],
             }

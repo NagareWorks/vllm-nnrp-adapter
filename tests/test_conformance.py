@@ -34,6 +34,14 @@ async def test_conformance_runner_executes_plan_with_mock_backend() -> None:
     assert terminals["openai-compatible.chat.tool-call-delta"] == "success"
     assert terminals["openai-compatible.chat.cancellation"] == "cancelled"
     assert terminals["openai-compatible.chat.backend-error"] == "error"
+    tool_result = next(
+        result for result in report["results"] if result["id"] == "openai-compatible.chat.tool-call-delta"
+    )
+    assert [event["type"] for event in tool_result["events"] if event["type"].startswith("response.tool_call")] == [
+        "response.tool_call.started",
+        "response.tool_call.delta",
+        "response.tool_call.completed",
+    ]
 
 
 def test_cli_writes_conformance_result_file(tmp_path: Path) -> None:

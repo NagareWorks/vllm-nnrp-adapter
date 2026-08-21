@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from collections.abc import AsyncIterator, Mapping
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -116,6 +116,13 @@ class FakeSamplingRequest:
     truncate_prompt_tokens = 7
     include_reasoning = False
 
+    def __init__(self, body: Mapping[str, Any] | None = None) -> None:
+        payload = body or {}
+        self.tools = payload.get("tools")
+        self.tool_choice = payload.get("tool_choice")
+        self.n = payload.get("n", 1)
+        self.include_reasoning = bool(payload.get("include_reasoning", False))
+
     def to_sampling_params(self, max_tokens: int, default_sampling_params: Mapping[str, Any]) -> dict[str, Any]:
         return {"max_tokens": max_tokens, **default_sampling_params}
 
@@ -165,9 +172,13 @@ class FakeDirectServingChat:
     default_sampling_params = {"temperature": 0.2}
     override_max_tokens = None
     reasoning_parser_cls = None
+    tool_parser = None
     parser_cls = None
+    enable_auto_tools = False
+    tool_call_id_type = "random"
     use_harmony = False
     models = FakeModels()
+    renderer = SimpleNamespace(tokenizer=object())
 
     def __init__(self) -> None:
         self.engine_client = FakeEngineClient()
@@ -210,7 +221,125 @@ class FakeBoundRequestFactory:
         self.engine_direct_binding = binding or VLLM_COMPATIBILITY_BINDINGS[0].engine_direct
 
     def __call__(self, body: Mapping[str, Any]) -> FakeSamplingRequest:
-        return FakeSamplingRequest()
+        return FakeSamplingRequest(body)
+
+
+class FakeToolEngineClient(FakeEngineClient):
+    def generate(
+        self,
+        engine_prompt: object,
+        sampling_params: object,
+        request_id: str,
+        **kwargs: object,
+    ) -> AsyncIterator[FakeRequestOutput]:
+        assert engine_prompt == {"prompt_token_ids": [1, 2, 3]}
+        assert sampling_params == {"max_tokens": 16, "temperature": 0.2}
+        self.last_generate_kwargs = dict(kwargs)
+
+        async def outputs() -> AsyncIterator[FakeRequestOutput]:
+            yield FakeRequestOutput(outputs=[FakeCompletionOutput(text="{", token_ids=[10])])
+            yield FakeRequestOutput(
+                outputs=[FakeCompletionOutput(text="}", token_ids=[11], finish_reason="stop")],
+                finished=True,
+            )
+
+        return outputs()
+
+
+class FakeLegacyToolParser:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def extract_tool_calls_streaming(self, **kwargs: object) -> Mapping[str, Any]:
+        self.calls.append(dict(kwargs))
+        if len(self.calls) == 1:
+            return {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call-parser",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{"},
+                    }
+                ]
+            }
+        return {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}
+
+
+class FakeLegacyToolParserFactory:
+    def __init__(self) -> None:
+        self.instances: list[FakeLegacyToolParser] = []
+
+    def __call__(self, tokenizer: object) -> FakeLegacyToolParser:
+        assert tokenizer is not None
+        parser = FakeLegacyToolParser()
+        self.instances.append(parser)
+        return parser
+
+
+class FakeUnifiedParser:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._stream_state = SimpleNamespace()
+
+    def parse_delta(self, **kwargs: object) -> Mapping[str, Any]:
+        self.calls.append(dict(kwargs))
+        if len(self.calls) == 1:
+            return {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call-parser",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{"},
+                    }
+                ]
+            }
+        return {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}
+
+
+class FakeUnifiedParserFactory:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.instances: list[FakeUnifiedParser] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> FakeUnifiedParser:
+        self.calls.append((args, dict(kwargs)))
+        parser = FakeUnifiedParser()
+        self.instances.append(parser)
+        return parser
+
+
+class FakeToolServingChat(FakeDirectServingChat):
+    enable_auto_tools = True
+
+    def __init__(self, binding: VllmEngineDirectBinding) -> None:
+        super().__init__()
+        self.engine_client = FakeToolEngineClient()
+        self.legacy_parser_factory = FakeLegacyToolParserFactory()
+        self.unified_parser_factory = FakeUnifiedParserFactory()
+        if binding.parser_family == "legacy":
+            self.tool_parser = self.legacy_parser_factory
+            self.parser_cls = None
+        else:
+            self.tool_parser = None
+            self.parser_cls = self.unified_parser_factory
+
+    def _should_stream_with_auto_tool_parsing(self, request: FakeSamplingRequest) -> bool:
+        return bool(request.tools) and request.tool_choice in (None, "auto")
+
+    def _effective_chat_template_kwargs(self, request: FakeSamplingRequest) -> Mapping[str, Any]:
+        assert request.tools
+        return {"enable_thinking": False}
+
+    def extract_tool_call_required_streaming(self, **kwargs: object) -> tuple[Mapping[str, Any], bool]:
+        first = not bool(kwargs["function_name_returned"])
+        function: dict[str, Any] = {"arguments": kwargs["delta_text"]}
+        tool_call: dict[str, Any] = {"index": 0, "function": function}
+        if first:
+            tool_call.update({"id": "call-required", "type": "function"})
+            function["name"] = "lookup"
+        return {"tool_calls": [tool_call]}, True
 
 
 class FakeNoUsageRequestOutput(FakeRequestOutput):
@@ -943,6 +1072,141 @@ async def test_engine_direct_binding_matches_each_vllm_family(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name", "expects_model_config", "expects_finished"),
+    (
+        (0, "vllm.entrypoints.utils", False, False),
+        (1, "vllm.entrypoints.utils", False, False),
+        (2, "vllm.entrypoints.serve.utils.api_utils", True, True),
+    ),
+)
+async def test_engine_direct_tool_calls_follow_each_vllm_parser_family(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+    expects_model_config: bool,
+    expects_finished: bool,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+    serving_chat = FakeToolServingChat(binding)
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+    adapter = OpenAiNnrpAdapter(backend)
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "look it up"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "lookup", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    "tool_choice": "auto",
+                },
+            }
+        )
+    ]
+
+    assert backend.supports_tool_calls is True
+    assert [event["type"] for event in events] == [
+        "response.tool_call.started",
+        "response.tool_call.delta",
+        "response.tool_call.delta",
+        "response.tool_call.completed",
+        "response.completed",
+    ]
+    assert events[0]["call_id"] == "call-parser"
+    assert events[3]["arguments"] == "{}"
+
+    if binding.parser_family == "legacy":
+        parser = serving_chat.legacy_parser_factory.instances[0]
+        assert parser.calls[0]["previous_text"] == ""
+        assert parser.calls[1]["previous_text"] == "{"
+        assert parser.calls[1]["current_token_ids"] == [10, 11]
+        return
+
+    constructor_args, constructor_kwargs = serving_chat.unified_parser_factory.calls[0]
+    assert constructor_args[1] == [
+        {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    ]
+    assert constructor_kwargs["chat_template_kwargs"] == {"enable_thinking": False}
+    assert ("model_config" in constructor_kwargs) is expects_model_config
+    parser = serving_chat.unified_parser_factory.instances[0]
+    assert ("finished" in parser.calls[0]) is expects_finished
+    assert parser.calls[-1].get("finished") is (True if expects_finished else None)
+    if binding.parser_family == "unified-0.22":
+        assert parser._stream_state.tool_call_id_type == "random"
+        assert parser._stream_state.history_tool_call_cnt == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_choice", "expected_call_id", "expected_finish_reason"),
+    (
+        ({"type": "function", "function": {"name": "lookup"}}, None, "stop"),
+        ("required", "call-required", "tool_calls"),
+    ),
+)
+async def test_legacy_engine_direct_supports_named_and_required_tool_choices(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_choice: object,
+    expected_call_id: str | None,
+    expected_finish_reason: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[0].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        "vllm.entrypoints.utils",
+        supports_truncate=False,
+    )
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.utils", helper_module)
+    serving_chat = FakeToolServingChat(binding)
+    adapter = OpenAiNnrpAdapter(VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding)))
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "body": {
+                    "model": "llama",
+                    "messages": [{"role": "user", "content": "look it up"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "lookup", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    "tool_choice": tool_choice,
+                },
+            }
+        )
+    ]
+
+    started = next(event for event in events if event["type"] == "response.tool_call.started")
+    completed = next(event for event in events if event["type"] == "response.tool_call.completed")
+    if expected_call_id is None:
+        assert started["call_id"].startswith("call_")
+    else:
+        assert started["call_id"] == expected_call_id
+    assert completed["arguments"] == "{}"
+    assert completed["openai_chunk"]["choices"][0]["finish_reason"] == expected_finish_reason
+
+
+@pytest.mark.asyncio
 async def test_engine_direct_requires_named_compatibility_binding() -> None:
     serving_chat = FakeDirectServingChat()
     backend = VllmBackend(serving_chat, request_factory=lambda body: FakeSamplingRequest())
@@ -951,6 +1215,16 @@ async def test_engine_direct_requires_named_compatibility_binding() -> None:
         await backend.create_chat_completion({"model": "llama", "stream": True})
 
     assert serving_chat.fallback_calls == 0
+
+
+def test_backend_does_not_advertise_auto_tool_calls_when_vllm_disables_them() -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[2].engine_direct
+    serving_chat = FakeDirectServingChat()
+    serving_chat.parser_cls = FakeUnifiedParserFactory()
+
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+
+    assert backend.supports_tool_calls is False
 
 
 @pytest.mark.asyncio
@@ -980,6 +1254,7 @@ async def test_engine_direct_stream_emits_usage_after_terminal_delta_without_rec
     first = FakeNoUsageRequestOutput()
     terminal = FakeNoUsageRequestOutput()
     terminal.finished = True
+    terminal.outputs[0].finish_reason = "stop"
 
     async def outputs() -> AsyncIterator[FakeRequestOutput]:
         yield first
@@ -993,7 +1268,6 @@ async def test_engine_direct_stream_emits_usage_after_terminal_delta_without_rec
         include_usage=True,
     )
 
-    assert "usage" not in await stream.__anext__()
     assert "usage" not in await stream.__anext__()
     usage_chunk = await stream.__anext__()
     assert usage_chunk["choices"] == []

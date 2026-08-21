@@ -24,9 +24,9 @@ def test_level1_capability_document_shape() -> None:
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
 
 
-def test_release_capability_manifest_does_not_advertise_unimplemented_vllm_tool_calls() -> None:
+def test_release_capability_manifest_advertises_tested_tool_call_lifecycle() -> None:
     class ProductionCapabilityBackend:
-        supports_tool_calls = False
+        supports_tool_calls = True
 
         def create_chat_completion(self, body):
             return {"model": body["model"], "choices": []}
@@ -36,7 +36,7 @@ def test_release_capability_manifest_does_not_advertise_unimplemented_vllm_tool_
     )
     adapter = OpenAiNnrpAdapter(ProductionCapabilityBackend())
 
-    assert manifest["operations"][0]["tool_calls"] is False
+    assert manifest["operations"][0]["tool_calls"] is True
     assert manifest["operations"] == list(adapter.capabilities.operations)
 
 

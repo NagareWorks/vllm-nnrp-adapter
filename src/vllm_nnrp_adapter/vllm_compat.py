@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from typing import Literal
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
@@ -21,6 +22,10 @@ class VllmEngineDirectBinding:
     supports_truncate_prompt_tokens: bool
     supports_reasoning_parser_kwargs: bool
     parser_attribute: str
+    parser_family: Literal["legacy", "unified-0.22", "unified-0.26"]
+    chat_template_kwargs_method: str | None
+    parser_accepts_model_config: bool
+    parser_accepts_finished: bool
     honors_include_reasoning: bool
 
 
@@ -49,7 +54,11 @@ _LEGACY_ENGINE_DIRECT = VllmEngineDirectBinding(
     get_max_tokens_path="vllm.entrypoints.utils:get_max_tokens",
     supports_truncate_prompt_tokens=False,
     supports_reasoning_parser_kwargs=False,
-    parser_attribute="reasoning_parser_cls",
+    parser_attribute="tool_parser",
+    parser_family="legacy",
+    chat_template_kwargs_method=None,
+    parser_accepts_model_config=False,
+    parser_accepts_finished=False,
     honors_include_reasoning=False,
 )
 _TRANSITION_ENGINE_DIRECT = VllmEngineDirectBinding(
@@ -57,7 +66,11 @@ _TRANSITION_ENGINE_DIRECT = VllmEngineDirectBinding(
     get_max_tokens_path="vllm.entrypoints.utils:get_max_tokens",
     supports_truncate_prompt_tokens=True,
     supports_reasoning_parser_kwargs=True,
-    parser_attribute="reasoning_parser_cls",
+    parser_attribute="parser_cls",
+    parser_family="unified-0.22",
+    chat_template_kwargs_method="_effective_chat_template_kwargs",
+    parser_accepts_model_config=False,
+    parser_accepts_finished=False,
     honors_include_reasoning=True,
 )
 _CURRENT_ENGINE_DIRECT = VllmEngineDirectBinding(
@@ -66,6 +79,10 @@ _CURRENT_ENGINE_DIRECT = VllmEngineDirectBinding(
     supports_truncate_prompt_tokens=True,
     supports_reasoning_parser_kwargs=True,
     parser_attribute="parser_cls",
+    parser_family="unified-0.26",
+    chat_template_kwargs_method="_effective_chat_template_kwargs",
+    parser_accepts_model_config=True,
+    parser_accepts_finished=True,
     honors_include_reasoning=True,
 )
 
@@ -128,12 +145,14 @@ def render_vllm_compatibility_table() -> str:
         f"The optional dependency accepts `{VLLM_INSTALLATION_RANGE}` for installation. Runtime support is",
         "limited to the named, feature-probed compatibility bindings below.",
         "",
-        "| Binding | Tested anchor | Accepted minor family | Required serving method | Token-limit helper |",
-        "| --- | --- | --- | --- | --- |",
+        "| Binding | Tested anchor | Accepted minor family | Required serving method | "
+        "Parser family | Token-limit helper |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     rows.extend(
         f"| `{binding.name}` | `{binding.anchor_version}` | `{binding.version_range}` | "
-        f"`{binding.serving_method}` | `{binding.engine_direct.get_max_tokens_path}` |"
+        f"`{binding.serving_method}` | `{binding.engine_direct.parser_family}` | "
+        f"`{binding.engine_direct.get_max_tokens_path}` |"
         for binding in VLLM_COMPATIBILITY_BINDINGS
     )
     rows.extend(

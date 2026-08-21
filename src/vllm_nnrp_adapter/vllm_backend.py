@@ -5,6 +5,7 @@ import inspect
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from .vllm_compat import VllmEngineDirectBinding
@@ -17,8 +18,6 @@ CHAT_METHOD_CANDIDATES = (
 
 
 class VllmBackend:
-    supports_tool_calls = False
-
     def __init__(
         self,
         serving_chat: object,
@@ -40,6 +39,11 @@ class VllmBackend:
     def vllm_version(self) -> str | None:
         value = getattr(self._request_factory, "vllm_version", None)
         return value if isinstance(value, str) else None
+
+    @property
+    def supports_tool_calls(self) -> bool:
+        binding = _engine_direct_binding(self._request_factory)
+        return binding is not None and _serving_supports_tool_calls(self._serving_chat, binding)
 
     def benchmark_metadata(self) -> Mapping[str, object]:
         model_config = _getattr_default(self._serving_chat, "model_config", None)
@@ -157,15 +161,13 @@ def _supports_engine_direct(
 ) -> bool:
     if not body.get("stream", False):
         return False
-    if body.get("tools") or body.get("tool_choice"):
-        return False
     if body.get("logprobs") or body.get("top_logprobs") or body.get("echo") or body.get("return_token_ids"):
-        return False
-    if getattr(serving_chat, binding.parser_attribute, None) is not None:
         return False
     if getattr(serving_chat, "use_harmony", False):
         return False
     if bool(_getattr_default(request, "use_beam_search", False)):
+        return False
+    if body.get("tools") and not _tool_request_supported(serving_chat, request, binding):
         return False
     return all(
         callable(getattr(serving_chat, name, None))
@@ -189,10 +191,17 @@ async def _create_engine_direct_stream(
     if not isinstance(rendered, tuple) or len(rendered) != 2:
         raise EngineDirectUnsupported
 
-    _conversation, engine_prompts = rendered
+    conversation, engine_prompts = rendered
     if not isinstance(engine_prompts, list) or len(engine_prompts) != 1:
         raise EngineDirectUnsupported
     engine_prompt = engine_prompts[0]
+
+    delta_parser = _create_engine_direct_delta_parser(
+        serving_chat,
+        request,
+        binding,
+        conversation=conversation,
+    )
 
     request_id = _direct_request_id(request)
     lora_request = _call_optional(serving_chat, "_maybe_get_adapters", request, supports_default_mm_loras=True)
@@ -227,6 +236,7 @@ async def _create_engine_direct_stream(
         request_id=request_id,
         model_name=model_name,
         include_usage=_include_usage(body),
+        delta_parser=delta_parser,
     )
 
 
@@ -239,12 +249,14 @@ class EngineDirectChatStream:
         request_id: str,
         model_name: str,
         include_usage: bool,
+        delta_parser: EngineDirectDeltaParser | None = None,
     ) -> None:
         self._generator = generator
         self._engine_client = engine_client
         self._request_id = request_id
         self._model_name = model_name
         self._include_usage = include_usage
+        self._delta_parser = delta_parser
         self._created = int(time.time())
         self._completion_tokens = 0
         self._prompt_tokens = 0
@@ -262,11 +274,13 @@ class EngineDirectChatStream:
             self._final_usage_pending = False
             return self._usage_chunk()
 
-        result = await self._generator.__anext__()
-        chunk = self._chunk_from_request_output(result)
-        if _request_output_finished(result) and self._include_usage:
-            self._final_usage_pending = True
-        return chunk
+        while True:
+            result = await self._generator.__anext__()
+            chunk = self._chunk_from_request_output(result)
+            if _request_output_finished(result) and self._include_usage:
+                self._final_usage_pending = True
+            if _chunk_has_output(chunk) or self._final_usage_pending:
+                return chunk
 
     async def aclose(self) -> bool:
         if self._closed:
@@ -299,10 +313,23 @@ class EngineDirectChatStream:
             token_ids = list(cast(list[object], _getattr_default(output, "token_ids", [])))
             self._completion_tokens += len(token_ids)
             delta_text = _getattr_default(output, "text", "")
+            delta = (
+                self._delta_parser.parse(output, prompt_token_ids=prompt_token_ids)
+                if self._delta_parser is not None
+                else {"content": delta_text}
+                if isinstance(delta_text, str) and delta_text
+                else {}
+            )
+            finish_reason = _getattr_default(output, "finish_reason", None)
+            if self._delta_parser is not None:
+                finish_reason = self._delta_parser.finish_reason(
+                    _optional_int(_getattr_default(output, "index", 0), default=0),
+                    finish_reason,
+                )
             choice: dict[str, Any] = {
                 "index": _optional_int(_getattr_default(output, "index", 0), default=0),
-                "delta": {"content": delta_text} if isinstance(delta_text, str) and delta_text else {},
-                "finish_reason": _getattr_default(output, "finish_reason", None),
+                "delta": delta,
+                "finish_reason": finish_reason,
             }
             stop_reason = _getattr_default(output, "stop_reason", None)
             if stop_reason is not None:
@@ -330,6 +357,153 @@ class EngineDirectChatStream:
                 "total_tokens": self._prompt_tokens + self._completion_tokens,
             },
         }
+
+
+@dataclass
+class _LegacyToolState:
+    previous_text: str = ""
+    previous_token_ids: list[object] = field(default_factory=list)
+    function_name_returned: bool = False
+    history_tool_call_count: int = 0
+    call_id: str | None = None
+    parser: object | None = None
+
+
+class EngineDirectDeltaParser:
+    def __init__(
+        self,
+        serving_chat: object,
+        request: object,
+        binding: VllmEngineDirectBinding,
+        *,
+        tokenizer: object,
+        chat_template_kwargs: Mapping[str, Any] | None,
+        history_tool_call_count: int,
+    ) -> None:
+        self._serving_chat = serving_chat
+        self._request = request
+        self._binding = binding
+        self._tokenizer = tokenizer
+        self._chat_template_kwargs = chat_template_kwargs
+        self._history_tool_call_count = history_tool_call_count
+        self._legacy_states: dict[int, _LegacyToolState] = {}
+        self._parsers: dict[int, object] = {}
+        self._tools_streamed: set[int] = set()
+        self._named_tool = _named_tool_choice(request)
+        self._legacy_mode = _legacy_tool_mode(serving_chat, request) if binding.parser_family == "legacy" else None
+
+        if binding.parser_family != "legacy":
+            for choice_index in range(_choice_count(request)):
+                self._parsers[choice_index] = self._new_unified_parser()
+
+    def parse(self, output: object, *, prompt_token_ids: object) -> dict[str, Any]:
+        choice_index = _optional_int(_getattr_default(output, "index", 0), default=0)
+        if self._binding.parser_family == "legacy":
+            delta = self._parse_legacy(choice_index, output)
+        else:
+            parser = self._parsers.get(choice_index)
+            if parser is None:
+                parser = self._new_unified_parser()
+                self._parsers[choice_index] = parser
+            parse_delta = _required_callable(parser, "parse_delta")
+            parse_kwargs: dict[str, object] = {
+                "delta_text": _text_delta(output),
+                "delta_token_ids": _token_ids(output),
+                "request": self._request,
+                "prompt_token_ids": prompt_token_ids,
+            }
+            if self._binding.parser_accepts_finished:
+                parse_kwargs["finished"] = _getattr_default(output, "finish_reason", None) is not None
+            delta = _normalize_delta(parse_delta(**parse_kwargs))
+
+        if _delta_has_tool_calls(delta):
+            self._tools_streamed.add(choice_index)
+        return delta
+
+    def finish_reason(self, choice_index: int, finish_reason: object) -> object:
+        if finish_reason is None or choice_index not in self._tools_streamed:
+            return finish_reason
+        return "stop" if self._named_tool is not None else "tool_calls"
+
+    def _new_unified_parser(self) -> object:
+        parser_factory = _required_callable(self._serving_chat, self._binding.parser_attribute)
+        parser_kwargs: dict[str, object] = {"chat_template_kwargs": self._chat_template_kwargs}
+        if self._binding.parser_accepts_model_config:
+            parser_kwargs["model_config"] = _required_attr(self._serving_chat, "model_config")
+        parser = parser_factory(
+            self._tokenizer,
+            _getattr_default(self._request, "tools", None),
+            **parser_kwargs,
+        )
+        if parser is None:
+            raise EngineDirectUnsupported
+        if self._binding.parser_family == "unified-0.22":
+            stream_state = _getattr_default(parser, "_stream_state", None)
+            if stream_state is not None:
+                _set_compat_attribute(
+                    stream_state,
+                    "tool_call_id_type",
+                    _getattr_default(self._serving_chat, "tool_call_id_type", "random"),
+                )
+                _set_compat_attribute(stream_state, "history_tool_call_cnt", self._history_tool_call_count)
+        return parser
+
+    def _parse_legacy(self, choice_index: int, output: object) -> dict[str, Any]:
+        state = self._legacy_states.get(choice_index)
+        if state is None:
+            state = _LegacyToolState(history_tool_call_count=self._history_tool_call_count)
+            self._legacy_states[choice_index] = state
+
+        delta_text = _text_delta(output)
+        delta_token_ids = _token_ids(output)
+        current_text = state.previous_text + delta_text
+        current_token_ids = state.previous_token_ids + delta_token_ids
+
+        if self._legacy_mode == "auto":
+            if state.parser is None:
+                parser_factory = _required_callable(self._serving_chat, self._binding.parser_attribute)
+                state.parser = parser_factory(self._tokenizer)
+            parser = _required_callable(state.parser, "extract_tool_calls_streaming")
+            parsed = parser(
+                previous_text=state.previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+                previous_token_ids=state.previous_token_ids,
+                current_token_ids=current_token_ids,
+                delta_token_ids=delta_token_ids,
+                request=self._request,
+            )
+            delta = _normalize_delta(parsed)
+        elif self._legacy_mode == "named":
+            if state.call_id is None:
+                state.call_id = f"call_{uuid.uuid4().hex}"
+            function: dict[str, Any] = {"arguments": delta_text}
+            tool_call: dict[str, Any] = {"index": 0, "function": function}
+            if not state.function_name_returned:
+                tool_call.update({"id": state.call_id, "type": "function"})
+                function["name"] = cast(str, self._named_tool)
+                state.function_name_returned = True
+            delta = {"tool_calls": [tool_call]}
+        elif self._legacy_mode == "required":
+            parsed = _required_callable(self._serving_chat, "extract_tool_call_required_streaming")(
+                previous_text=state.previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+                function_name_returned=state.function_name_returned,
+                tool_call_idx=state.history_tool_call_count,
+            )
+            if not isinstance(parsed, tuple) or len(parsed) != 2:
+                raise EngineDirectUnsupported
+            delta = _normalize_delta(parsed[0])
+            state.function_name_returned = bool(parsed[1])
+            if _delta_starts_tool_call(delta):
+                state.history_tool_call_count += 1
+        else:
+            delta = {"content": delta_text} if delta_text else {}
+
+        state.previous_text = current_text
+        state.previous_token_ids = current_token_ids
+        return delta
 
 
 class EngineDirectUnsupported(Exception):
@@ -393,6 +567,178 @@ def _sampling_params(
     if not callable(to_sampling_params):
         raise EngineDirectUnsupported
     return to_sampling_params(resolved_max_tokens, default_sampling_params)
+
+
+def _create_engine_direct_delta_parser(
+    serving_chat: object,
+    request: object,
+    binding: VllmEngineDirectBinding,
+    *,
+    conversation: object,
+) -> EngineDirectDeltaParser | None:
+    has_tools = bool(_getattr_default(request, "tools", None))
+    parser_factory = getattr(serving_chat, binding.parser_attribute, None)
+    if binding.parser_family == "legacy":
+        if not has_tools:
+            if getattr(serving_chat, "reasoning_parser_cls", None) is not None:
+                raise EngineDirectUnsupported
+            return None
+        if _legacy_tool_mode(serving_chat, request) is None:
+            raise EngineDirectUnsupported
+    elif not callable(parser_factory):
+        if has_tools:
+            raise EngineDirectUnsupported
+        return None
+
+    renderer = _required_attr(serving_chat, "renderer")
+    tokenizer = _required_attr(renderer, "tokenizer")
+    if tokenizer is None:
+        raise EngineDirectUnsupported
+    chat_template_kwargs = _chat_template_kwargs(serving_chat, request, binding)
+    return EngineDirectDeltaParser(
+        serving_chat,
+        request,
+        binding,
+        tokenizer=tokenizer,
+        chat_template_kwargs=chat_template_kwargs,
+        history_tool_call_count=_history_tool_call_count(conversation),
+    )
+
+
+def _chat_template_kwargs(
+    serving_chat: object,
+    request: object,
+    binding: VllmEngineDirectBinding,
+) -> Mapping[str, Any] | None:
+    method_name = binding.chat_template_kwargs_method
+    if method_name is None:
+        return None
+    value = _required_callable(serving_chat, method_name)(request)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise EngineDirectUnsupported
+    return value
+
+
+def _serving_supports_tool_calls(serving_chat: object, binding: VllmEngineDirectBinding) -> bool:
+    return bool(_getattr_default(serving_chat, "enable_auto_tools", False)) and callable(
+        getattr(serving_chat, binding.parser_attribute, None)
+    )
+
+
+def _tool_request_supported(
+    serving_chat: object,
+    request: object,
+    binding: VllmEngineDirectBinding,
+) -> bool:
+    renderer = _getattr_default(serving_chat, "renderer", None)
+    if renderer is None or _getattr_default(renderer, "tokenizer", None) is None:
+        return False
+    if binding.parser_family != "legacy":
+        method_name = binding.chat_template_kwargs_method
+        parser_available = callable(getattr(serving_chat, binding.parser_attribute, None)) and (
+            method_name is None or callable(getattr(serving_chat, method_name, None))
+        )
+        tool_choice = _getattr_default(request, "tool_choice", None)
+        if tool_choice in (None, "auto"):
+            return parser_available and bool(_getattr_default(serving_chat, "enable_auto_tools", False))
+        return parser_available
+    return _legacy_tool_mode(serving_chat, request) is not None
+
+
+def _legacy_tool_mode(serving_chat: object, request: object) -> str | None:
+    if not _getattr_default(request, "tools", None):
+        return None
+    if _named_tool_choice(request) is not None:
+        return "named"
+    tool_choice = _getattr_default(request, "tool_choice", None)
+    if tool_choice == "required":
+        return "required" if callable(getattr(serving_chat, "extract_tool_call_required_streaming", None)) else None
+    if tool_choice in (None, "auto"):
+        should_parse = getattr(serving_chat, "_should_stream_with_auto_tool_parsing", None)
+        if callable(should_parse):
+            try:
+                if not bool(should_parse(request)):
+                    return None
+            except Exception:
+                return None
+        elif not bool(_getattr_default(serving_chat, "enable_auto_tools", False)):
+            return None
+        return "auto" if callable(getattr(serving_chat, "tool_parser", None)) else None
+    return None
+
+
+def _named_tool_choice(request: object) -> str | None:
+    tool_choice = _getattr_default(request, "tool_choice", None)
+    if isinstance(tool_choice, Mapping):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, Mapping) else None
+    else:
+        function = _getattr_default(tool_choice, "function", None)
+        name = _getattr_default(function, "name", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _choice_count(request: object) -> int:
+    count = _optional_int(_getattr_default(request, "n", 1), default=1)
+    return count if count > 0 else 1
+
+
+def _history_tool_call_count(conversation: object) -> int:
+    if not isinstance(conversation, list):
+        return 0
+    count = 0
+    for message in conversation:
+        if isinstance(message, Mapping):
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                count += len(tool_calls)
+    return count
+
+
+def _text_delta(output: object) -> str:
+    value = _getattr_default(output, "text", "")
+    return value if isinstance(value, str) else ""
+
+
+def _token_ids(output: object) -> list[object]:
+    value = _getattr_default(output, "token_ids", [])
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _normalize_delta(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    normalized = _normalize_object(value)
+    if not isinstance(normalized, Mapping):
+        raise EngineDirectUnsupported
+    return {str(key): item for key, item in normalized.items() if item is not None}
+
+
+def _delta_has_tool_calls(delta: Mapping[str, Any]) -> bool:
+    tool_calls = delta.get("tool_calls")
+    return isinstance(tool_calls, list) and bool(tool_calls)
+
+
+def _delta_starts_tool_call(delta: Mapping[str, Any]) -> bool:
+    tool_calls = delta.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    return any(isinstance(tool_call, Mapping) and bool(tool_call.get("id")) for tool_call in tool_calls)
+
+
+def _chunk_has_output(chunk: Mapping[str, Any]) -> bool:
+    if chunk.get("usage") is not None:
+        return True
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return False
+    return any(
+        isinstance(choice, Mapping)
+        and (bool(choice.get("delta")) or choice.get("finish_reason") is not None)
+        for choice in choices
+    )
 
 
 def _engine_direct_binding(request_factory: object | None) -> VllmEngineDirectBinding | None:
@@ -484,6 +830,10 @@ async def _abort_request(engine_client: object, request_id: str) -> bool:
 
 def _getattr_default(value: object, name: str, default: object) -> object:
     return getattr(value, name, default)
+
+
+def _set_compat_attribute(value: object, name: str, attribute: object) -> None:
+    setattr(value, name, attribute)
 
 
 def _required_attr(value: object, name: str) -> object:
