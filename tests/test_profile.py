@@ -89,3 +89,70 @@ def test_validate_rejects_missing_messages() -> None:
         )
 
     assert error.value.code == "missing_messages"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_code"),
+    (
+        ("request_id", 7, "invalid_request_id"),
+        ("nnrp", [], "invalid_nnrp_policy"),
+    ),
+)
+def test_validate_rejects_invalid_optional_envelope_fields(
+    field: str,
+    value: object,
+    expected_code: str,
+) -> None:
+    envelope = {
+        "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+        "operation": CHAT_COMPLETIONS_CREATE,
+        "body": {"model": "llama", "messages": [{"role": "user", "content": "hello"}]},
+        field: value,
+    }
+
+    with pytest.raises(OpenAiNnrpError) as error:
+        validate_request(envelope, OpenAiNnrpCapabilityDocument.level1())
+
+    assert error.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("policy", "message"),
+    (
+        ({"timeout_ms": -1}, "timeout_ms"),
+        ({"timeout_ms": True}, "timeout_ms"),
+        ({"diagnostics": "yes"}, "diagnostics"),
+        ({"cancel_after_events": -1}, "cancel_after_events"),
+        ({"cancel_after_events": False}, "cancel_after_events"),
+    ),
+)
+def test_validate_rejects_invalid_known_nnrp_policy_values(
+    policy: dict[str, object],
+    message: str,
+) -> None:
+    envelope = {
+        "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+        "operation": CHAT_COMPLETIONS_CREATE,
+        "body": {"model": "llama", "messages": [{"role": "user", "content": "hello"}]},
+        "nnrp": policy,
+    }
+
+    with pytest.raises(OpenAiNnrpError, match=message) as error:
+        validate_request(envelope, OpenAiNnrpCapabilityDocument.level1())
+
+    assert error.value.code == "invalid_nnrp_policy"
+
+
+@pytest.mark.parametrize("operation", ("responses.create", "models.list", "embeddings.create"))
+def test_level1_rejects_level2_and_level3_operations(operation: str) -> None:
+    with pytest.raises(OpenAiNnrpError) as error:
+        validate_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": operation,
+                "body": {"model": "llama", "messages": [{"role": "user", "content": "hello"}]},
+            },
+            OpenAiNnrpCapabilityDocument.level1(),
+        )
+
+    assert error.value.code == "unsupported_operation"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict, cast
 
 OPENAI_COMPATIBLE_PROFILE = "openai-compatible"
 OPENAI_COMPATIBLE_SCHEMA_VERSION = "openai-compatible/1"
@@ -98,10 +98,25 @@ def validate_request(request: Mapping[str, Any], capabilities: OpenAiNnrpCapabil
         "operation": operation,
         "body": body,
     }
-    if isinstance(request.get("request_id"), str):
-        validated["request_id"] = request["request_id"]
-    if isinstance(request.get("nnrp"), dict):
-        validated["nnrp"] = request["nnrp"]
+    if "request_id" in request:
+        request_id = request["request_id"]
+        if not isinstance(request_id, str):
+            raise OpenAiNnrpError(
+                "invalid_request_error",
+                "invalid_request_id",
+                "request_id must be a string when provided.",
+            )
+        validated["request_id"] = request_id
+    if "nnrp" in request:
+        policy = request["nnrp"]
+        if not isinstance(policy, dict):
+            raise OpenAiNnrpError(
+                "invalid_request_error",
+                "invalid_nnrp_policy",
+                "nnrp must be a JSON object when provided.",
+            )
+        _validate_nnrp_policy(policy)
+        validated["nnrp"] = cast(OpenAiNnrpPolicy, policy)
     return validated
 
 
@@ -115,6 +130,34 @@ def _validate_chat_body(body: Mapping[str, Any]) -> None:
             "invalid_request_error",
             "missing_messages",
             "Chat completion body must include messages.",
+        )
+
+
+def _validate_nnrp_policy(policy: Mapping[str, Any]) -> None:
+    timeout_ms = policy.get("timeout_ms")
+    if "timeout_ms" in policy and (type(timeout_ms) is not int or timeout_ms < 0):
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "invalid_nnrp_policy",
+            "nnrp.timeout_ms must be a non-negative integer when provided.",
+        )
+
+    diagnostics = policy.get("diagnostics")
+    if "diagnostics" in policy and not isinstance(diagnostics, bool):
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "invalid_nnrp_policy",
+            "nnrp.diagnostics must be a boolean when provided.",
+        )
+
+    cancel_after_events = policy.get("cancel_after_events")
+    if "cancel_after_events" in policy and (
+        type(cancel_after_events) is not int or cancel_after_events < 0
+    ):
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "invalid_nnrp_policy",
+            "nnrp.cancel_after_events must be a non-negative integer when provided.",
         )
 
 

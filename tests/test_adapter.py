@@ -555,6 +555,63 @@ async def test_adapter_passes_profile_request_id_to_backend_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_preserves_openai_body_without_leaking_nnrp_policy() -> None:
+    class RecordingBackend:
+        def __init__(self) -> None:
+            self.body: Mapping[str, Any] | None = None
+
+        def create_chat_completion(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
+            self.body = body
+            return {"id": "chatcmpl-recorded", "choices": []}
+
+    backend = RecordingBackend()
+    adapter = OpenAiNnrpAdapter(backend)
+    openai_body = {
+        "model": "vision-model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+                ],
+            }
+        ],
+        "temperature": 0.25,
+        "top_p": 0.8,
+        "max_tokens": 64,
+        "tools": [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+        ],
+        "tool_choice": "auto",
+        "metadata": {"tenant": "example"},
+        "stream": False,
+    }
+
+    events = [
+        event
+        async for event in adapter.handle_request(
+            {
+                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+                "operation": CHAT_COMPLETIONS_CREATE,
+                "request_id": "request-profile-2",
+                "body": openai_body,
+                "nnrp": {
+                    "timeout_ms": 30_000,
+                    "diagnostics": False,
+                    "cache": {"mode": "explicit"},
+                    "transport": {"preference": "ipc"},
+                },
+            }
+        )
+    ]
+
+    assert events[-1]["type"] == "response.completed"
+    assert backend.body == {**openai_body, "request_id": "request-profile-2"}
+    assert "nnrp" not in backend.body
+
+
+@pytest.mark.asyncio
 async def test_adapter_emits_profile_error_for_bad_request() -> None:
     adapter = OpenAiNnrpAdapter(NonStreamingBackend())
 

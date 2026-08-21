@@ -2,14 +2,14 @@
 
 ## Level 1 Request Contract
 
-- [ ] Validate `schema_version`, `operation`, optional `request_id`, `body`, and optional `nnrp`
+- [x] Validate `schema_version`, `operation`, optional `request_id`, `body`, and optional `nnrp`
   policy exactly as frozen for `openai-compatible/1`.
-- [ ] Accept only `chat.completions.create` for Level 1.
-- [ ] Preserve OpenAI-compatible model, messages, temperature, top-p, token limit, tools,
+- [x] Accept only `chat.completions.create` for Level 1.
+- [x] Preserve OpenAI-compatible model, messages, temperature, top-p, token limit, tools,
   tool-choice, metadata, stream, and supported multimodal fields.
-- [ ] Keep NNRP timeout, diagnostics, cache, transport, and cancellation policy out of the OpenAI
+- [x] Keep NNRP timeout, diagnostics, cache, transport, and cancellation policy out of the OpenAI
   request body passed to vLLM.
-- [ ] Reject Level 2 and Level 3 operations until their complete behavior and conformance manifests
+- [x] Reject Level 2 and Level 3 operations until their complete behavior and conformance manifests
   are implemented.
 
 ## Result Event Contract
