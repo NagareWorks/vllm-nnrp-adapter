@@ -417,7 +417,7 @@ async def test_adapter_maps_streaming_chat_chunks() -> None:
     assert events[0]["type"] == "response.output_text.delta"
     assert events[0]["delta"] == "hello"
     assert events[1]["type"] == "response.usage"
-    assert events[2]["type"] == "response.completed"
+    assert len(events) == 2
 
 
 @pytest.mark.asyncio
@@ -980,7 +980,7 @@ async def test_explicit_smoke_backend_normalizes_in_process_sse_stream() -> None
         )
     ]
 
-    assert [event["type"] for event in events] == ["response.output_text.delta", "response.completed"]
+    assert [event["type"] for event in events] == ["response.output_text.delta"]
     assert events[0]["delta"] == "hello"
     assert adapter.capabilities.operations[0]["tool_calls"] is True
 
@@ -1050,7 +1050,6 @@ async def test_vllm_backend_prefers_engine_direct_stream_without_sse(monkeypatch
         "response.output_text.delta",
         "response.output_text.delta",
         "response.usage",
-        "response.completed",
     ]
     assert events[0]["delta"] == "hello"
     assert events[1]["delta"] == " world"
@@ -1411,7 +1410,6 @@ async def test_engine_direct_tool_calls_follow_each_vllm_parser_family(
         "response.tool_call.delta",
         "response.tool_call.delta",
         "response.tool_call.completed",
-        "response.completed",
     ]
     assert events[0]["call_id"] == "call-parser"
     assert events[3]["arguments"] == "{}"

@@ -394,12 +394,13 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     ]
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "completed"
-    assert observation["output_event_count"] == 3
+    assert observation["output_event_count"] == 2
     assert observation["total_tokens"] == 2
     terminal_metadata, terminal_body = operation.terminal_results[0]
     assert terminal_metadata.result_class is ResultClass.COMPLETE
-    assert terminal_metadata.payload_kind_bitmap is PayloadKind.STRUCTURED_EVENT
-    assert json.loads(terminal_body)["type"] == "response.completed"
+    assert terminal_metadata.payload_kind_bitmap == PayloadKind(0)
+    assert terminal_metadata.payload_frame_count == 0
+    assert terminal_body == b""
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
     assert session.closed is True
@@ -572,7 +573,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         assert observation["backend_binding"] is None
         assert observation["vllm_version"] is None
         assert observation["selected_transport"] == "ipc"
-        assert observation["output_event_count"] == 3
+        assert observation["output_event_count"] == 2
         assert observation["terminal_outcome"] == "completed"
 
 
@@ -619,7 +620,7 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
 
     assert statistics.accepted_operations == 1
     assert statistics.terminal_results == 2
-    assert json.loads(operations[0].terminal_results[0][1])["type"] == "response.completed"
+    assert operations[0].terminal_results[0][1] == b""
     duplicate_event = json.loads(operations[1].terminal_results[0][1])
     assert duplicate_event["type"] == "response.error"
     assert duplicate_event["error"]["code"] == "duplicate_operation_id"
@@ -998,7 +999,7 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
     assert old_operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.SUPERSEDED
     assert old_operation.result_drops[0][1] == b"newer_request"
     assert len(new_operation.terminal_results) == 1
-    assert json.loads(new_operation.terminal_results[0][1])["type"] == "response.completed"
+    assert new_operation.terminal_results[0][1] == b""
     observations = {record["operation_id"]: record for record in _observation_records(caplog)}
     assert observations[105]["terminal_outcome"] == "dropped"
     assert observations[105]["cancellation_kind"] == "supersede"

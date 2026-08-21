@@ -412,7 +412,12 @@ async def _serve_operation(
             event = _runtime_error_event(error)
         else:
             if not terminal_sent:
-                event = _missing_terminal_event()
+                await progress.emit(OperationProgressStage.FINALIZING)
+                record.terminate(OperationState.COMPLETED)
+                await progress.emit(OperationProgressStage.COMPLETED)
+                terminal_sent = True
+                await operation.send_result(_terminal_metadata(operation, None), b"")
+                counters.terminal_results += 1
 
         if not terminal_sent:
             await progress.emit(OperationProgressStage.FINALIZING)
@@ -570,8 +575,9 @@ def _operation_capacity_event(limit: int) -> dict[str, Any]:
 
 def _terminal_metadata(
     operation: NativeRuntimeServerOperation,
-    event: Mapping[str, Any],
+    event: Mapping[str, Any] | None,
 ) -> ResultPushMetadata:
+    has_profile_body = event is not None
     return ResultPushMetadata(
         status_code=_status_code(event),
         result_flags=ResultFlags(0),
@@ -586,12 +592,14 @@ def _terminal_metadata(
         tile_base_id=0,
         tile_index_bytes=0,
         result_class=ResultClass.COMPLETE,
-        payload_kind_bitmap=PayloadKind.STRUCTURED_EVENT,
-        payload_frame_count=1,
+        payload_kind_bitmap=PayloadKind.STRUCTURED_EVENT if has_profile_body else PayloadKind(0),
+        payload_frame_count=1 if has_profile_body else 0,
     )
 
 
-def _status_code(event: Mapping[str, Any]) -> int:
+def _status_code(event: Mapping[str, Any] | None) -> int:
+    if event is None:
+        return 200
     if event.get("type") == "response.cancelled":
         return 499
     if event.get("type") != "response.error":
@@ -621,17 +629,6 @@ def _runtime_error_event(error: Exception) -> dict[str, Any]:
             "type": "server_error",
             "code": "adapter_runtime_error",
             "message": str(error),
-        },
-    }
-
-
-def _missing_terminal_event() -> dict[str, Any]:
-    return {
-        "type": "response.error",
-        "error": {
-            "type": "server_error",
-            "code": "missing_terminal_event",
-            "message": "Adapter result stream ended without a terminal event.",
         },
     }
 

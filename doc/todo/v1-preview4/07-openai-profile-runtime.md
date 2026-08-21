@@ -14,15 +14,15 @@
 
 ## Result Event Contract
 
-- [ ] Emit ordered `response.output_text.delta` events for streaming text as `PARTIAL_RESULT`
+- [x] Emit ordered `response.output_text.delta` events for streaming text as `PARTIAL_RESULT`
   payloads, preserving one monotonic result sequence per operation.
 - [x] Emit `response.tool_call.started`, `.delta`, `.completed`, and `.error` with stable tool-call
   identity when advertised; non-terminal tool events also use `PARTIAL_RESULT`.
-- [ ] Emit `response.usage` without inventing absent token counts and preserve its order relative to
+- [x] Emit `response.usage` without inventing absent token counts and preserve its order relative to
   text and tool events.
-- [ ] Emit at most one `response.completed`, `response.error`, or `response.cancelled` terminal
+- [x] Emit at most one `response.completed`, `response.error`, or `response.cancelled` terminal
   profile event when applicable, then produce exactly one matching NNRP terminal outcome.
-- [ ] Preserve the final streaming or non-streaming OpenAI-compatible response body, when available,
+- [x] Preserve the final streaming or non-streaming OpenAI-compatible response body, when available,
   in the single terminal `RESULT_PUSH` sent by `NativeRuntimeServerOperation.send_result`; never
   invent a final body when vLLM provides only ordered deltas and terminal metadata.
 - [ ] Keep optional original OpenAI chunks ignorable and exclude them from baseline client
