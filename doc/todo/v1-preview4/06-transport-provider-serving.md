@@ -5,7 +5,7 @@
 - [x] Replace `serve-tcp` with `serve` accepting one `nnrp://` or `nnrps://` application endpoint.
 - [x] Accept explicit TCP, QUIC, IPC, and WebSocket provider routes with provider-local locators and
   security material.
-- [ ] Pass an explicit provider registry through to `listen_native_server` when supplied; otherwise
+- [x] Pass an explicit provider registry through to `listen_native_server` when supplied; otherwise
   use official installed-provider discovery.
 - [ ] Select the only installed provider directly and probe only when multiple eligible providers
   are installed.

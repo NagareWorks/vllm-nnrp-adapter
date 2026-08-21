@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from nnrp import (  # type: ignore[import-untyped]
     NativeRuntimeServerOperation,
     NativeRuntimeServerSession,
+    NativeTransportBinding,
     NativeWouldBlockError,
     PayloadKind,
     TransportPolicy,
@@ -55,6 +56,7 @@ _T = TypeVar("_T")
 class NnrpServerConfig:
     endpoint: str
     provider_routes: Mapping[str, NativeServerProviderRoute] = field(default_factory=dict)
+    transports: Sequence[NativeTransportBinding] | None = None
     transport_policy: TransportPolicy = TransportPolicy.AUTO
     session_options: NativeServerSessionOptions = field(default_factory=NativeServerSessionOptions)
     accept_timeout_ms: int = 100
@@ -78,9 +80,13 @@ class NnrpServerConfig:
         routes = MappingProxyType(dict(self.provider_routes))
         if any(not isinstance(route, NativeServerProviderRoute) for route in routes.values()):
             raise TypeError("provider_routes values must be NativeServerProviderRoute")
+        transports = None if self.transports is None else tuple(self.transports)
+        if transports is not None and any(not isinstance(binding, NativeTransportBinding) for binding in transports):
+            raise TypeError("transports values must be NativeTransportBinding")
         if not isinstance(self.transport_policy, TransportPolicy):
             raise TypeError("transport_policy must be TransportPolicy")
         object.__setattr__(self, "provider_routes", routes)
+        object.__setattr__(self, "transports", transports)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +148,8 @@ async def serve(
             provider_routes=config.provider_routes,
             transport_policy=config.transport_policy,
             session_defaults=config.session_options,
-        )
+        ),
+        transports=config.transports,
     )
     sessions: set[asyncio.Task[None]] = set()
     server = None

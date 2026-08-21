@@ -13,7 +13,7 @@ from vllm_nnrp_adapter.distribution_metadata import (
 )
 
 
-def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post15,<1.0.0rc5") -> str:
+def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post18,<1.0.0rc5") -> str:
     return "\n".join(
         (
             "Metadata-Version: 2.4",
@@ -37,7 +37,7 @@ def test_distribution_metadata_rejects_preview3_artifact() -> None:
 
 def test_distribution_metadata_rejects_wrong_preview4_range() -> None:
     with pytest.raises(DistributionMetadataError, match="frozen nnrp-py range"):
-        validate_metadata_text(_metadata(nnrp_range=">=1.0.0rc4.post13,<1.0.0rc5"), artifact="adapter.whl")
+        validate_metadata_text(_metadata(nnrp_range=">=1.0.0rc4.post17,<1.0.0rc5"), artifact="adapter.whl")
 
 
 def test_distribution_metadata_rejects_missing_vllm_extra() -> None:

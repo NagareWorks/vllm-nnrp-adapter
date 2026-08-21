@@ -54,6 +54,7 @@ EXPECTED_ENTRYPOINT_SIGNATURES = {
     "NnrpServeStatistics": "(accepted_sessions: 'int', accepted_operations: 'int', partial_results: 'int', "
     "terminal_results: 'int') -> None",
     "NnrpServerConfig": "(endpoint: 'str', provider_routes: 'Mapping[str, NativeServerProviderRoute]' = <factory>, "
+    "transports: 'Sequence[NativeTransportBinding] | None' = None, "
     "transport_policy: 'TransportPolicy' = <TransportPolicy.AUTO: 0>, "
     "session_options: 'NativeServerSessionOptions' = <factory>, "
     "accept_timeout_ms: 'int' = 100, receive_timeout_ms: 'int' = 100, max_active_sessions: 'int' = 8, "
@@ -102,7 +103,7 @@ def test_contract_rejects_missing_preview4_symbol(monkeypatch: pytest.MonkeyPatc
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="nnrp.server.NativeServer"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post15")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
 
 
 def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -123,6 +124,7 @@ def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.
             name: getattr(nnrp, name)
             for name in (
                 "NativeRuntimeServerSession",
+                "NativeTransportBinding",
                 "NativeTransportEndpoint",
                 "NnrpEndpoint",
                 "TransportPolicy",
@@ -137,11 +139,41 @@ def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="incompatible Preview4 native role contract"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post15")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+
+
+def test_contract_rejects_private_transport_binding_keyword(monkeypatch: pytest.MonkeyPatch) -> None:
+    from importlib import import_module
+
+    server_module = import_module("nnrp.server")
+
+    def old_listen(options: object, *, _transports: object = None) -> None:
+        pass
+
+    old_server_module = SimpleNamespace(
+        **{
+            name: getattr(server_module, name)
+            for name in (
+                "NativeServer",
+                "NativeServerAcceptOptions",
+                "NativeServerBootstrapOptions",
+                "NativeServerProviderRoute",
+                "NativeServerSessionOptions",
+            )
+        },
+        listen_native_server=old_listen,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_contract.import_module",
+        lambda module_name: old_server_module if module_name == "nnrp.server" else import_module(module_name),
+    )
+
+    with pytest.raises(NnrpRuntimeContractError, match="public transports keyword"):
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
 
 
 def test_contract_rejects_versions_outside_preview4_range() -> None:
-    for incompatible_version in ("1.0.0rc3.post5", "1.0.0rc5"):
+    for incompatible_version in ("1.0.0rc3.post5", "1.0.0rc4.post17", "1.0.0rc5"):
         with pytest.raises(NnrpRuntimeContractError, match=incompatible_version):
             validate_nnrp_runtime_contract(installed_version=incompatible_version)
 
@@ -163,7 +195,7 @@ def test_project_dependency_metadata_requires_preview4_without_native_payloads()
     metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = metadata["project"]["dependencies"]
 
-    assert "nnrp-py>=1.0.0rc4.post15,<1.0.0rc5" in dependencies
+    assert "nnrp-py>=1.0.0rc4.post18,<1.0.0rc5" in dependencies
     assert all("rc3" not in dependency for dependency in dependencies)
     assert metadata["project"]["optional-dependencies"]["vllm"] == ["vllm>=0.18.0,<0.27"]
 

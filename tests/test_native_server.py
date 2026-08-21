@@ -10,7 +10,17 @@ from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 import pytest
-from nnrp import NativeWouldBlockError
+from nnrp import (
+    NativeTransportBinding,
+    NativeTransportProvider,
+    NativeTransportProviderCost,
+    NativeTransportProviderKind,
+    NativeTransportProviderLimitation,
+    NativeTransportProviderLimits,
+    NativeTransportProviderMetadata,
+    NativeWouldBlockError,
+    TransportId,
+)
 from nnrp.core import FrameSubmitMetadata, InputProfile, MessageType, PayloadKind, ResultClass, ResultPushMetadata
 from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
 from nnrp.runtime import (
@@ -335,6 +345,42 @@ class FakeServerContext:
         self.exited = True
 
 
+def _unavailable_ipc_binding() -> NativeTransportBinding:
+    provider = NativeTransportProvider(
+        name="test-ipc",
+        version="1",
+        transport_id=TransportId.IPC,
+        kind=NativeTransportProviderKind.NATIVE_DYNAMIC,
+        available=False,
+        library_path=None,
+        metadata=NativeTransportProviderMetadata(
+            id="test.ipc",
+            cost=NativeTransportProviderCost(model_id=0, units=0),
+            preference_rank=1,
+            limits=NativeTransportProviderLimits(max_frame_bytes=1024),
+            limitations=(NativeTransportProviderLimitation.LOCAL_HOST_ONLY,),
+        ),
+        diagnostic="test provider is unavailable",
+    )
+    return NativeTransportBinding(
+        entrypoints=None,
+        provider=provider,
+        role_entrypoints=None,
+        unavailable_diagnostic=provider.diagnostic,
+    )
+
+
+def _listen_with_context(server_context: FakeServerContext) -> Callable[..., FakeServerContext]:
+    def listen(
+        _options: NativeServerBootstrapOptions,
+        *,
+        transports: tuple[NativeTransportBinding, ...] | None = None,
+    ) -> FakeServerContext:
+        return server_context
+
+    return listen
+
+
 @pytest.mark.asyncio
 async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     monkeypatch: pytest.MonkeyPatch,
@@ -352,15 +398,23 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     session = FakeSession(operation, stop_event)
     server_context = FakeServerContext(FakeServer(session))
     captured_options: list[NativeServerBootstrapOptions] = []
+    captured_transports: list[tuple[NativeTransportBinding, ...] | None] = []
 
-    def fake_listen(options: NativeServerBootstrapOptions) -> FakeServerContext:
+    def fake_listen(
+        options: NativeServerBootstrapOptions,
+        *,
+        transports: tuple[NativeTransportBinding, ...] | None = None,
+    ) -> FakeServerContext:
         captured_options.append(options)
+        captured_transports.append(transports)
         return server_context
 
     monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", fake_listen)
+    binding = _unavailable_ipc_binding()
     config = NnrpServerConfig(
         endpoint="nnrp://runtime.local/vllm",
         provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm")},
+        transports=[binding],
         accept_timeout_ms=10,
         receive_timeout_ms=10,
         max_active_sessions=1,
@@ -403,6 +457,8 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert terminal_body == b""
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
     assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
+    assert config.transports == (binding,)
+    assert captured_transports == [(binding,)]
     assert session.closed is True
     assert server_context.exited is True
     assert operation.native_thread_ids
@@ -414,6 +470,18 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
 def test_server_config_rejects_provider_locator_as_application_endpoint(endpoint: str) -> None:
     with pytest.raises(ValueError, match="nnrp:// or nnrps://"):
         NnrpServerConfig(endpoint=endpoint)
+
+
+def test_server_config_uses_installed_provider_discovery_when_transports_are_omitted() -> None:
+    assert NnrpServerConfig(endpoint="nnrp://runtime.local/vllm").transports is None
+
+
+def test_server_config_rejects_non_binding_transport_entries() -> None:
+    with pytest.raises(TypeError, match="transports values must be NativeTransportBinding"):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            transports=[object()],  # type: ignore[list-item]
+        )
 
 
 @pytest.mark.asyncio
@@ -458,7 +526,7 @@ async def test_invalid_submit_body_produces_one_terminal_error(
     server_context = FakeServerContext(FakeServer(session))
     monkeypatch.setattr(
         "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
-        lambda _options: server_context,
+        _listen_with_context(server_context),
     )
 
     statistics = await serve(
@@ -520,7 +588,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
     server_context = FakeServerContext(MultiSessionFakeServer(sessions))
     monkeypatch.setattr(
         "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
-        lambda _options: server_context,
+        _listen_with_context(server_context),
     )
     backend = InterleavingBackend(expected_operations=len(operations))
 
@@ -603,7 +671,10 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
 
     session = MultiOperationFakeSession(operations, operation_accepted=operation_received)
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(StreamingBackend()),
@@ -653,7 +724,10 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
         stop_event=stop_event,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(backend),
@@ -724,7 +798,10 @@ async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cann
         stop_event=stop_event,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(backend),
@@ -774,7 +851,10 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
         stop_event=stop_event,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     async def request_shutdown() -> None:
         await asyncio.to_thread(backend.started.wait, 1)
@@ -838,7 +918,10 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
         stop_after_last_event=True,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(backend),
@@ -897,7 +980,10 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
         stop_event=stop_event,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(backend),
@@ -975,7 +1061,10 @@ async def test_native_supersede_admits_replacement_before_dropping_old_operation
         stop_event=stop_event,
     )
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
-    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", lambda _options: server_context)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
 
     statistics = await serve(
         OpenAiNnrpAdapter(backend),

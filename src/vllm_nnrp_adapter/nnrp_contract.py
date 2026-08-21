@@ -2,19 +2,20 @@ from __future__ import annotations
 
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from inspect import iscoroutinefunction
+from inspect import Parameter, iscoroutinefunction, signature
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 NNRP_PY_DISTRIBUTION = "nnrp-py"
-NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post15,<1.0.0rc5"
+NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post18,<1.0.0rc5"
 _NNRP_PY_REQUIRED_SPECIFIER = SpecifierSet(NNRP_PY_REQUIRED_RANGE)
 
 _REQUIRED_NNRP_SYMBOLS = {
     "nnrp": (
         "NativeRuntimeServerOperation",
         "NativeRuntimeServerSession",
+        "NativeTransportBinding",
         "NativeTransportEndpoint",
         "NnrpEndpoint",
         "TransportPolicy",
@@ -82,6 +83,13 @@ def validate_nnrp_runtime_contract(*, installed_version: str | None = None) -> s
         raise NnrpRuntimeContractError(
             f"installed {NNRP_PY_DISTRIBUTION} version {resolved_version} does not expose the Preview4 native "
             f"role contract; missing: {', '.join(missing_symbols)}"
+        )
+    listen_parameters = signature(import_module("nnrp.server").listen_native_server).parameters
+    transports_parameter = listen_parameters.get("transports")
+    if transports_parameter is None or transports_parameter.kind is not Parameter.KEYWORD_ONLY:
+        raise NnrpRuntimeContractError(
+            f"installed {NNRP_PY_DISTRIBUTION} version {resolved_version} exposes an incompatible Preview4 native "
+            "role contract; listen_native_server must expose the public transports keyword"
         )
     incompatible_methods: list[str] = []
     for owner_path, method_contracts in _REQUIRED_NNRP_METHODS.items():

@@ -118,6 +118,10 @@ asyncio.create_task(start_nnrp_profile_server(backend))
 
 The application endpoint stays `nnrp://` or `nnrps://`. Carrier locators such as `tcp://`,
 `quic://`, `unix://`, `npipe://`, `ws://`, and `wss://` appear only inside provider routes.
+By default, the runtime discovers installed transport providers. Embedders that already own a
+provider registry can pass its `NativeTransportBinding` sequence through
+`NnrpServerConfig(transports=...)`; that explicit sequence is forwarded unchanged to
+`listen_native_server`.
 
 The native role receives operation bodies directly. Ordered non-terminal profile events are sent as
 `PARTIAL_RESULT`; exactly one `response.completed`, `response.error`, or `response.cancelled` event
