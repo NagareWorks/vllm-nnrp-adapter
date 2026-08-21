@@ -31,6 +31,7 @@ async def run_conformance_plan_file(
     report = await run_conformance_plan(plan, backend=backend)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    _write_case_evidence(plan, report)
     return report
 
 
@@ -236,6 +237,25 @@ def _mapping_contains(actual: Mapping[str, Any], expected: Mapping[str, Any]) ->
 def _load_json_object(path: Path) -> Mapping[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     return _as_mapping(value, str(path))
+
+
+def _write_case_evidence(plan: Mapping[str, Any], report: Mapping[str, Any]) -> None:
+    artifacts = _as_mapping(plan.get("artifacts"), "artifacts")
+    evidence_directory = Path(_as_str(artifacts.get("evidence_dir"), "artifacts.evidence_dir"))
+    evidence_directory.mkdir(parents=True, exist_ok=True)
+    results = _as_list(report.get("results"), "results")
+    for index, result_value in enumerate(results, start=1):
+        result = _as_mapping(result_value, "results[]")
+        case_id = _as_str(result.get("id"), "results[].id")
+        slug = "".join(character if character.isalnum() or character in ".-_" else "_" for character in case_id)
+        evidence = {
+            "profile": _as_str(report.get("profile"), "profile"),
+            "schema_version": _as_str(report.get("schema_version"), "schema_version"),
+            "adapter": _as_str(report.get("adapter"), "adapter"),
+            "case": dict(result),
+        }
+        evidence_path = evidence_directory / f"{index:03d}-{slug}.json"
+        evidence_path.write_text(f"{json.dumps(evidence, indent=2, sort_keys=True)}\n", encoding="utf-8")
 
 
 def _as_mapping(value: object, field: str) -> Mapping[str, Any]:

@@ -92,7 +92,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: NagareWorks/nnrp-conformance
-          ref: a2c124bc98dd6844bb5699816f00ae089e7d328d
+          ref: 6a95f241ae4e5b616cd4e9f55c5033f49a1ab6b1
           path: nnrp-conformance
 
       - name: Setup Python
@@ -127,10 +127,57 @@ jobs:
           path: artifacts/wire-e2e
           if-no-files-found: error
 
+  api-profile-conformance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout adapter
+        uses: actions/checkout@v5
+
+      - name: Checkout pinned conformance suite
+        uses: actions/checkout@v5
+        with:
+          repository: NagareWorks/nnrp-conformance
+          ref: 6a95f241ae4e5b616cd4e9f55c5033f49a1ab6b1
+          path: nnrp-conformance
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nnrp-conformance
+
+      - name: Install adapter
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Run suite-generated API profile plans
+        run: |
+          python scripts/run_api_profile_conformance.py \
+            --conformance-root nnrp-conformance \
+            --artifact-directory artifacts/api-profile-conformance
+
+      - name: Upload API profile evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: openai-api-profile-conformance
+          path: artifacts/api-profile-conformance
+          if-no-files-found: error
+
   required-checks:
     needs:
       - commit-policy
       - test
+      - api-profile-conformance
       - wire-e2e
     if: always()
     runs-on: ubuntu-latest
@@ -146,6 +193,11 @@ jobs:
 
           if [ "${{ needs.test.result }}" != "success" ]; then
             echo "Lint, type check, test, coverage, or package build validation failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.api-profile-conformance.result }}" != "success" ]; then
+            echo "Suite-generated OpenAI API profile conformance failed."
             exit 1
           fi
 

@@ -45,13 +45,18 @@ async def test_conformance_runner_executes_plan_with_mock_backend() -> None:
 
 
 def test_cli_writes_conformance_result_file(tmp_path: Path) -> None:
+    plan = json.loads(FIXTURE_PLAN.read_text(encoding="utf-8"))
+    evidence_directory = tmp_path / "evidence"
+    plan["artifacts"]["evidence_dir"] = str(evidence_directory)
+    plan_path = tmp_path / "api-profile-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
     output = tmp_path / "api-profile-results.json"
 
     exit_code = main(
         [
             "run-conformance-plan",
             "--plan",
-            str(FIXTURE_PLAN),
+            str(plan_path),
             "--output",
             str(output),
             "--backend",
@@ -63,6 +68,10 @@ def test_cli_writes_conformance_result_file(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert len(report["results"]) == 8
     assert report["results"][1]["events"][0]["type"] == "response.completed"
+    evidence_files = sorted(evidence_directory.glob("*.json"))
+    assert len(evidence_files) == 8
+    evidence = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+    assert evidence["case"]["id"] == report["results"][0]["id"]
 
 
 def test_load_backend_accepts_mock_and_module_factory() -> None:
@@ -127,9 +136,7 @@ async def test_level1_baseline_reports_but_never_requires_original_openai_chunks
     assert text_event["openai_chunk"]["object"] == "chat.completion.chunk"
     assert result["outcome"] == "passed"
 
-    plan["cases"][0]["expect"]["events"][0]["fields"] = {
-        "openai_chunk": {"object": "chat.completion.chunk"}
-    }
+    plan["cases"][0]["expect"]["events"][0]["fields"] = {"openai_chunk": {"object": "chat.completion.chunk"}}
     rejected = await run_conformance_plan(plan, backend=MockChatCompletionBackend())
 
     assert rejected["results"][0]["outcome"] == "failed"

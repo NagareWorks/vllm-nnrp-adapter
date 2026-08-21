@@ -119,14 +119,34 @@ routes and policy to the native server role.
 
 ## Conformance Smoke
 
-`nnrp-conformance` owns OpenAI NNRP API profile plan and result schemas. This adapter consumes the generated plan and writes the result report:
+`nnrp-conformance` owns the OpenAI NNRP API profile recipes, plan, and result schemas. Generate the
+Preview4 plan from the suite, run it through the adapter, and return the results to the independent
+validator:
 
 ```powershell
+cargo run --manifest-path ../nnrp-conformance/Cargo.toml -p nnrp-conformance-runner -- `
+  api-profile-plan `
+  --protocol ../nnrp-conformance/protocol/nnrp-1-preview4/manifest.json `
+  --profile ../nnrp-conformance/profiles/openai-compatible/1/manifest.json `
+  --capabilities conformance/openai-api-capabilities.json `
+  --output artifacts/api-profile-plan.json `
+  --results-path artifacts/api-profile-results.json `
+  --evidence-dir artifacts/api-profile-evidence
+
 vllm-nnrp-adapter run-conformance-plan `
-  --plan tests/fixtures/api-profile-execution-plan.json `
+  --plan artifacts/api-profile-plan.json `
   --output artifacts/api-profile-results.json `
   --backend mock
+
+cargo run --manifest-path ../nnrp-conformance/Cargo.toml -p nnrp-conformance-runner -- `
+  validate-api-profile-results `
+  --plan artifacts/api-profile-plan.json `
+  --results artifacts/api-profile-results.json
 ```
+
+CI also reruns the same Level 1 plan with non-critical extensions removed. The selected case set and
+all terminal outcomes must remain identical, so the diagnostics extension cannot become a hidden
+baseline dependency. Each execution writes one evidence document per selected recipe.
 
 Use `--backend module.path:factory_name` when running against a real vLLM serving object. The factory must return an object that exposes the adapter backend protocol.
 
