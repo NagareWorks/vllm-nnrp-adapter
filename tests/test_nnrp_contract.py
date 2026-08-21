@@ -172,6 +172,36 @@ def test_contract_rejects_private_transport_binding_keyword(monkeypatch: pytest.
         validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
 
 
+def test_contract_rejects_transport_binding_without_role_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    import nnrp
+
+    class OldNativeTransportBinding:
+        async def listen(self) -> None:
+            pass
+
+    old_nnrp = SimpleNamespace(
+        **{
+            name: getattr(nnrp, name)
+            for name in (
+                "NativeRuntimeServerOperation",
+                "NativeRuntimeServerSession",
+                "NativeTransportEndpoint",
+                "NnrpEndpoint",
+                "TransportPolicy",
+            )
+        },
+        NativeTransportBinding=OldNativeTransportBinding,
+    )
+    real_import = __import__
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_contract.import_module",
+        lambda module_name: old_nnrp if module_name == "nnrp" else real_import(module_name, fromlist=["*"]),
+    )
+
+    with pytest.raises(NnrpRuntimeContractError, match="NativeTransportBinding.adopt_server"):
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+
+
 def test_contract_rejects_versions_outside_preview4_range() -> None:
     for incompatible_version in ("1.0.0rc3.post5", "1.0.0rc4.post17", "1.0.0rc5"):
         with pytest.raises(NnrpRuntimeContractError, match=incompatible_version):

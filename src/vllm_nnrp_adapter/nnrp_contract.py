@@ -38,6 +38,10 @@ _REQUIRED_NNRP_SYMBOLS = {
 }
 
 _REQUIRED_NNRP_METHODS = {
+    "nnrp.NativeTransportBinding": {
+        "listen": True,
+        "adopt_server": False,
+    },
     "nnrp.NativeRuntimeServerSession": {
         "poll_events": False,
     },

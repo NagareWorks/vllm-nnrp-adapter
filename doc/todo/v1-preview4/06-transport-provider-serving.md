@@ -14,7 +14,7 @@
 
 ## Provider Boundaries
 
-- [ ] Require each available binding to own its carrier implementation, listener, role adoption, and
+- [x] Require each available binding to own its carrier implementation, listener, role adoption, and
   transport-scoped native artifact.
 - [x] Keep adapter, client, server, and profile packages free of hidden provider artifacts.
 - [x] Treat unavailable bindings as diagnostics and never bind them.
