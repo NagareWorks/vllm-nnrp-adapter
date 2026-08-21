@@ -84,7 +84,7 @@ class PydanticLikeErrorResponse:
 
 class FakeRequestOutput:
     def __init__(self, *, outputs: list[object], finished: bool = False) -> None:
-        self.request_id = "chatcmpl-nnrp-test"
+        self.request_id = "chatcmpl-test"
         self.prompt_token_ids = [1, 2, 3]
         self.encoder_prompt_token_ids = None
         self.outputs = outputs
@@ -1030,7 +1030,7 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request(monkeypatch: pyt
     ]
 
     assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
-    assert serving_chat.engine_client.aborted == ["chatcmpl-nnrp-test"]
+    assert serving_chat.engine_client.aborted == ["chatcmpl-test"]
     assert abort_observations == [True]
 
 
@@ -1069,6 +1069,157 @@ async def test_engine_direct_binding_matches_each_vllm_family(
         "reasoning_parser_kwargs" in serving_chat.engine_client.last_generate_kwargs
     ) is expected_parser_kwargs
     await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name"),
+    (
+        (0, "vllm.entrypoints.utils"),
+        (1, "vllm.entrypoints.utils"),
+        (2, "vllm.entrypoints.serve.utils.api_utils"),
+    ),
+)
+async def test_engine_direct_preserves_request_inputs_and_outputs_in_each_vllm_family(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+    lora_request = object()
+    engine_input = {
+        "prompt_token_ids": [1, 2, 3],
+        "multi_modal_data": {"image": [b"image-bytes"]},
+        "multi_modal_placeholders": {"image": [{"offset": 1, "length": 2}]},
+    }
+
+    class PreservingRequest(FakeSamplingRequest):
+        def __init__(self, body: Mapping[str, Any]) -> None:
+            super().__init__(body)
+            self.request_id = body["request_id"]
+            self.model = body["model"]
+            self.priority = body["priority"]
+            self.max_completion_tokens = body["max_completion_tokens"]
+            self.temperature = body["temperature"]
+            self.top_p = body["top_p"]
+
+        def to_sampling_params(
+            self,
+            max_tokens: int,
+            default_sampling_params: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            return {
+                "max_tokens": max_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "default_temperature": default_sampling_params["temperature"],
+            }
+
+    class PreservingRequestFactory:
+        engine_direct_binding = binding
+
+        def __call__(self, body: Mapping[str, Any]) -> PreservingRequest:
+            return PreservingRequest(body)
+
+    class PreservingModels:
+        def model_name(self, selected_lora: object) -> str:
+            assert selected_lora is lora_request
+            return "vision-lora"
+
+    class RecordingEngineClient:
+        def __init__(self) -> None:
+            self.call: tuple[object, object, str, dict[str, object]] | None = None
+
+        def generate(
+            self,
+            prompt: object,
+            sampling_params: object,
+            request_id: str,
+            **kwargs: object,
+        ) -> AsyncIterator[FakeRequestOutput]:
+            self.call = (prompt, sampling_params, request_id, dict(kwargs))
+
+            async def outputs() -> AsyncIterator[FakeRequestOutput]:
+                yield FakeRequestOutput(
+                    outputs=[FakeCompletionOutput(text="done", token_ids=[42], finish_reason="length")],
+                    finished=True,
+                )
+
+            return outputs()
+
+        async def abort(self, request_id: str) -> None:
+            raise AssertionError(f"completed request must not be aborted: {request_id}")
+
+    class PreservingServingChat(FakeDirectServingChat):
+        models = PreservingModels()
+
+        def __init__(self) -> None:
+            self.engine_client = RecordingEngineClient()
+            self.fallback_calls = 0
+            self.adapter_calls: list[tuple[object, bool]] = []
+
+        async def render_chat_request(
+            self,
+            request: PreservingRequest,
+        ) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+            assert request.model == "vision-lora"
+            return ([{"role": "user", "content": "describe"}], [engine_input])
+
+        def _maybe_get_adapters(
+            self,
+            request: PreservingRequest,
+            supports_default_mm_loras: bool = False,
+        ) -> object:
+            self.adapter_calls.append((request, supports_default_mm_loras))
+            return lora_request
+
+    serving_chat = PreservingServingChat()
+    backend = VllmBackend(serving_chat, request_factory=PreservingRequestFactory())
+    stream = await backend.create_chat_completion(
+        {
+            "request_id": "request-42",
+            "model": "vision-lora",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+                    ],
+                }
+            ],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "priority": 7,
+            "max_completion_tokens": 5,
+            "temperature": 0.35,
+            "top_p": 0.8,
+        }
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert serving_chat.adapter_calls[0][1] is True
+    assert serving_chat.engine_client.call is not None
+    prompt, sampling_params, request_id, generate_kwargs = serving_chat.engine_client.call
+    assert prompt is engine_input
+    assert sampling_params == {
+        "max_tokens": 5,
+        "temperature": 0.35,
+        "top_p": 0.8,
+        "default_temperature": 0.2,
+    }
+    assert request_id == "chatcmpl-request-42"
+    assert generate_kwargs["lora_request"] is lora_request
+    assert generate_kwargs["priority"] == 7
+    assert chunks[0]["id"] == "chatcmpl-request-42"
+    assert chunks[0]["model"] == "vision-lora"
+    assert chunks[0]["choices"][0]["finish_reason"] == "length"
+    assert chunks[1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
 
 
 @pytest.mark.asyncio

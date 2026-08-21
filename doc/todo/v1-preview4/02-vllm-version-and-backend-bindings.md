@@ -24,7 +24,7 @@
   request preprocessing and engine client APIs.
 - [x] Keep HTTP/SSE parsing behind an explicit smoke-only backend and exclude it from production
   auto-selection.
-- [ ] Preserve request id, model id, LoRA selection, sampling parameters, multimodal inputs, usage,
+- [x] Preserve request id, model id, LoRA selection, sampling parameters, multimodal inputs, usage,
   finish reasons, and tool-call deltas across each binding.
 - [x] Normalize backend error objects without depending on rendered HTTP responses.
 - [x] Provide one idempotent backend abort operation and record whether vLLM accepted it.

@@ -755,7 +755,7 @@ def _reasoning_ended(request: object, binding: VllmEngineDirectBinding) -> bool 
 def _direct_request_id(request: object) -> str:
     configured = _getattr_default(request, "request_id", None)
     suffix = configured if isinstance(configured, str) and configured else uuid.uuid4().hex
-    return f"chatcmpl-nnrp-{suffix}"
+    return f"chatcmpl-{suffix}"
 
 
 def _model_name(serving_chat: object, lora_request: object, body: Mapping[str, Any]) -> str:
