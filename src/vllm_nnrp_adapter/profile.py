@@ -43,6 +43,7 @@ class OpenAiNnrpCapabilityDocument:
     compatibility_levels: tuple[int, ...]
     operations: tuple[dict[str, Any], ...]
     models: tuple[dict[str, Any], ...] = ()
+    extensions: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def level1(cls, models: tuple[str, ...] = ()) -> OpenAiNnrpCapabilityDocument:
@@ -58,6 +59,15 @@ class OpenAiNnrpCapabilityDocument:
                 },
             ),
             models=tuple({"id": model, "owned_by": "adapter"} for model in models),
+            extensions=(
+                {
+                    "name": "diagnostics",
+                    "critical": False,
+                    "description": (
+                        "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail."
+                    ),
+                },
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,6 +77,7 @@ class OpenAiNnrpCapabilityDocument:
             "compatibility_levels": list(self.compatibility_levels),
             "operations": list(self.operations),
             "models": list(self.models),
+            "extensions": list(self.extensions),
         }
 
     def supports_operation(self, operation: str) -> bool:

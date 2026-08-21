@@ -22,6 +22,13 @@ def test_level1_capability_document_shape() -> None:
     assert document["operations"][0]["name"] == CHAT_COMPLETIONS_CREATE
     assert document["operations"][0]["cancellation"] is True
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
+    assert document["extensions"] == [
+        {
+            "name": "diagnostics",
+            "critical": False,
+            "description": "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail.",
+        }
+    ]
 
 
 def test_release_capability_manifest_advertises_tested_tool_call_lifecycle() -> None:
@@ -36,8 +43,35 @@ def test_release_capability_manifest_advertises_tested_tool_call_lifecycle() -> 
     )
     adapter = OpenAiNnrpAdapter(ProductionCapabilityBackend())
 
+    runtime_capabilities = adapter.capabilities.to_dict()
+
     assert manifest["operations"][0]["tool_calls"] is True
-    assert manifest["operations"] == list(adapter.capabilities.operations)
+    assert manifest["profile"] == runtime_capabilities["profile"]
+    assert manifest["schema_version"] == runtime_capabilities["schema_version"]
+    assert manifest["compatibility_levels"] == runtime_capabilities["compatibility_levels"]
+    assert manifest["operations"] == runtime_capabilities["operations"]
+    assert manifest["extensions"] == runtime_capabilities["extensions"]
+
+
+def test_runtime_capabilities_only_downgrade_backend_dependent_tool_calls() -> None:
+    class TextOnlyBackend:
+        supports_tool_calls = False
+
+        def create_chat_completion(self, body):
+            return {"model": body["model"], "choices": []}
+
+    capabilities = OpenAiNnrpAdapter(TextOnlyBackend()).capabilities.to_dict()
+
+    assert capabilities["operations"] == [
+        {
+            "name": CHAT_COMPLETIONS_CREATE,
+            "streaming": True,
+            "non_streaming": True,
+            "tool_calls": False,
+            "cancellation": True,
+        }
+    ]
+    assert capabilities["extensions"] == OpenAiNnrpCapabilityDocument.level1().to_dict()["extensions"]
 
 
 def test_validate_chat_request_preserves_body_and_policy() -> None:

@@ -354,6 +354,7 @@ def _default_capabilities(backend: ChatCompletionBackend) -> OpenAiNnrpCapabilit
         compatibility_levels=document.compatibility_levels,
         operations=operations,
         models=document.models,
+        extensions=document.extensions,
     )
 
 

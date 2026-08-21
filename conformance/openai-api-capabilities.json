@@ -19,7 +19,7 @@
     {
       "name": "diagnostics",
       "critical": false,
-      "description": "Adapter may include NNRP diagnostics in case result diagnostics without changing baseline pass/fail."
+      "description": "Adapter may include NNRP diagnostics without changing Level 1 baseline pass/fail."
     }
   ]
 }

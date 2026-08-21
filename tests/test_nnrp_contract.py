@@ -48,7 +48,8 @@ EXPECTED_ENTRYPOINT_SIGNATURES = {
     "OpenAiNnrpAdapter": "(backend: 'ChatCompletionBackend', *, "
     "capabilities: 'OpenAiNnrpCapabilityDocument | None' = None) -> 'None'",
     "OpenAiNnrpCapabilityDocument": "(compatibility_levels: 'tuple[int, ...]', "
-    "operations: 'tuple[dict[str, Any], ...]', models: 'tuple[dict[str, Any], ...]' = ()) -> None",
+    "operations: 'tuple[dict[str, Any], ...]', models: 'tuple[dict[str, Any], ...]' = (), "
+    "extensions: 'tuple[dict[str, Any], ...]' = ()) -> None",
     "OpenAiNnrpError": "(error_type: 'str', code: 'str', message: 'str') -> 'None'",
     "NnrpServeStatistics": "(accepted_sessions: 'int', accepted_operations: 'int', partial_results: 'int', "
     "terminal_results: 'int') -> None",
