@@ -30,9 +30,9 @@
 
 ## Errors And Capabilities
 
-- [ ] Map invalid request, unsupported operation, model error, scheduler rejection, overload,
+- [x] Map invalid request, unsupported operation, model error, scheduler rejection, overload,
   timeout, cancellation, and backend failure to frozen profile error bodies and NNRP terminal state.
-- [ ] Keep application errors distinct from transport, protocol, and adapter-internal failures.
+- [x] Keep application errors distinct from transport, protocol, and adapter-internal failures.
 - [x] Generate the Level 1 capability document from real backend and adapter behavior.
 - [ ] Advertise streaming, non-streaming, cancellation, usage, tool calls, diagnostics, limits, and
   extensions only when tested.

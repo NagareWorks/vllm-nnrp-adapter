@@ -909,6 +909,22 @@ def test_backend_error_classifier_maps_scheduler_rejections_and_cancellation() -
 
 
 @pytest.mark.parametrize(
+    ("error", "expected"),
+    (
+        (RuntimeError("model does not exist"), ("server_error", "backend_error")),
+        (RuntimeError("scheduler full: reject request"), ("server_error", "scheduler_rejected")),
+        (RuntimeError("backend overload"), ("server_error", "backend_overload")),
+        (RuntimeError("request cancelled by backend"), ("server_error", "backend_cancelled")),
+    ),
+)
+def test_backend_error_classifier_keeps_stable_application_error_families(
+    error: Exception,
+    expected: tuple[str, str],
+) -> None:
+    assert classify_backend_error(error) == expected
+
+
+@pytest.mark.parametrize(
     ("status", "backend_type", "expected"),
     [
         (400, "BadRequestError", ("invalid_request_error", "invalid_backend_request")),

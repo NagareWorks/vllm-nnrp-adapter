@@ -75,6 +75,11 @@ class StreamingBackend:
         return events()
 
 
+class FailingBackend:
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        raise RuntimeError(f"backend failed for {body['model']}")
+
+
 class InterleavingBackend:
     def __init__(self, expected_operations: int) -> None:
         self._expected_operations = expected_operations
@@ -367,6 +372,14 @@ class FakeServerContext:
         self.exited = True
 
 
+class FailingServerContext:
+    def __enter__(self) -> None:
+        raise OSError("listener failed before admission")
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        raise AssertionError("an unopened listener context must not be exited")
+
+
 def _unavailable_binding(transport_id: TransportId) -> NativeTransportBinding:
     transport_name = transport_id.name.lower()
     provider = NativeTransportProvider(
@@ -545,6 +558,27 @@ async def test_unavailable_explicit_binding_never_starts_a_provider_listener() -
 
 
 @pytest.mark.asyncio
+async def test_listener_failure_remains_a_server_failure_without_profile_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        lambda *_args, **_kwargs: FailingServerContext(),
+    )
+
+    with pytest.raises(OSError, match="listener failed before admission"):
+        await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(endpoint="nnrp://runtime.local/vllm"),
+        )
+
+    assert _startup_observation_records(caplog) == []
+    assert _observation_records(caplog) == []
+
+
+@pytest.mark.asyncio
 async def test_production_entrypoint_rejects_preview3_packet_session() -> None:
     class Preview3PacketSession:
         pass
@@ -619,6 +653,52 @@ async def test_invalid_submit_body_produces_one_terminal_error(
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "failed"
     assert observation["error_family"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_backend_failure_produces_one_typed_application_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=73,
+        frame_id=21,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=73),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    session = FakeSession(operation, stop_event)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(FakeServer(session))),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(FailingBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 1
+    assert len(operation.terminal_results) == 1
+    metadata, body = operation.terminal_results[0]
+    assert metadata.status_code == 500
+    event = _decode_terminal_profile_body(metadata, body)
+    assert event["type"] == "response.error"
+    assert event["error"]["code"] == "backend_error"
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "failed"
+    assert observation["error_family"] == "RuntimeError"
 
 
 @pytest.mark.asyncio
