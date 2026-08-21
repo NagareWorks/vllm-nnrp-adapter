@@ -8,6 +8,7 @@ import pytest
 
 from vllm_nnrp_adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.adapter import (
+    OpenAiStreamEventMapper,
     _AsyncIteratorCloseGuard,
     _close_async_iterator,
     classify_backend_error,
@@ -538,7 +539,7 @@ async def test_adapter_maps_timeout_policy() -> None:
     assert events[0]["error"]["code"] == "request_timeout"
 
 
-def test_stream_chunk_mapper_preserves_tool_call_delta() -> None:
+def test_stream_chunk_mapper_emits_frozen_tool_call_identity_and_delta() -> None:
     events = map_openai_stream_chunk(
         {
             "choices": [
@@ -546,7 +547,12 @@ def test_stream_chunk_mapper_preserves_tool_call_delta() -> None:
                     "index": 0,
                     "delta": {
                         "tool_calls": [
-                            {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"},
+                            }
                         ]
                     },
                 }
@@ -554,8 +560,111 @@ def test_stream_chunk_mapper_preserves_tool_call_delta() -> None:
         }
     )
 
-    assert events[0]["type"] == "response.tool_call.delta"
-    assert events[0]["tool_call"]["id"] == "call-1"
+    assert [event["type"] for event in events] == [
+        "response.tool_call.started",
+        "response.tool_call.delta",
+    ]
+    assert events[0]["index"] == 0
+    assert events[0]["item_id"] == "tool-call-0-0"
+    assert events[0]["call_id"] == "call-1"
+    assert events[0]["name"] == "lookup"
+    assert events[0]["openai_chunk"]["choices"][0]["index"] == 0
+    assert events[1]["item_id"] == "tool-call-0-0"
+    assert events[1]["call_id"] == "call-1"
+    assert events[1]["arguments_delta"] == "{}"
+
+
+def test_stream_chunk_mapper_completes_interleaved_tool_calls_in_order() -> None:
+    mapper = OpenAiStreamEventMapper()
+
+    first = mapper.map_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "call-b",
+                                "function": {"name": "second", "arguments": '{"b":'},
+                            },
+                            {
+                                "index": 0,
+                                "id": "call-a",
+                                "function": {"name": "first", "arguments": '{"a":'},
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+    second = mapper.map_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": "1}"}},
+                            {"index": 1, "function": {"arguments": "2}"}},
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+    )
+
+    assert [event["type"] for event in first] == [
+        "response.tool_call.started",
+        "response.tool_call.delta",
+        "response.tool_call.started",
+        "response.tool_call.delta",
+    ]
+    completed = [event for event in second if event["type"] == "response.tool_call.completed"]
+    assert [(event["call_id"], event["arguments"]) for event in completed] == [
+        ("call-a", '{"a":1}'),
+        ("call-b", '{"b":2}'),
+    ]
+    assert mapper.finish() == []
+
+
+def test_stream_chunk_mapper_reports_malformed_and_interrupted_tool_calls() -> None:
+    malformed = OpenAiStreamEventMapper()
+    assert (
+        malformed.map_chunk(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"tool_calls": [{"index": 0, "id": "call-bad", "function": {"arguments": "{"}}]},
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        )[0]["error"]["code"]
+        == "invalid_tool_call_stream"
+    )
+
+    interrupted = OpenAiStreamEventMapper()
+    interrupted.map_chunk(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "lookup", "arguments": "{"}}]
+                    },
+                }
+            ]
+        }
+    )
+    error = interrupted.fail(RuntimeError("backend disconnected"))[0]
+    assert error["type"] == "response.tool_call.error"
+    assert error["call_id"] == "call-1"
+    assert error["error"]["code"] == "tool_call_stream_interrupted"
 
 
 def test_stream_chunk_mapper_ignores_unknown_choice_shape() -> None:

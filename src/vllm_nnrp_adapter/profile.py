@@ -130,13 +130,89 @@ def build_text_delta_event(
     return event
 
 
-def build_tool_call_delta_event(
-    tool_call: Mapping[str, Any],
+def build_tool_call_started_event(
     *,
-    index: int = 0,
+    index: int,
+    item_id: str,
+    call_id: str,
+    name: str,
     openai_chunk: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    event: dict[str, Any] = {"type": "response.tool_call.delta", "index": index, "tool_call": dict(tool_call)}
+    event: dict[str, Any] = {
+        "type": "response.tool_call.started",
+        "index": index,
+        "item_id": item_id,
+        "call_id": call_id,
+        "name": name,
+    }
+    if openai_chunk is not None:
+        event["openai_chunk"] = dict(openai_chunk)
+    return event
+
+
+def build_tool_call_delta_event(
+    arguments_delta: str,
+    *,
+    index: int,
+    item_id: str,
+    call_id: str,
+    openai_chunk: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "response.tool_call.delta",
+        "index": index,
+        "item_id": item_id,
+        "call_id": call_id,
+        "arguments_delta": arguments_delta,
+    }
+    if openai_chunk is not None:
+        event["openai_chunk"] = dict(openai_chunk)
+    return event
+
+
+def build_tool_call_completed_event(
+    *,
+    index: int,
+    item_id: str,
+    call_id: str,
+    name: str,
+    arguments: str,
+    openai_chunk: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "response.tool_call.completed",
+        "index": index,
+        "item_id": item_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+    if openai_chunk is not None:
+        event["openai_chunk"] = dict(openai_chunk)
+    return event
+
+
+def build_tool_call_error_event(
+    *,
+    index: int,
+    item_id: str,
+    call_id: str,
+    error_type: str,
+    code: str,
+    message: str,
+    openai_chunk: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "response.tool_call.error",
+        "index": index,
+        "item_id": item_id,
+        "call_id": call_id,
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+        },
+    }
     if openai_chunk is not None:
         event["openai_chunk"] = dict(openai_chunk)
     return event

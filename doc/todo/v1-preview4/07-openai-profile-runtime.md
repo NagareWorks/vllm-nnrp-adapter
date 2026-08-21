@@ -16,7 +16,7 @@
 
 - [ ] Emit ordered `response.output_text.delta` events for streaming text as `PARTIAL_RESULT`
   payloads, preserving one monotonic result sequence per operation.
-- [ ] Emit `response.tool_call.started`, `.delta`, `.completed`, and `.error` with stable tool-call
+- [x] Emit `response.tool_call.started`, `.delta`, `.completed`, and `.error` with stable tool-call
   identity when advertised; non-terminal tool events also use `PARTIAL_RESULT`.
 - [ ] Emit `response.usage` without inventing absent token counts and preserve its order relative to
   text and tool events.

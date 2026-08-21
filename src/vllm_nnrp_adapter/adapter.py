@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Protocol, cast
 
 from .profile import (
@@ -14,7 +16,10 @@ from .profile import (
     build_diagnostics_event,
     build_error_event,
     build_text_delta_event,
+    build_tool_call_completed_event,
     build_tool_call_delta_event,
+    build_tool_call_error_event,
+    build_tool_call_started_event,
     build_usage_event,
     validate_request,
 )
@@ -127,47 +132,219 @@ class OpenAiNnrpAdapter:
         *,
         timeout_s: float | None,
     ) -> AsyncIterator[dict[str, Any]]:
-        async for chunk in _iterate_with_timeout(chunks, timeout_s):
-            yielded = False
-            for event in map_openai_stream_chunk(chunk):
-                yielded = True
+        mapper = OpenAiStreamEventMapper()
+        try:
+            async for chunk in _iterate_with_timeout(chunks, timeout_s):
+                for event in mapper.map_chunk(chunk):
+                    yield event
+        except (Exception, asyncio.CancelledError) as error:
+            for event in mapper.fail(error):
                 yield event
-
-            if not yielded and chunk.get("usage") is not None:
-                yield build_usage_event(_as_mapping(chunk["usage"]))
+            raise
+        for event in mapper.finish():
+            yield event
 
 
 def map_openai_stream_chunk(chunk: Mapping[str, Any]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
+    return OpenAiStreamEventMapper().map_chunk(chunk)
 
-    usage = chunk.get("usage")
-    if isinstance(usage, Mapping):
-        events.append(build_usage_event(usage))
 
-    choices = chunk.get("choices")
-    if not isinstance(choices, list):
+@dataclass
+class _ToolCallState:
+    choice_index: int
+    tool_index: int
+    item_id: str
+    call_id: str
+    name: str = ""
+    argument_parts: list[str] = dataclass_field(default_factory=list)
+    emitted_argument_parts: int = 0
+    started: bool = False
+    closed: bool = False
+
+
+class OpenAiStreamEventMapper:
+    def __init__(self) -> None:
+        self._tool_calls: dict[tuple[int, int], _ToolCallState] = {}
+
+    def map_chunk(self, chunk: Mapping[str, Any]) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+
+        usage = chunk.get("usage")
+        if isinstance(usage, Mapping):
+            events.append(build_usage_event(usage))
+
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return events
+
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+
+            choice_index = _non_negative_index(choice.get("index"), default=0)
+            delta = choice.get("delta")
+            if isinstance(delta, Mapping):
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    events.append(build_text_delta_event(content, index=choice_index, openai_chunk=chunk))
+
+                tool_calls = delta.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for position, tool_call in enumerate(tool_calls):
+                        if isinstance(tool_call, Mapping):
+                            events.extend(
+                                self._map_tool_call_delta(
+                                    choice_index,
+                                    position,
+                                    tool_call,
+                                    chunk,
+                                )
+                            )
+
+            if choice.get("finish_reason") is not None:
+                events.extend(self._complete_choice(choice_index, chunk))
+
         return events
 
-    for choice in choices:
-        if not isinstance(choice, Mapping):
-            continue
+    def finish(self) -> list[dict[str, Any]]:
+        return self._complete_states(self._open_states(), openai_chunk=None)
 
-        index = int(choice.get("index", 0))
-        delta = choice.get("delta")
-        if not isinstance(delta, Mapping):
-            continue
+    def fail(self, error: BaseException) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for state in self._open_states():
+            state.closed = True
+            events.append(
+                build_tool_call_error_event(
+                    index=state.tool_index,
+                    item_id=state.item_id,
+                    call_id=state.call_id,
+                    error_type="server_error",
+                    code="tool_call_stream_interrupted",
+                    message=str(error) or type(error).__name__,
+                )
+            )
+        return events
 
-        content = delta.get("content")
-        if isinstance(content, str) and content:
-            events.append(build_text_delta_event(content, index=index, openai_chunk=chunk))
+    def _map_tool_call_delta(
+        self,
+        choice_index: int,
+        position: int,
+        tool_call: Mapping[str, Any],
+        chunk: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        tool_index = _non_negative_index(tool_call.get("index"), default=position)
+        key = (choice_index, tool_index)
+        state = self._tool_calls.get(key)
+        call_id = tool_call.get("id")
+        if state is None:
+            stable_call_id = call_id if isinstance(call_id, str) and call_id else f"call-{choice_index}-{tool_index}"
+            state = _ToolCallState(
+                choice_index=choice_index,
+                tool_index=tool_index,
+                item_id=f"tool-call-{choice_index}-{tool_index}",
+                call_id=stable_call_id,
+            )
+            self._tool_calls[key] = state
+        elif not state.started and isinstance(call_id, str) and call_id:
+            state.call_id = call_id
 
-        tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tool_call in tool_calls:
-                if isinstance(tool_call, Mapping):
-                    events.append(build_tool_call_delta_event(tool_call, index=index, openai_chunk=chunk))
+        function = tool_call.get("function")
+        if isinstance(function, Mapping):
+            name = function.get("name")
+            if not state.name and isinstance(name, str) and name:
+                state.name = name
+            arguments = function.get("arguments")
+            if isinstance(arguments, str) and arguments:
+                state.argument_parts.append(arguments)
 
-    return events
+        return self._emit_ready_state(state, chunk)
+
+    def _emit_ready_state(
+        self,
+        state: _ToolCallState,
+        chunk: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        if state.closed or not state.name:
+            return []
+
+        events: list[dict[str, Any]] = []
+        if not state.started:
+            state.started = True
+            events.append(
+                build_tool_call_started_event(
+                    index=state.tool_index,
+                    item_id=state.item_id,
+                    call_id=state.call_id,
+                    name=state.name,
+                    openai_chunk=chunk,
+                )
+            )
+
+        for arguments_delta in state.argument_parts[state.emitted_argument_parts :]:
+            events.append(
+                build_tool_call_delta_event(
+                    arguments_delta,
+                    index=state.tool_index,
+                    item_id=state.item_id,
+                    call_id=state.call_id,
+                    openai_chunk=chunk,
+                )
+            )
+        state.emitted_argument_parts = len(state.argument_parts)
+        return events
+
+    def _complete_choice(
+        self,
+        choice_index: int,
+        openai_chunk: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        states = [state for state in self._open_states() if state.choice_index == choice_index]
+        return self._complete_states(states, openai_chunk=openai_chunk)
+
+    def _complete_states(
+        self,
+        states: list[_ToolCallState],
+        *,
+        openai_chunk: Mapping[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for state in sorted(states, key=lambda item: (item.choice_index, item.tool_index)):
+            if state.closed:
+                continue
+            state.closed = True
+            if not state.started:
+                events.append(
+                    build_tool_call_error_event(
+                        index=state.tool_index,
+                        item_id=state.item_id,
+                        call_id=state.call_id,
+                        error_type="server_error",
+                        code="invalid_tool_call_stream",
+                        message="tool call stream ended before a function name was provided",
+                        openai_chunk=openai_chunk,
+                    )
+                )
+                continue
+            events.append(
+                build_tool_call_completed_event(
+                    index=state.tool_index,
+                    item_id=state.item_id,
+                    call_id=state.call_id,
+                    name=state.name,
+                    arguments="".join(state.argument_parts),
+                    openai_chunk=openai_chunk,
+                )
+            )
+        return events
+
+    def _open_states(self) -> list[_ToolCallState]:
+        return [state for state in self._tool_calls.values() if not state.closed]
+
+
+def _non_negative_index(value: object, *, default: int) -> int:
+    if type(value) is int and value >= 0:
+        return value
+    return default
 
 
 def _default_capabilities(backend: ChatCompletionBackend) -> OpenAiNnrpCapabilityDocument:
