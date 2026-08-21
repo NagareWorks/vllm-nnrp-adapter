@@ -25,7 +25,7 @@
 - [x] Preserve the final streaming or non-streaming OpenAI-compatible response body, when available,
   in the single terminal `RESULT_PUSH` sent by `NativeRuntimeServerOperation.send_result`; never
   invent a final body when vLLM provides only ordered deltas and terminal metadata.
-- [ ] Keep optional original OpenAI chunks ignorable and exclude them from baseline client
+- [x] Keep optional original OpenAI chunks ignorable and exclude them from baseline client
   requirements.
 
 ## Errors And Capabilities

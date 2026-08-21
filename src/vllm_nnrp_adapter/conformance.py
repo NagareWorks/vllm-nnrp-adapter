@@ -13,6 +13,7 @@ from .profile import OPENAI_COMPATIBLE_SCHEMA_VERSION
 
 Terminal = Literal["success", "error", "cancelled"]
 Outcome = Literal["passed", "failed", "skipped"]
+_BASELINE_IGNORED_EVENT_FIELDS = frozenset({"openai_chunk"})
 
 
 class BackendFactory(Protocol):
@@ -197,10 +198,11 @@ def _terminal_from_events(events: list[dict[str, Any]]) -> Terminal:
 
 def _event_expectation_failures(events: list[dict[str, Any]], expected_events: list[Any]) -> list[str]:
     failures: list[str] = []
+    baseline_events = [_without_ignored_baseline_fields(event) for event in events]
     for expectation_value in expected_events:
         expectation = _as_mapping(expectation_value, "expect.events[]")
         event_type = _as_str(expectation.get("type"), "expect.events[].type")
-        matching_events = [event for event in events if event.get("type") == event_type]
+        matching_events = [event for event in baseline_events if event.get("type") == event_type]
         min_count = _as_non_negative_int(expectation.get("min_count"), default=0 if expectation.get("optional") else 1)
         fields = expectation.get("fields")
         if isinstance(fields, Mapping):
@@ -210,6 +212,10 @@ def _event_expectation_failures(events: list[dict[str, Any]], expected_events: l
             failures.append(f"{event_type} count mismatch: expected at least {min_count}, got {len(matching_events)}")
 
     return failures
+
+
+def _without_ignored_baseline_fields(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in event.items() if key not in _BASELINE_IGNORED_EVENT_FIELDS}
 
 
 def _mapping_contains(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:

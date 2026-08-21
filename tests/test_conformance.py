@@ -113,3 +113,24 @@ async def test_conformance_runner_fails_when_expected_field_is_absent() -> None:
 
     assert report["results"][0]["outcome"] == "failed"
     assert "response.error count mismatch" in report["results"][0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_level1_baseline_reports_but_never_requires_original_openai_chunks() -> None:
+    plan = json.loads(FIXTURE_PLAN.read_text(encoding="utf-8"))
+    plan["cases"] = [case for case in plan["cases"] if case["id"] == "openai-compatible.chat.streaming-text"]
+
+    report = await run_conformance_plan(plan, backend=MockChatCompletionBackend())
+
+    result = report["results"][0]
+    text_event = next(event for event in result["events"] if event["type"] == "response.output_text.delta")
+    assert text_event["openai_chunk"]["object"] == "chat.completion.chunk"
+    assert result["outcome"] == "passed"
+
+    plan["cases"][0]["expect"]["events"][0]["fields"] = {
+        "openai_chunk": {"object": "chat.completion.chunk"}
+    }
+    rejected = await run_conformance_plan(plan, backend=MockChatCompletionBackend())
+
+    assert rejected["results"][0]["outcome"] == "failed"
+    assert "response.output_text.delta count mismatch" in rejected["results"][0]["message"]
