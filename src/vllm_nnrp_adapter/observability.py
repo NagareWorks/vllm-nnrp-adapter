@@ -4,11 +4,12 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from nnrp import NativeRuntimeServerOperation, NativeTransportEndpoint  # type: ignore[import-untyped]
 from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
+from nnrp.runtime import TraceContextMetadata  # type: ignore[import-untyped]
 
 from .operation_progress import OperationProgressStage
 from .operation_state import OperationState
@@ -136,6 +137,11 @@ class OperationObservation:
     drop_reason: str | None
     terminal_outcome: str
     stage_transitions: tuple[OperationStageTransition, ...]
+    trace_span_id: int | None = None
+    trace_parent_span_id: int | None = None
+    trace_stage_code: int | None = None
+    trace_flags: int | None = None
+    trace_attribute_bytes: int = 0
 
     def to_log_fields(self) -> dict[str, object]:
         return {
@@ -174,6 +180,11 @@ class OperationObservation:
             "backend_abort_accepted": self.backend_abort_accepted,
             "drop_reason": self.drop_reason,
             "terminal_outcome": self.terminal_outcome,
+            "trace_span_id": self.trace_span_id,
+            "trace_parent_span_id": self.trace_parent_span_id,
+            "trace_stage_code": self.trace_stage_code,
+            "trace_flags": self.trace_flags,
+            "trace_attribute_bytes": self.trace_attribute_bytes,
             "stage_transitions": [
                 {
                     "stage_code": transition.stage_code,
@@ -213,6 +224,11 @@ class _OperationObservationTracker:
     _cancellation_reason_code: int | None = field(default=None, repr=False)
     _backend_abort_accepted: bool | None = field(default=None, repr=False)
     _drop_reason: str | None = field(default=None, repr=False)
+    _trace_span_id: int | None = field(default=None, repr=False)
+    _trace_parent_span_id: int | None = field(default=None, repr=False)
+    _trace_stage_code: int | None = field(default=None, repr=False)
+    _trace_flags: int | None = field(default=None, repr=False)
+    _trace_attribute_bytes: int = field(default=0, repr=False)
     _stage_transitions: list[tuple[int, str, int]] = field(default_factory=list, repr=False)
     _finished: bool = field(default=False, repr=False)
 
@@ -314,6 +330,16 @@ class _OperationObservationTracker:
     def record_backend_abort(self, accepted: bool | None) -> None:
         self._backend_abort_accepted = accepted
 
+    def record_trace_context(self, metadata: TraceContextMetadata, attributes: bytes) -> None:
+        if metadata.body_bytes != len(attributes):
+            raise ValueError("TRACE_CONTEXT body_bytes does not match the trace attribute body")
+        self.identity = replace(self.identity, trace_id=metadata.trace_id)
+        self._trace_span_id = metadata.span_id
+        self._trace_parent_span_id = metadata.parent_span_id
+        self._trace_stage_code = metadata.stage_code
+        self._trace_flags = metadata.flags
+        self._trace_attribute_bytes = len(attributes)
+
     def finish(self, terminal_state: OperationState) -> OperationObservation:
         if self._finished:
             raise RuntimeError(f"operation {self.identity.operation_id} observation already finished")
@@ -344,6 +370,11 @@ class _OperationObservationTracker:
             backend_abort_accepted=self._backend_abort_accepted,
             drop_reason=self._drop_reason,
             terminal_outcome=terminal_state.value,
+            trace_span_id=self._trace_span_id,
+            trace_parent_span_id=self._trace_parent_span_id,
+            trace_stage_code=self._trace_stage_code,
+            trace_flags=self._trace_flags,
+            trace_attribute_bytes=self._trace_attribute_bytes,
             stage_transitions=tuple(
                 OperationStageTransition(
                     stage_code=stage_code,

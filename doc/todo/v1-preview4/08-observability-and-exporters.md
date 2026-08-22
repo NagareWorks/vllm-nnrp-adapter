@@ -10,7 +10,7 @@
   latency, terminal latency, output event count, token usage, and bytes where available.
 - [ ] Record cancellation source, backend abort acceptance, error family, drop reason, retry hint,
   pressure state, and terminal outcome.
-- [ ] Derive stage transitions from the same record used for `TRACE_CONTEXT` and `PROGRESS`.
+- [x] Derive stage transitions from the same record used for `TRACE_CONTEXT` and `PROGRESS`.
 
 ## Export Boundary
 

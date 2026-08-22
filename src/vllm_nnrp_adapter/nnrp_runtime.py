@@ -35,7 +35,10 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
     PartialResultMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
+    RuntimeEventMetadataKind,
+    RuntimeEventTailKind,
     RuntimeRole,
+    TraceContextMetadata,
 )
 from nnrp.server import (  # type: ignore[import-untyped]
     NativeServerAcceptOptions,
@@ -250,6 +253,8 @@ async def _serve_session(
     operations: set[asyncio.Task[None]] = set()
     registry = OperationRegistry()
     controls = RuntimeControlRegistry()
+    observations_by_frame: dict[int, tuple[OperationRecord, _OperationObservationTracker]] = {}
+    session_trace_context: tuple[TraceContextMetadata, bytes] | None = None
     backend_family, backend_binding, vllm_version = adapter._backend_observation_identity()
     try:
         while not shutdown.is_set():
@@ -276,6 +281,14 @@ async def _serve_session(
                             diagnostic=b"peer_disconnect",
                         )
                         break
+                    if runtime_event.header.message_type is MessageType.TRACE_CONTEXT:
+                        session_trace_context = _apply_trace_context(
+                            runtime_event,
+                            observations_by_frame=observations_by_frame,
+                            session_trace_context=session_trace_context,
+                        )
+                        counters.applied_control_events += 1
+                        continue
                     await _handle_runtime_control(
                         runtime_event,
                         registry=registry,
@@ -319,6 +332,9 @@ async def _serve_session(
                 session_handle_id=session_handle_id,
                 session_generation=session_generation,
             )
+            if session_trace_context is not None:
+                observation.record_trace_context(*session_trace_context)
+            observations_by_frame[operation.frame_id] = (record, observation)
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:
                 try:
@@ -365,6 +381,36 @@ async def _serve_session(
             finally:
                 await controls.clear()
                 registry.clear()
+
+
+def _apply_trace_context(
+    event: NativeRuntimeEvent,
+    *,
+    observations_by_frame: Mapping[int, tuple[OperationRecord, _OperationObservationTracker]],
+    session_trace_context: tuple[TraceContextMetadata, bytes] | None,
+) -> tuple[TraceContextMetadata, bytes] | None:
+    if event.metadata.kind is not RuntimeEventMetadataKind.TRACE_CONTEXT or not isinstance(
+        event.metadata.value, TraceContextMetadata
+    ):
+        raise ValueError("TRACE_CONTEXT requires TraceContextMetadata")
+    if event.tail.kind is not RuntimeEventTailKind.BODY:
+        raise ValueError("TRACE_CONTEXT requires a trace attribute body")
+    metadata = event.metadata.value
+    attributes = event.tail.body
+    if metadata.body_bytes != len(attributes):
+        raise ValueError("TRACE_CONTEXT body_bytes does not match the trace attribute body")
+    if event.header.trace_id not in {0, metadata.trace_id}:
+        raise ValueError("TRACE_CONTEXT header trace_id does not match metadata trace_id")
+    if event.header.frame_id == 0:
+        return metadata, attributes
+    try:
+        record, observation = observations_by_frame[event.header.frame_id]
+    except KeyError as error:
+        raise ValueError(f"TRACE_CONTEXT references unknown active frame {event.header.frame_id}") from error
+    if record.is_terminal:
+        raise ValueError(f"TRACE_CONTEXT references terminal frame {event.header.frame_id}")
+    observation.record_trace_context(metadata, attributes)
+    return session_trace_context
 
 
 async def _serve_operation(

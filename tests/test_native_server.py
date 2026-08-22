@@ -56,11 +56,13 @@ from nnrp.runtime import (
     SessionCloseMetadata,
     SessionCloseReason,
     SupersedeMetadata,
+    TraceContextMetadata,
 )
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
 from vllm_nnrp_adapter.nnrp_runtime import (
+    _apply_trace_context,
     _native_handle_identity,
     _OperationObservationTracker,
     _serve_operation,
@@ -584,6 +586,149 @@ async def test_terminal_send_cancellation_preserves_completed_operation_state() 
     assert record.state is OperationState.COMPLETED
     assert record.resources_released is True
     assert counters.terminal_results == 0
+
+
+def _trace_context_event(
+    metadata: TraceContextMetadata,
+    body: bytes,
+    *,
+    frame_id: int,
+    header_trace_id: int | None = None,
+) -> NativeRuntimeEvent:
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(
+            message_type=MessageType.TRACE_CONTEXT,
+            session_id=1,
+            frame_id=frame_id,
+            trace_id=metadata.trace_id if header_trace_id is None else header_trace_id,
+        ),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.TRACE_CONTEXT, metadata),
+        RuntimeEventTail.with_body(body),
+    )
+
+
+def test_trace_context_correlates_session_and_active_operation_frames() -> None:
+    operation = FakeOperation(
+        operation_id=73,
+        frame_id=23,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=73),
+        terminal_results=[],
+    )
+    record = OperationRegistry().register(operation.operation_id, "request-73")
+    record.transition(OperationState.QUEUED)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        clock_ns=lambda: 0,
+    )
+    session_metadata = TraceContextMetadata(81, 82, 80, 3, 1, 7)
+    session_context = _apply_trace_context(
+        _trace_context_event(session_metadata, b"session", frame_id=0),
+        observations_by_frame={},
+        session_trace_context=None,
+    )
+
+    assert session_context == (session_metadata, b"session")
+
+    operation_metadata = TraceContextMetadata(91, 92, 90, 5, 3, 9)
+    retained_session_context = _apply_trace_context(
+        _trace_context_event(operation_metadata, b"operation", frame_id=23),
+        observations_by_frame={23: (record, observation)},
+        session_trace_context=session_context,
+    )
+    result = observation.finish(OperationState.FAILED)
+
+    assert retained_session_context == session_context
+    assert result.identity.trace_id == 91
+    assert result.trace_span_id == 92
+    assert result.trace_parent_span_id == 90
+    assert result.trace_stage_code == 5
+    assert result.trace_flags == 3
+    assert result.trace_attribute_bytes == 9
+
+
+@pytest.mark.parametrize(
+    ("event", "message"),
+    (
+        (_trace_context_event(TraceContextMetadata(1, 2, 0, 0, 0, 0), b"", frame_id=99), "unknown active frame"),
+        (
+            _trace_context_event(
+                TraceContextMetadata(1, 2, 0, 0, 0, 0),
+                b"",
+                frame_id=0,
+                header_trace_id=2,
+            ),
+            "does not match",
+        ),
+        (_trace_context_event(TraceContextMetadata(1, 2, 0, 0, 0, 1), b"", frame_id=0), "body_bytes"),
+    ),
+)
+def test_trace_context_rejects_invalid_correlation(
+    event: NativeRuntimeEvent,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _apply_trace_context(event, observations_by_frame={}, session_trace_context=None)
+
+
+@pytest.mark.asyncio
+async def test_native_server_applies_session_trace_context_to_operation_observation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=74,
+        frame_id=24,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=74),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    trace_metadata = TraceContextMetadata(101, 102, 100, 3, 1, 12)
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(runtime=_trace_context_event(trace_metadata, b"private-attr", frame_id=0)),
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_control_event(MessageType.CANCEL, operation_id=74, sequence=1),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    observation = _observation_records(caplog)[0]
+    assert observation["trace_id"] == 101
+    assert observation["trace_span_id"] == 102
+    assert observation["trace_parent_span_id"] == 100
+    assert observation["trace_stage_code"] == 3
+    assert observation["trace_flags"] == 1
+    assert observation["trace_attribute_bytes"] == 12
+    assert "private-attr" not in json.dumps(observation)
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1:7766", "unix:///tmp/nnrp.sock", "ws://host/nnrp"])

@@ -16,6 +16,7 @@ from nnrp.runtime import (
     RuntimeEventTail,
     RuntimeFrameHeader,
     RuntimeRole,
+    TraceContextMetadata,
 )
 from prometheus_client import CollectorRegistry, generate_latest
 
@@ -172,6 +173,43 @@ def test_operation_observation_is_immutable_complete_and_structured(
     }
     assert payload["backend_abort_accepted"] is True
     assert payload["terminal_outcome"] == "dropped"
+
+
+def test_operation_observation_records_trace_context_without_attribute_contents() -> None:
+    tracker = _OperationObservationTracker.from_operation(
+        _operation(),
+        selected_transport="ipc",
+        clock_ns=lambda: 0,
+    )
+
+    tracker.record_trace_context(
+        TraceContextMetadata(
+            trace_id=71,
+            span_id=72,
+            parent_span_id=70,
+            stage_code=5,
+            flags=3,
+            body_bytes=6,
+        ),
+        b"secret",
+    )
+    observation = tracker.finish(OperationState.FAILED)
+
+    assert observation.identity.trace_id == 71
+    assert observation.trace_span_id == 72
+    assert observation.trace_parent_span_id == 70
+    assert observation.trace_stage_code == 5
+    assert observation.trace_flags == 3
+    assert observation.trace_attribute_bytes == 6
+    assert "secret" not in json.dumps(observation.to_log_fields())
+
+    with pytest.raises(ValueError, match="body_bytes"):
+        tracker = _OperationObservationTracker.from_operation(
+            _operation(),
+            selected_transport="ipc",
+            clock_ns=lambda: 0,
+        )
+        tracker.record_trace_context(TraceContextMetadata(1, 2, 0, 0, 0, 1), b"")
 
 
 def test_operation_observation_keeps_unavailable_values_absent() -> None:

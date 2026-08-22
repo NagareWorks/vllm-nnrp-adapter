@@ -36,8 +36,10 @@
 
 ## Diagnostics And Recovery
 
-- [ ] Propagate `TRACE_CONTEXT` into operation observations and backend trace headers where the vLLM
-  binding supports them.
+- [x] Propagate session-scoped and active-operation `TRACE_CONTEXT` metadata into operation
+  observations, rejecting unknown or terminal submit-frame correlations.
+- [ ] Translate eligible `TRACE_CONTEXT` values into backend trace headers for vLLM bindings that
+  support trace propagation.
 - [ ] Emit `RESULT_DROP_REASON` for deadline, supersede, peer cancellation, backpressure, capability
   mismatch, budget, object invalidation, and transport closure outcomes.
 - [ ] Emit `ERROR_RECOVERABLE` and `RETRY_AFTER` for transient admission, queue, and backend errors.
