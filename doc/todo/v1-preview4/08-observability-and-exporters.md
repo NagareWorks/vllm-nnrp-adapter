@@ -4,9 +4,9 @@
 
 - [x] Add one immutable operation observation record shared by diagnostics, metrics, logs, and
   benchmarks.
-- [ ] Record model, operation, vLLM version, backend binding, selected transport, connection,
+- [x] Record model, operation, vLLM version, backend binding, selected transport, connection,
   session, operation, frame, route, view, trace, and profile identities.
-- [ ] Record queue delay, admission latency, preprocessing latency, time to first event, inter-event
+- [x] Record queue delay, admission latency, preprocessing latency, time to first event, inter-event
   latency, terminal latency, output event count, token usage, and bytes where available.
 - [ ] Record cancellation source, backend abort acceptance, error family, drop reason, retry hint,
   pressure state, and terminal outcome.

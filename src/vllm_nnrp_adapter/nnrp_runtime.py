@@ -306,12 +306,18 @@ async def _serve_session(
                 continue
             counters.accepted_operations += 1
             control = controls.register(operation.operation_id)
+            connection_id, connection_generation = _native_handle_identity(getattr(session, "server", None))
+            session_handle_id, session_generation = _native_handle_identity(getattr(session, "handle", None))
             observation = _OperationObservationTracker.from_operation(
                 operation,
                 selected_transport=session.active_transport_name,
                 backend_family=backend_family,
                 backend_binding=backend_binding,
                 vllm_version=vllm_version,
+                connection_id=connection_id,
+                connection_generation=connection_generation,
+                session_handle_id=session_handle_id,
+                session_generation=session_generation,
             )
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:
@@ -373,7 +379,7 @@ async def _serve_operation(
 ) -> None:
     result_sequence = 0
     terminal_sent = False
-    progress = OperationProgressReporter(operation)
+    progress = OperationProgressReporter(operation, observer=observation.record_progress_stage)
     try:
         try:
             await progress.emit(OperationProgressStage.QUEUED)
@@ -684,6 +690,16 @@ def _terminal_progress_stage(event: Mapping[str, Any]) -> OperationProgressStage
 
 def _backend_request_id(operation_id: int, frame_id: int) -> str:
     return f"nnrp-{operation_id}-{frame_id}"
+
+
+def _native_handle_identity(value: object) -> tuple[int | None, int | None]:
+    handle = getattr(value, "handle", None)
+    handle_id = getattr(handle, "id", None)
+    generation = getattr(handle, "generation", None)
+    return (
+        handle_id if type(handle_id) is int else None,
+        generation if type(generation) is int else None,
+    )
 
 
 def _duplicate_operation_event(error: OperationStateError) -> dict[str, Any]:

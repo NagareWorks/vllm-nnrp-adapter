@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import IntEnum
 
 from nnrp import NativeRuntimeServerOperation  # type: ignore[import-untyped]
@@ -20,8 +21,14 @@ class OperationProgressStage(IntEnum):
 
 
 class OperationProgressReporter:
-    def __init__(self, operation: NativeRuntimeServerOperation) -> None:
+    def __init__(
+        self,
+        operation: NativeRuntimeServerOperation,
+        *,
+        observer: Callable[[OperationProgressStage], None] | None = None,
+    ) -> None:
         self._operation = operation
+        self._observer = observer
         self._sequence = 0
         self._last_stage: OperationProgressStage | None = None
 
@@ -44,3 +51,5 @@ class OperationProgressReporter:
             )
         )
         self._last_stage = stage
+        if self._observer is not None:
+            self._observer(stage)

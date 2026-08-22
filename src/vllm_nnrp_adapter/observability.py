@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from nnrp import NativeRuntimeServerOperation, NativeTransportEndpoint  # type: ignore[import-untyped]
 from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
 
+from .operation_progress import OperationProgressStage
 from .operation_state import OperationState
 from .runtime_control import RuntimeControlRequest
 
@@ -88,6 +89,10 @@ class ServerStartupObservation:
 @dataclass(frozen=True, slots=True)
 class OperationIdentity:
     selected_transport: str
+    connection_id: int | None
+    connection_generation: int | None
+    session_handle_id: int | None
+    session_generation: int | None
     session_id: int
     operation_id: int
     frame_id: int
@@ -95,6 +100,13 @@ class OperationIdentity:
     view_id: int
     trace_id: int
     profile_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class OperationStageTransition:
+    stage_code: int
+    stage_name: str
+    elapsed_ms: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +118,8 @@ class OperationObservation:
     backend_binding: str | None
     vllm_version: str | None
     queue_delay_ms: float | None
+    admission_latency_ms: float | None
+    preprocessing_latency_ms: float | None
     first_event_latency_ms: float | None
     inter_event_latency_ms: tuple[float, ...]
     terminal_latency_ms: float
@@ -121,10 +135,15 @@ class OperationObservation:
     backend_abort_accepted: bool | None
     drop_reason: str | None
     terminal_outcome: str
+    stage_transitions: tuple[OperationStageTransition, ...]
 
     def to_log_fields(self) -> dict[str, object]:
         return {
             "selected_transport": self.identity.selected_transport,
+            "connection_id": self.identity.connection_id,
+            "connection_generation": self.identity.connection_generation,
+            "session_handle_id": self.identity.session_handle_id,
+            "session_generation": self.identity.session_generation,
             "session_id": self.identity.session_id,
             "operation_id": self.identity.operation_id,
             "frame_id": self.identity.frame_id,
@@ -138,6 +157,8 @@ class OperationObservation:
             "backend_binding": self.backend_binding,
             "vllm_version": self.vllm_version,
             "queue_delay_ms": self.queue_delay_ms,
+            "admission_latency_ms": self.admission_latency_ms,
+            "preprocessing_latency_ms": self.preprocessing_latency_ms,
             "first_event_latency_ms": self.first_event_latency_ms,
             "inter_event_latency_ms": self.inter_event_latency_ms,
             "terminal_latency_ms": self.terminal_latency_ms,
@@ -153,6 +174,14 @@ class OperationObservation:
             "backend_abort_accepted": self.backend_abort_accepted,
             "drop_reason": self.drop_reason,
             "terminal_outcome": self.terminal_outcome,
+            "stage_transitions": [
+                {
+                    "stage_code": transition.stage_code,
+                    "stage_name": transition.stage_name,
+                    "elapsed_ms": transition.elapsed_ms,
+                }
+                for transition in self.stage_transitions
+            ],
         }
 
 
@@ -164,7 +193,10 @@ class _OperationObservationTracker:
     vllm_version: str | None
     _clock_ns: Callable[[], int] = field(repr=False)
     _accepted_ns: int = field(repr=False)
+    _input_received_ns: int | None = field(default=None, repr=False)
     _admitted_ns: int | None = field(default=None, repr=False)
+    _preprocessing_ns: int | None = field(default=None, repr=False)
+    _executing_ns: int | None = field(default=None, repr=False)
     _first_event_ns: int | None = field(default=None, repr=False)
     _last_event_ns: int | None = field(default=None, repr=False)
     _inter_event_ns: list[int] = field(default_factory=list, repr=False)
@@ -181,6 +213,7 @@ class _OperationObservationTracker:
     _cancellation_reason_code: int | None = field(default=None, repr=False)
     _backend_abort_accepted: bool | None = field(default=None, repr=False)
     _drop_reason: str | None = field(default=None, repr=False)
+    _stage_transitions: list[tuple[int, str, int]] = field(default_factory=list, repr=False)
     _finished: bool = field(default=False, repr=False)
 
     @classmethod
@@ -192,6 +225,10 @@ class _OperationObservationTracker:
         backend_family: str = "unknown",
         backend_binding: str | None = None,
         vllm_version: str | None = None,
+        connection_id: int | None = None,
+        connection_generation: int | None = None,
+        session_handle_id: int | None = None,
+        session_generation: int | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> _OperationObservationTracker:
         submit = operation.submit
@@ -202,6 +239,10 @@ class _OperationObservationTracker:
         return cls(
             identity=OperationIdentity(
                 selected_transport=selected_transport,
+                connection_id=connection_id,
+                connection_generation=connection_generation,
+                session_handle_id=session_handle_id,
+                session_generation=session_generation,
                 session_id=header.session_id,
                 operation_id=operation.operation_id,
                 frame_id=operation.frame_id,
@@ -227,6 +268,18 @@ class _OperationObservationTracker:
     def mark_admitted(self) -> None:
         if self._admitted_ns is None:
             self._admitted_ns = self._clock_ns()
+
+    def record_progress_stage(self, stage: OperationProgressStage) -> None:
+        now = self._clock_ns()
+        stage_code = stage.value
+        stage_name = _enum_value(stage)
+        self._stage_transitions.append((stage_code, stage_name, now))
+        if stage_name == "input_received" and self._input_received_ns is None:
+            self._input_received_ns = now
+        elif stage_name == "preprocessing" and self._preprocessing_ns is None:
+            self._preprocessing_ns = now
+        elif stage_name == "executing" and self._executing_ns is None:
+            self._executing_ns = now
 
     def record_event(self, event: Mapping[str, Any], *, body_bytes: int) -> None:
         now = self._clock_ns()
@@ -274,6 +327,8 @@ class _OperationObservationTracker:
             backend_binding=self.backend_binding,
             vllm_version=self.vllm_version,
             queue_delay_ms=_duration_ms(self._accepted_ns, self._admitted_ns),
+            admission_latency_ms=_optional_duration_ms(self._input_received_ns, self._admitted_ns),
+            preprocessing_latency_ms=_optional_duration_ms(self._preprocessing_ns, self._executing_ns),
             first_event_latency_ms=_duration_ms(self._accepted_ns, self._first_event_ns),
             inter_event_latency_ms=tuple(_nanoseconds_to_ms(value) for value in self._inter_event_ns),
             terminal_latency_ms=_nanoseconds_to_ms(terminal_ns - self._accepted_ns),
@@ -289,6 +344,14 @@ class _OperationObservationTracker:
             backend_abort_accepted=self._backend_abort_accepted,
             drop_reason=self._drop_reason,
             terminal_outcome=terminal_state.value,
+            stage_transitions=tuple(
+                OperationStageTransition(
+                    stage_code=stage_code,
+                    stage_name=stage_name,
+                    elapsed_ms=_nanoseconds_to_ms(timestamp_ns - self._accepted_ns),
+                )
+                for stage_code, stage_name, timestamp_ns in self._stage_transitions
+            ),
         )
 
     def _record_usage(self, event: Mapping[str, Any]) -> None:
@@ -406,6 +469,8 @@ class PrometheusObservationSink:
 
         self._operations.labels(**labels).inc()
         self._observe_latency(labels, "queue", observation.queue_delay_ms)
+        self._observe_latency(labels, "admission", observation.admission_latency_ms)
+        self._observe_latency(labels, "preprocessing", observation.preprocessing_latency_ms)
         self._observe_latency(labels, "first_event", observation.first_event_latency_ms)
         self._observe_latency(labels, "terminal", observation.terminal_latency_ms)
         event_labels = {"transport": transport, "operation": operation}
@@ -481,6 +546,12 @@ def _duration_ms(start_ns: int, end_ns: int | None) -> float | None:
     if end_ns is None:
         return None
     return _nanoseconds_to_ms(end_ns - start_ns)
+
+
+def _optional_duration_ms(start_ns: int | None, end_ns: int | None) -> float | None:
+    if start_ns is None:
+        return None
+    return _duration_ms(start_ns, end_ns)
 
 
 def _nanoseconds_to_ms(value: int) -> float:

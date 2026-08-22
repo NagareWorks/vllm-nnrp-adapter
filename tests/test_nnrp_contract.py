@@ -25,6 +25,7 @@ EXPECTED_PUBLIC_API = {
     "ObservationSink",
     "OperationIdentity",
     "OperationObservation",
+    "OperationStageTransition",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
     "OpenAiNnrpError",

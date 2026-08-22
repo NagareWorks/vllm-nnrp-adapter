@@ -22,6 +22,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from vllm_nnrp_adapter.observability import (
     OperationIdentity,
     OperationObservation,
+    OperationStageTransition,
     PrometheusObservationSink,
     ServerStartupObservation,
     StructuredLogObservationSink,
@@ -29,6 +30,7 @@ from vllm_nnrp_adapter.observability import (
     _emit_server_startup_observation,
     _OperationObservationTracker,
 )
+from vllm_nnrp_adapter.operation_progress import OperationProgressStage
 from vllm_nnrp_adapter.operation_state import OperationState
 from vllm_nnrp_adapter.runtime_control import RuntimeControlKind, RuntimeControlRequest
 
@@ -36,7 +38,20 @@ from vllm_nnrp_adapter.runtime_control import RuntimeControlKind, RuntimeControl
 def test_operation_observation_is_immutable_complete_and_structured(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    ticks = iter((0, 2_000_000, 5_000_000, 8_000_000, 11_000_000))
+    ticks = iter(
+        (
+            0,
+            1_000_000,
+            2_000_000,
+            3_000_000,
+            4_000_000,
+            5_000_000,
+            8_000_000,
+            11_000_000,
+            14_000_000,
+            17_000_000,
+        )
+    )
     operation = _operation()
     tracker = _OperationObservationTracker.from_operation(
         operation,
@@ -44,6 +59,10 @@ def test_operation_observation_is_immutable_complete_and_structured(
         backend_family="VllmBackend",
         backend_binding="current-0.26",
         vllm_version="0.26.0",
+        connection_id=101,
+        connection_generation=2,
+        session_handle_id=202,
+        session_generation=3,
         clock_ns=lambda: next(ticks),
     )
     tracker.record_request(
@@ -52,7 +71,12 @@ def test_operation_observation_is_immutable_complete_and_structured(
             "body": {"model": "test-model"},
         }
     )
+    tracker.record_progress_stage(OperationProgressStage.QUEUED)
+    tracker.record_progress_stage(OperationProgressStage.INPUT_RECEIVED)
     tracker.mark_admitted()
+    tracker.record_progress_stage(OperationProgressStage.ADMITTED)
+    tracker.record_progress_stage(OperationProgressStage.PREPROCESSING)
+    tracker.record_progress_stage(OperationProgressStage.EXECUTING)
     tracker.record_event(
         {
             "type": "response.usage",
@@ -84,6 +108,10 @@ def test_operation_observation_is_immutable_complete_and_structured(
     observation = tracker.finish(OperationState.DROPPED)
 
     assert observation.identity.selected_transport == "ipc"
+    assert observation.identity.connection_id == 101
+    assert observation.identity.connection_generation == 2
+    assert observation.identity.session_handle_id == 202
+    assert observation.identity.session_generation == 3
     assert observation.identity.session_id == 11
     assert observation.identity.operation_id == 7
     assert observation.identity.frame_id == 17
@@ -96,10 +124,12 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.backend_family == "VllmBackend"
     assert observation.backend_binding == "current-0.26"
     assert observation.vllm_version == "0.26.0"
-    assert observation.queue_delay_ms == 2.0
-    assert observation.first_event_latency_ms == 5.0
+    assert observation.queue_delay_ms == 3.0
+    assert observation.admission_latency_ms == 1.0
+    assert observation.preprocessing_latency_ms == 3.0
+    assert observation.first_event_latency_ms == 11.0
     assert observation.inter_event_latency_ms == (3.0,)
-    assert observation.terminal_latency_ms == 11.0
+    assert observation.terminal_latency_ms == 17.0
     assert observation.output_event_count == 2
     assert observation.output_bytes == 40
     assert observation.prompt_tokens == 4
@@ -112,6 +142,13 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.backend_abort_accepted is True
     assert observation.drop_reason == "peer_cancelled"
     assert observation.terminal_outcome == "dropped"
+    assert observation.stage_transitions == (
+        OperationStageTransition(0x0001, "queued", 1.0),
+        OperationStageTransition(0x0003, "input_received", 2.0),
+        OperationStageTransition(0x0002, "admitted", 4.0),
+        OperationStageTransition(0x0004, "preprocessing", 5.0),
+        OperationStageTransition(0x0005, "executing", 8.0),
+    )
     with pytest.raises(FrozenInstanceError):
         observation.model_id = "mutated"  # type: ignore[misc]
     with pytest.raises(RuntimeError, match="already finished"):
@@ -121,9 +158,18 @@ def test_operation_observation_is_immutable_complete_and_structured(
     _emit_operation_observation(observation, (StructuredLogObservationSink(),))
     payload = json.loads(caplog.records[-1].getMessage().removeprefix("nnrp_operation_observation "))
     assert payload["operation_id"] == 7
+    assert payload["connection_id"] == 101
+    assert payload["session_handle_id"] == 202
     assert payload["model_id"] == "test-model"
     assert payload["backend_binding"] == "current-0.26"
     assert payload["vllm_version"] == "0.26.0"
+    assert payload["admission_latency_ms"] == 1.0
+    assert payload["preprocessing_latency_ms"] == 3.0
+    assert payload["stage_transitions"][-1] == {
+        "elapsed_ms": 8.0,
+        "stage_code": 5,
+        "stage_name": "executing",
+    }
     assert payload["backend_abort_accepted"] is True
     assert payload["terminal_outcome"] == "dropped"
 
@@ -146,6 +192,8 @@ def test_operation_observation_keeps_unavailable_values_absent() -> None:
     assert observation.model_id is None
     assert observation.profile_operation is None
     assert observation.queue_delay_ms is None
+    assert observation.admission_latency_ms is None
+    assert observation.preprocessing_latency_ms is None
     assert observation.first_event_latency_ms == 0.0001
     assert observation.prompt_tokens is None
     assert observation.error_family == "ValueError"
@@ -245,6 +293,10 @@ def _public_observation() -> OperationObservation:
     return OperationObservation(
         identity=OperationIdentity(
             selected_transport="ipc",
+            connection_id=101,
+            connection_generation=2,
+            session_handle_id=202,
+            session_generation=3,
             session_id=11,
             operation_id=7,
             frame_id=17,
@@ -259,6 +311,8 @@ def _public_observation() -> OperationObservation:
         backend_binding="current-0.26",
         vllm_version="0.26.0",
         queue_delay_ms=2.0,
+        admission_latency_ms=1.0,
+        preprocessing_latency_ms=3.0,
         first_event_latency_ms=5.0,
         inter_event_latency_ms=(3.0,),
         terminal_latency_ms=11.0,
@@ -274,6 +328,7 @@ def _public_observation() -> OperationObservation:
         backend_abort_accepted=None,
         drop_reason=None,
         terminal_outcome="completed",
+        stage_transitions=(OperationStageTransition(0x0005, "executing", 4.0),),
     )
 
 

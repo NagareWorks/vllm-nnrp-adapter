@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import InitVar, dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -59,7 +60,12 @@ from nnrp.runtime import (
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
-from vllm_nnrp_adapter.nnrp_runtime import _OperationObservationTracker, _serve_operation, _ServeCounters
+from vllm_nnrp_adapter.nnrp_runtime import (
+    _native_handle_identity,
+    _OperationObservationTracker,
+    _serve_operation,
+    _ServeCounters,
+)
 from vllm_nnrp_adapter.operation_state import OperationRegistry, OperationState
 from vllm_nnrp_adapter.runtime_control import OperationControlSlot, RuntimeControlKind, RuntimeControlRequest
 
@@ -604,6 +610,13 @@ def test_server_config_rejects_invalid_observation_sink() -> None:
             endpoint="nnrp://runtime.local/vllm",
             observation_sinks=[object()],  # type: ignore[list-item]
         )
+
+
+def test_native_handle_identity_preserves_available_local_identity() -> None:
+    wrapped = SimpleNamespace(handle=SimpleNamespace(id=41, generation=3))
+
+    assert _native_handle_identity(wrapped) == (41, 3)
+    assert _native_handle_identity(object()) == (None, None)
 
 
 @pytest.mark.asyncio

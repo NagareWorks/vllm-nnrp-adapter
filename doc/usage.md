@@ -159,6 +159,12 @@ existing registry. Metric labels are restricted to bounded protocol/runtime cate
 identifiers, prompts, generated text, model ids, and arbitrary metadata never become labels. A sink
 failure is logged and isolated from request serving and from the remaining sinks.
 
+Each terminal `OperationObservation` carries the selected transport, native connection/session
+handle identities, wire session/operation/frame/route/view/trace/profile identities, backend and
+model identity, token and byte counts, terminal diagnostics, and the `PROGRESS` stage timeline.
+Queue, admission, preprocessing, first-event, inter-event, and terminal latencies are derived from
+that same immutable record.
+
 ## Conformance
 
 Run against the shared OpenAI API profile plan:

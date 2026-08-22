@@ -21,7 +21,8 @@ class ProgressOperation:
 @pytest.mark.asyncio
 async def test_progress_reporter_emits_monotonic_frozen_stages_and_skips_duplicates() -> None:
     operation = ProgressOperation(44)
-    reporter = OperationProgressReporter(operation)  # type: ignore[arg-type]
+    observed: list[OperationProgressStage] = []
+    reporter = OperationProgressReporter(operation, observer=observed.append)  # type: ignore[arg-type]
 
     await reporter.emit(OperationProgressStage.QUEUED)
     await reporter.emit(OperationProgressStage.QUEUED)
@@ -32,3 +33,4 @@ async def test_progress_reporter_emits_monotonic_frozen_stages_and_skips_duplica
         ProgressMetadata(44, 1, 0x0001, 0xFFFF, 0, 0),
         ProgressMetadata(44, 2, 0x0005, 2500, 0, 0),
     ]
+    assert observed == [OperationProgressStage.QUEUED, OperationProgressStage.EXECUTING]
