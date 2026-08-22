@@ -5,7 +5,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from .profile import (
     CHAT_COMPLETIONS_CREATE,
@@ -36,6 +36,17 @@ class ChatCompletionBackend(Protocol):
         pass
 
 
+@runtime_checkable
+class _TraceAwareChatCompletionBackend(Protocol):
+    def create_chat_completion_with_context(
+        self,
+        body: Mapping[str, Any],
+        *,
+        trace_headers: Mapping[str, str],
+    ) -> ChatCompletionResult | Awaitable[ChatCompletionResult]:
+        pass
+
+
 class OpenAiNnrpAdapter:
     def __init__(
         self,
@@ -62,6 +73,7 @@ class OpenAiNnrpAdapter:
         request: Mapping[str, Any],
         *,
         backend_abort_observer: Callable[[bool | None], None] | None = None,
+        backend_trace_headers_factory: Callable[[], Mapping[str, str] | None] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             envelope = validate_request(request, self.capabilities)
@@ -87,7 +99,16 @@ class OpenAiNnrpAdapter:
             request_id = envelope.get("request_id")
             if request_id is not None:
                 backend_body["request_id"] = request_id
-            result = self._backend.create_chat_completion(backend_body)
+            backend_trace_headers = (
+                None if backend_trace_headers_factory is None else backend_trace_headers_factory()
+            )
+            if backend_trace_headers is not None and isinstance(self._backend, _TraceAwareChatCompletionBackend):
+                result = self._backend.create_chat_completion_with_context(
+                    backend_body,
+                    trace_headers=backend_trace_headers,
+                )
+            else:
+                result = self._backend.create_chat_completion(backend_body)
             if inspect.isawaitable(result):
                 result = await _await_with_timeout(result, timeout_s)
 

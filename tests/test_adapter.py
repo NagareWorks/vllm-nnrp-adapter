@@ -1270,6 +1270,43 @@ async def test_engine_direct_binding_matches_each_vllm_family(
         (2, "vllm.entrypoints.serve.utils.api_utils"),
     ),
 )
+async def test_engine_direct_forwards_explicit_trace_headers_without_http_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+    serving_chat = FakeDirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+    trace_headers = {
+        "traceparent": "00-00000000000000000000000000001234-0000000000005678-01"
+    }
+
+    stream = await backend.create_chat_completion_with_context(
+        {"model": "llama", "stream": True},
+        trace_headers=trace_headers,
+    )
+
+    assert isinstance(stream, EngineDirectChatStream)
+    assert serving_chat.engine_client.last_generate_kwargs["trace_headers"] is trace_headers
+    assert serving_chat.fallback_calls == 0
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name"),
+    (
+        (0, "vllm.entrypoints.utils"),
+        (1, "vllm.entrypoints.utils"),
+        (2, "vllm.entrypoints.serve.utils.api_utils"),
+    ),
+)
 async def test_engine_direct_preserves_request_inputs_and_outputs_in_each_vllm_family(
     monkeypatch: pytest.MonkeyPatch,
     binding_index: int,

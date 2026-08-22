@@ -59,6 +59,22 @@ class VllmBackend:
         }
 
     async def create_chat_completion(self, body: Mapping[str, Any]) -> Any:
+        return await self._create_chat_completion(body, trace_headers=None)
+
+    async def create_chat_completion_with_context(
+        self,
+        body: Mapping[str, Any],
+        *,
+        trace_headers: Mapping[str, str],
+    ) -> Any:
+        return await self._create_chat_completion(body, trace_headers=trace_headers)
+
+    async def _create_chat_completion(
+        self,
+        body: Mapping[str, Any],
+        *,
+        trace_headers: Mapping[str, str] | None,
+    ) -> Any:
         request = self._build_request(body)
         if body.get("stream", False):
             if not self._prefer_engine_direct:
@@ -79,6 +95,7 @@ class VllmBackend:
                     request,
                     body,
                     engine_direct_binding,
+                    trace_headers=trace_headers,
                 )
             except EngineDirectUnsupported as error:
                 raise VllmProductionBoundaryError("vLLM rejected the engine-direct request shape") from error
@@ -180,6 +197,8 @@ async def _create_engine_direct_stream(
     request: object,
     body: Mapping[str, Any],
     binding: VllmEngineDirectBinding,
+    *,
+    trace_headers: Mapping[str, str] | None,
 ) -> AsyncIterator[Mapping[str, Any]]:
     render_chat_request = _required_callable(serving_chat, "render_chat_request")
     rendered = render_chat_request(request)
@@ -207,7 +226,6 @@ async def _create_engine_direct_stream(
     lora_request = _call_optional(serving_chat, "_maybe_get_adapters", request, supports_default_mm_loras=True)
     model_name = _model_name(serving_chat, lora_request, body)
     sampling_params = _sampling_params(serving_chat, request, engine_prompt, binding)
-    trace_headers = None
     data_parallel_rank = _call_optional(serving_chat, "_get_data_parallel_rank", None)
 
     _call_optional(

@@ -165,6 +165,12 @@ model identity, token and byte counts, terminal diagnostics, and the `PROGRESS` 
 Queue, admission, preprocessing, first-event, inter-event, and terminal latencies are derived from
 that same immutable record.
 
+`TRACE_CONTEXT` remains runtime metadata and never enters the OpenAI request body. For supported
+vLLM engine-direct bindings, an eligible session context becomes the operation default and is
+forwarded as a W3C `traceparent`; an operation-scoped context can replace it until backend dispatch.
+Later updates remain observable but do not mutate the in-flight request. Opaque trace attributes
+are counted for diagnostics and are never copied into headers or logs.
+
 The `serve` command does not open a metrics port by default. To expose the adapter collector from
 the serving process, install the `prometheus` extra and opt in with an explicit bind address:
 

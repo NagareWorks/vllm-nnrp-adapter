@@ -146,6 +146,22 @@ class _ServeCounters:
         )
 
 
+@dataclass(slots=True)
+class _BackendTraceContextSlot:
+    metadata: TraceContextMetadata | None = None
+    dispatched: bool = False
+
+    def update(self, metadata: TraceContextMetadata) -> bool:
+        if self.dispatched:
+            return False
+        self.metadata = metadata
+        return True
+
+    def begin_dispatch(self) -> Mapping[str, str] | None:
+        self.dispatched = True
+        return _w3c_trace_headers(self.metadata)
+
+
 class _NativeCallExecutor:
     def __init__(self, max_workers: int) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="vllm-nnrp-native")
@@ -253,7 +269,10 @@ async def _serve_session(
     operations: set[asyncio.Task[None]] = set()
     registry = OperationRegistry()
     controls = RuntimeControlRegistry()
-    observations_by_frame: dict[int, tuple[OperationRecord, _OperationObservationTracker]] = {}
+    observations_by_frame: dict[
+        int,
+        tuple[OperationRecord, _OperationObservationTracker, _BackendTraceContextSlot],
+    ] = {}
     session_trace_context: tuple[TraceContextMetadata, bytes] | None = None
     backend_family, backend_binding, vllm_version = adapter._backend_observation_identity()
     try:
@@ -334,7 +353,10 @@ async def _serve_session(
             )
             if session_trace_context is not None:
                 observation.record_trace_context(*session_trace_context)
-            observations_by_frame[operation.frame_id] = (record, observation)
+            backend_trace = _BackendTraceContextSlot(
+                None if session_trace_context is None else session_trace_context[0]
+            )
+            observations_by_frame[operation.frame_id] = (record, observation, backend_trace)
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:
                 try:
@@ -351,6 +373,7 @@ async def _serve_session(
                     observation=observation,
                     observation_sinks=config.observation_sinks,
                     counters=counters,
+                    backend_trace=backend_trace,
                 )
             )
             control.bind(task)
@@ -386,7 +409,10 @@ async def _serve_session(
 def _apply_trace_context(
     event: NativeRuntimeEvent,
     *,
-    observations_by_frame: Mapping[int, tuple[OperationRecord, _OperationObservationTracker]],
+    observations_by_frame: Mapping[
+        int,
+        tuple[OperationRecord, _OperationObservationTracker, _BackendTraceContextSlot],
+    ],
     session_trace_context: tuple[TraceContextMetadata, bytes] | None,
 ) -> tuple[TraceContextMetadata, bytes] | None:
     if event.metadata.kind is not RuntimeEventMetadataKind.TRACE_CONTEXT or not isinstance(
@@ -404,13 +430,23 @@ def _apply_trace_context(
     if event.header.frame_id == 0:
         return metadata, attributes
     try:
-        record, observation = observations_by_frame[event.header.frame_id]
+        record, observation, backend_trace = observations_by_frame[event.header.frame_id]
     except KeyError as error:
         raise ValueError(f"TRACE_CONTEXT references unknown active frame {event.header.frame_id}") from error
     if record.is_terminal:
         raise ValueError(f"TRACE_CONTEXT references terminal frame {event.header.frame_id}")
     observation.record_trace_context(metadata, attributes)
+    backend_trace.update(metadata)
     return session_trace_context
+
+
+def _w3c_trace_headers(metadata: TraceContextMetadata | None) -> Mapping[str, str] | None:
+    if metadata is None or metadata.trace_id == 0 or metadata.span_id == 0:
+        return None
+    traceparent = (
+        f"00-{metadata.trace_id:032x}-{metadata.span_id:016x}-{metadata.flags & 0x01:02x}"
+    )
+    return MappingProxyType({"traceparent": traceparent})
 
 
 async def _serve_operation(
@@ -422,6 +458,7 @@ async def _serve_operation(
     observation: _OperationObservationTracker,
     observation_sinks: Sequence[ObservationSink],
     counters: _ServeCounters,
+    backend_trace: _BackendTraceContextSlot | None = None,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
@@ -441,6 +478,9 @@ async def _serve_operation(
             async for event in adapter._handle_native_request(
                 request,
                 backend_abort_observer=observation.record_backend_abort,
+                backend_trace_headers_factory=(
+                    None if backend_trace is None else backend_trace.begin_dispatch
+                ),
             ):
                 body = _encode_event(event)
                 observation.record_event(event, body_bytes=len(body))

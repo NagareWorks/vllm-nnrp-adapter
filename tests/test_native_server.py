@@ -63,10 +63,12 @@ from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions,
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
 from vllm_nnrp_adapter.nnrp_runtime import (
     _apply_trace_context,
+    _BackendTraceContextSlot,
     _native_handle_identity,
     _OperationObservationTracker,
     _serve_operation,
     _ServeCounters,
+    _w3c_trace_headers,
 )
 from vllm_nnrp_adapter.operation_state import OperationRegistry, OperationState
 from vllm_nnrp_adapter.runtime_control import OperationControlSlot, RuntimeControlKind, RuntimeControlRequest
@@ -82,6 +84,31 @@ class StreamingBackend:
         async def events() -> AsyncIterator[Mapping[str, Any]]:
             yield {"choices": [{"index": 0, "delta": {"content": body["model"]}}]}
             yield {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+        return events()
+
+
+class TraceAwareStreamingBackend:
+    def __init__(self) -> None:
+        self.requests: list[Mapping[str, Any]] = []
+        self.trace_headers: list[Mapping[str, str]] = []
+        self.started = threading.Event()
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        raise AssertionError("trace-aware backend must receive the explicit context call")
+
+    def create_chat_completion_with_context(
+        self,
+        body: Mapping[str, Any],
+        *,
+        trace_headers: Mapping[str, str],
+    ) -> object:
+        self.requests.append(body)
+        self.trace_headers.append(trace_headers)
+        self.started.set()
+
+        async def events() -> AsyncIterator[Mapping[str, Any]]:
+            yield {"choices": [{"index": 0, "delta": {"content": "traced"}}]}
 
         return events()
 
@@ -622,6 +649,7 @@ def test_trace_context_correlates_session_and_active_operation_frames() -> None:
         selected_transport="ipc",
         clock_ns=lambda: 0,
     )
+    backend_trace = _BackendTraceContextSlot()
     session_metadata = TraceContextMetadata(81, 82, 80, 3, 1, 7)
     session_context = _apply_trace_context(
         _trace_context_event(session_metadata, b"session", frame_id=0),
@@ -634,18 +662,77 @@ def test_trace_context_correlates_session_and_active_operation_frames() -> None:
     operation_metadata = TraceContextMetadata(91, 92, 90, 5, 3, 9)
     retained_session_context = _apply_trace_context(
         _trace_context_event(operation_metadata, b"operation", frame_id=23),
-        observations_by_frame={23: (record, observation)},
+        observations_by_frame={23: (record, observation, backend_trace)},
+        session_trace_context=session_context,
+    )
+
+    assert retained_session_context == session_context
+    assert backend_trace.begin_dispatch() == {
+        "traceparent": "00-0000000000000000000000000000005b-000000000000005c-01"
+    }
+
+    late_metadata = TraceContextMetadata(111, 112, 110, 7, 0, 0)
+    _apply_trace_context(
+        _trace_context_event(late_metadata, b"", frame_id=23),
+        observations_by_frame={23: (record, observation, backend_trace)},
         session_trace_context=session_context,
     )
     result = observation.finish(OperationState.FAILED)
 
-    assert retained_session_context == session_context
-    assert result.identity.trace_id == 91
-    assert result.trace_span_id == 92
-    assert result.trace_parent_span_id == 90
-    assert result.trace_stage_code == 5
-    assert result.trace_flags == 3
-    assert result.trace_attribute_bytes == 9
+    assert backend_trace.metadata is operation_metadata
+    assert result.identity.trace_id == 111
+    assert result.trace_span_id == 112
+    assert result.trace_parent_span_id == 110
+    assert result.trace_stage_code == 7
+    assert result.trace_flags == 0
+    assert result.trace_attribute_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    (
+        (None, None),
+        (TraceContextMetadata(0, 2, 0, 0, 0, 0), None),
+        (TraceContextMetadata(1, 0, 0, 0, 0, 0), None),
+        (
+            TraceContextMetadata(0x1234, 0x5678, 0x9ABC, 4, 3, 0),
+            {"traceparent": "00-00000000000000000000000000001234-0000000000005678-01"},
+        ),
+    ),
+)
+def test_trace_context_maps_to_frozen_w3c_header(
+    metadata: TraceContextMetadata | None,
+    expected: Mapping[str, str] | None,
+) -> None:
+    assert _w3c_trace_headers(metadata) == expected
+
+
+@pytest.mark.asyncio
+async def test_operation_trace_can_replace_session_default_before_backend_dispatch() -> None:
+    backend = TraceAwareStreamingBackend()
+    adapter = OpenAiNnrpAdapter(backend)
+    session_metadata = TraceContextMetadata(0x11, 0x12, 0, 0, 0, 0)
+    operation_metadata = TraceContextMetadata(0x21, 0x22, 0, 0, 1, 0)
+    backend_trace = _BackendTraceContextSlot(session_metadata)
+    request = _chat_request()
+    request["nnrp"] = {"diagnostics": True}
+    events = adapter._handle_native_request(
+        request,
+        backend_trace_headers_factory=backend_trace.begin_dispatch,
+    )
+
+    diagnostics = await anext(events)
+    assert diagnostics["type"] == "response.diagnostics"
+    assert backend_trace.dispatched is False
+    assert backend_trace.update(operation_metadata) is True
+
+    first_result = await anext(events)
+    assert first_result["type"] == "response.output_text.delta"
+    assert backend.trace_headers == [
+        {"traceparent": "00-00000000000000000000000000000021-0000000000000022-01"}
+    ]
+    assert backend_trace.dispatched is True
+    await events.aclose()
 
 
 @pytest.mark.parametrize(
@@ -729,6 +816,58 @@ async def test_native_server_applies_session_trace_context_to_operation_observat
     assert observation["trace_flags"] == 1
     assert observation["trace_attribute_bytes"] == 12
     assert "private-attr" not in json.dumps(observation)
+
+
+@pytest.mark.asyncio
+async def test_native_server_forwards_session_trace_to_trace_aware_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = TraceAwareStreamingBackend()
+    operation = FakeOperation(
+        operation_id=75,
+        frame_id=25,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=75),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    trace_metadata = TraceContextMetadata(0x1234, 0x5678, 0, 3, 3, 0)
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(runtime=_trace_context_event(trace_metadata, b"", frame_id=0)),
+            FakeServerEvent(submit=operation),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+            observation_sinks=(),
+        ),
+        stop_event=stop_event,
+    )
+
+    assert backend.trace_headers == [
+        {"traceparent": "00-00000000000000000000000000001234-0000000000005678-01"}
+    ]
+    assert len(backend.requests) == 1
+    assert "traceparent" not in backend.requests[0]
+    assert "trace_headers" not in backend.requests[0]
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1:7766", "unix:///tmp/nnrp.sock", "ws://host/nnrp"])
