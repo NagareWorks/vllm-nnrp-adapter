@@ -165,6 +165,21 @@ model identity, token and byte counts, terminal diagnostics, and the `PROGRESS` 
 Queue, admission, preprocessing, first-event, inter-event, and terminal latencies are derived from
 that same immutable record.
 
+The `serve` command does not open a metrics port by default. To expose the adapter collector from
+the serving process, install the `prometheus` extra and opt in with an explicit bind address:
+
+```powershell
+python -m pip install ".[prometheus]"
+vllm-nnrp-adapter serve `
+  --backend host.runtime:make_backend `
+  --endpoint nnrp://runtime.local/vllm `
+  --metrics-host 127.0.0.1 `
+  --metrics-port 9464
+```
+
+The endpoint is stopped with the adapter process. Deployments that already own a Prometheus
+registry should continue to register `PrometheusObservationSink` directly instead.
+
 ## Conformance
 
 Run against the shared OpenAI API profile plan:

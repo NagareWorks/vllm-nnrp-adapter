@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
 from collections.abc import Coroutine
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +13,7 @@ from nnrp import TransportPolicy
 
 from vllm_nnrp_adapter import cli
 from vllm_nnrp_adapter.adapter import OpenAiNnrpAdapter
+from vllm_nnrp_adapter.observability import PrometheusObservationSink
 
 
 def test_serve_cli_builds_provider_neutral_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -73,6 +76,92 @@ def test_serve_cli_builds_provider_neutral_config(monkeypatch: pytest.MonkeyPatc
     assert routes["quic"].security is not None
     assert routes["quic"].security.certificate_der == b"certificate"
     assert routes["websocket"].security is not None
+    assert len(config.observation_sinks) == 1
+
+
+def test_serve_cli_enables_metrics_only_with_explicit_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    metrics_sink = SimpleNamespace(
+        observe_server_startup=lambda _observation: None,
+        observe_operation=lambda _observation: None,
+    )
+    captured: list[cli.NnrpServerConfig] = []
+
+    @contextmanager
+    def fake_metrics_sink(host: str, port: int | None) -> Any:
+        assert host == "127.0.0.2"
+        assert port == 9464
+        yield metrics_sink
+
+    async def completed() -> None:
+        return None
+
+    def fake_run(coroutine: Coroutine[Any, Any, None]) -> None:
+        coroutine.close()
+
+    def fake_serve_backend(_backend_spec: str, config: cli.NnrpServerConfig) -> Coroutine[Any, Any, None]:
+        captured.append(config)
+        return completed()
+
+    monkeypatch.setattr(cli, "_standalone_metrics_sink", fake_metrics_sink)
+    monkeypatch.setattr(cli, "_serve_backend", fake_serve_backend)
+    monkeypatch.setattr(cli.asyncio, "run", fake_run)
+
+    assert cli.main(
+        [
+            "serve",
+            "--backend",
+            "host.runtime:make_backend",
+            "--endpoint",
+            "nnrp://runtime.local/vllm",
+            "--metrics-host",
+            "127.0.0.2",
+            "--metrics-port",
+            "9464",
+        ]
+    ) == 0
+    assert len(captured) == 1
+    assert captured[0].observation_sinks[1] is metrics_sink
+
+
+def test_standalone_metrics_sink_owns_http_server_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    import prometheus_client
+
+    server = SimpleNamespace(shutdown_calls=0, close_calls=0)
+    thread = SimpleNamespace(join_timeouts=[])
+
+    def shutdown() -> None:
+        server.shutdown_calls += 1
+
+    def server_close() -> None:
+        server.close_calls += 1
+
+    def join(timeout: int) -> None:
+        thread.join_timeouts.append(timeout)
+
+    server.shutdown = shutdown
+    server.server_close = server_close
+    thread.join = join
+
+    def fake_start_http_server(port: int, *, addr: str, registry: object) -> tuple[object, object]:
+        assert port == 9464
+        assert addr == "127.0.0.2"
+        assert registry is not None
+        return server, thread
+
+    monkeypatch.setattr(prometheus_client, "start_http_server", fake_start_http_server)
+
+    with cli._standalone_metrics_sink("127.0.0.2", 9464) as sink:
+        assert isinstance(sink, PrometheusObservationSink)
+
+    assert server.shutdown_calls == 1
+    assert server.close_calls == 1
+    assert thread.join_timeouts == [5]
+
+
+@pytest.mark.parametrize("value", ["0", "65536", "not-a-port"])
+def test_parse_port_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        cli._parse_port(value)
 
 
 @pytest.mark.parametrize(
