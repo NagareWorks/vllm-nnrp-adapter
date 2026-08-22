@@ -1041,6 +1041,71 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
 
 
 @pytest.mark.asyncio
+async def test_cancel_shutdown_race_emits_exactly_one_terminal_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=108,
+        frame_id=208,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=108),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_control_event(MessageType.CANCEL, operation_id=108, sequence=1),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    async def request_shutdown() -> None:
+        assert await asyncio.to_thread(backend.started.wait, 1)
+        stop_event.set()
+
+    shutdown_task = asyncio.create_task(request_shutdown())
+    try:
+        statistics = await serve(
+            OpenAiNnrpAdapter(backend),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=2,
+            ),
+            stop_event=stop_event,
+        )
+    finally:
+        await shutdown_task
+
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert backend.close_calls == 1
+    assert len(operation.terminal_results) + len(operation.result_drops) == 1
+    assert session.closed is True
+    assert server_context.exited is True
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] in {"cancelled", "dropped"}
+    assert observation["cancellation_kind"] in {"cancel", "server_shutdown"}
+
+
+@pytest.mark.asyncio
 async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1094,6 +1159,62 @@ async def test_peer_disconnect_stops_backend_without_sending_late_terminal(
     assert observation["terminal_outcome"] == "dropped"
     assert observation["cancellation_kind"] == "peer_disconnect"
     assert observation["cancellation_source"] == "client"
+
+
+@pytest.mark.asyncio
+async def test_native_server_restarts_after_clean_closure(monkeypatch: pytest.MonkeyPatch) -> None:
+    contexts: list[FakeServerContext] = []
+
+    def listen(
+        _options: NativeServerBootstrapOptions,
+        *,
+        transports: tuple[NativeTransportBinding, ...] | None = None,
+    ) -> FakeServerContext:
+        assert transports is None
+        return contexts.pop(0)
+
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", listen)
+
+    for operation_id in (109, 110):
+        stop_event = asyncio.Event()
+        operation = FakeOperation(
+            operation_id=operation_id,
+            frame_id=operation_id + 100,
+            body=_typed_profile_body(_chat_request(model=f"restart-{operation_id}")),
+            metadata=_submit_metadata(operation_id=operation_id),
+            terminal_results=[],
+            on_terminal=stop_event.set,
+        )
+        session = ScriptedEventSession(
+            [FakeServerEvent(submit=operation)],
+            operation=operation,
+            backend_started=threading.Event(),
+            stop_event=stop_event,
+        )
+        server_context = FakeServerContext(MultiSessionFakeServer([session]))
+        contexts.append(server_context)
+
+        statistics = await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=2,
+            ),
+            stop_event=stop_event,
+        )
+
+        assert statistics.accepted_sessions == 1
+        assert statistics.accepted_operations == 1
+        assert statistics.terminal_results == 1
+        assert len(operation.terminal_results) == 1
+        assert _decode_terminal_profile_body(*operation.terminal_results[0])["type"] == "response.completed"
+        assert session.closed is True
+        assert server_context.exited is True
+        assert contexts == []
 
 
 @pytest.mark.asyncio
