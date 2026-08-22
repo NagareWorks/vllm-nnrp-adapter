@@ -187,6 +187,7 @@ async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_versio
         endpoint="nnrp://wire-target.local/vllm",
         provider_routes=provider_routes,
         transports=tuple(load_native_transport_binding(name) for name in provider_routes),
+        accept_timeout_ms=1_000,
         max_active_sessions=1,
         max_operations_per_session=1,
         native_worker_count=2,

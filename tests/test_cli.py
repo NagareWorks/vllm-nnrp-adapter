@@ -142,6 +142,7 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         assert ipc_endpoint.startswith(("npipe://", "unix://"))
         assert config.transports is not None
         assert len(config.transports) == 3
+        assert config.accept_timeout_ms == 1_000
         on_ready(
             {
                 "tcp": SimpleNamespace(address="127.0.0.1:39123"),
