@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,7 +23,8 @@ def main() -> int:
     results = artifacts / "results.json"
     evidence = artifacts / "evidence"
     target_log = artifacts / "target.log"
-    for path in (target_manifest, plan, results, target_log):
+    observation_evidence = artifacts / "observations.jsonl"
+    for path in (target_manifest, plan, results, target_log, observation_evidence):
         path.unlink(missing_ok=True)
 
     environment = dict(os.environ)
@@ -34,6 +36,8 @@ def main() -> int:
         "serve-wire-target",
         "--ready-output",
         str(target_manifest),
+        "--observation-output",
+        str(observation_evidence),
     ]
     with target_log.open("w", encoding="utf-8") as log:
         target = subprocess.Popen(
@@ -76,6 +80,7 @@ def main() -> int:
             )
         finally:
             _stop_target(target)
+    _validate_observation_evidence(observation_evidence)
     return 0
 
 
@@ -118,6 +123,26 @@ def _stop_target(target: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         target.kill()
         target.wait(timeout=10)
+
+
+def _validate_observation_evidence(path: Path) -> None:
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    startup_records = [record for record in records if record.get("record_type") == "server_startup"]
+    operation_records = [record for record in records if record.get("record_type") == "operation"]
+    if len(startup_records) != 1:
+        raise RuntimeError(f"wire target emitted {len(startup_records)} startup observation records")
+    if len(operation_records) != 3:
+        raise RuntimeError(f"wire target emitted {len(operation_records)} operation observation records")
+    transports = {record.get("selected_transport") for record in operation_records}
+    if transports != {"tcp", "ipc", "websocket"}:
+        raise RuntimeError(f"wire observation transports do not match the exercised providers: {transports}")
+    for record in operation_records:
+        if record.get("terminal_outcome") != "completed":
+            raise RuntimeError("wire observation did not record a completed terminal outcome")
+        if not isinstance(record.get("operation_id"), int) or record["operation_id"] <= 0:
+            raise RuntimeError("wire observation did not preserve operation identity")
+        if not isinstance(record.get("stage_transitions"), list) or not record["stage_transitions"]:
+            raise RuntimeError("wire observation did not preserve the PROGRESS stage timeline")
 
 
 if __name__ == "__main__":

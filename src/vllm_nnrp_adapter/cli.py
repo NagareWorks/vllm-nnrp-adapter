@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,7 +20,13 @@ from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark_sync, run_comparison_benchmark_sync
 from .conformance import load_backend_async, run_conformance_plan_sync
 from .nnrp_runtime import NnrpServerConfig, _serve_with_ready, serve
-from .observability import ObservationSink, PrometheusObservationSink, StructuredLogObservationSink
+from .observability import (
+    ObservationSink,
+    OperationObservation,
+    PrometheusObservationSink,
+    ServerStartupObservation,
+    StructuredLogObservationSink,
+)
 
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
 _TRANSPORT_POLICIES = {policy.name.lower(): policy for policy in TransportPolicy}
@@ -124,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Serve the adapter as an external OpenAI-profile wire conformance target.",
     )
     wire_target.add_argument("--ready-output", type=Path, required=True)
+    wire_target.add_argument("--observation-output", type=Path)
     wire_target.add_argument("--backend", default="mock")
     wire_target.add_argument("--suite-version", default="0.1.0")
 
@@ -174,7 +182,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "serve-wire-target":
         try:
-            asyncio.run(_serve_wire_target(args.backend, args.ready_output, args.suite_version))
+            asyncio.run(
+                _serve_wire_target(
+                    args.backend,
+                    args.ready_output,
+                    args.suite_version,
+                    observation_output=args.observation_output,
+                )
+            )
         except KeyboardInterrupt:
             return 130
         return 0
@@ -230,9 +245,18 @@ async def _serve_backend(backend_spec: str, config: NnrpServerConfig) -> None:
     await serve(OpenAiNnrpAdapter(backend), config=config)
 
 
-async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_version: str) -> None:
+async def _serve_wire_target(
+    backend_spec: str,
+    ready_output: Path,
+    suite_version: str,
+    *,
+    observation_output: Path | None = None,
+) -> None:
     backend = await load_backend_async(backend_spec)
     provider_routes = _wire_target_provider_routes(ready_output)
+    observation_sinks: tuple[ObservationSink, ...] = (StructuredLogObservationSink(),)
+    if observation_output is not None:
+        observation_sinks += (_WireEvidenceSink(observation_output),)
     config = NnrpServerConfig(
         endpoint="nnrp://wire-target.local/vllm",
         provider_routes=provider_routes,
@@ -241,6 +265,7 @@ async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_versio
         max_active_sessions=1,
         max_operations_per_session=1,
         native_worker_count=2,
+        observation_sinks=observation_sinks,
     )
     ready = asyncio.get_running_loop().create_future()
 
@@ -291,6 +316,26 @@ async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_versio
         if not serve_task.done():
             serve_task.cancel()
             await asyncio.gather(serve_task, return_exceptions=True)
+
+
+class _WireEvidenceSink:
+    def __init__(self, path: Path) -> None:
+        self._path = path.resolve()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text("", encoding="utf-8")
+        self._lock = threading.Lock()
+
+    def observe_server_startup(self, observation: ServerStartupObservation) -> None:
+        self._append("server_startup", observation.to_log_fields())
+
+    def observe_operation(self, observation: OperationObservation) -> None:
+        self._append("operation", observation.to_log_fields())
+
+    def _append(self, record_type: str, fields: Mapping[str, object]) -> None:
+        record = {"record_type": record_type, **fields}
+        encoded = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        with self._lock, self._path.open("a", encoding="utf-8") as stream:
+            stream.write(encoded)
 
 
 def _wire_target_provider_routes(ready_output: Path) -> Mapping[str, NativeServerProviderRoute]:

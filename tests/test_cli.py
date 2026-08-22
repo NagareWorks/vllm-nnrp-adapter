@@ -212,6 +212,7 @@ async def test_serve_backend_loads_factory_and_enters_native_runtime(monkeypatch
 async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     backend = object()
     ready_output = tmp_path / "target.json"
+    observation_output = tmp_path / "observations.jsonl"
 
     async def fake_load_backend(spec: str) -> object:
         assert spec == "mock"
@@ -243,7 +244,12 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
     monkeypatch.setattr(cli, "load_backend_async", fake_load_backend)
     monkeypatch.setattr(cli, "_serve_with_ready", fake_serve_with_ready)
 
-    await cli._serve_wire_target("mock", ready_output, "0.1.0")
+    await cli._serve_wire_target(
+        "mock",
+        ready_output,
+        "0.1.0",
+        observation_output=observation_output,
+    )
 
     manifest = json.loads(ready_output.read_text(encoding="utf-8"))
     assert manifest["target_name"] == "vllm-nnrp-adapter"
@@ -259,6 +265,23 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         {"name": "websocket", "endpoint": "ws://127.0.0.1:39124/nnrp", "tls": False},
     ]
     assert manifest["wire_conformance"]["capabilities"] == ["profile.openai-compatible.level1.wire"]
+    evidence = [json.loads(line) for line in observation_output.read_text(encoding="utf-8").splitlines()]
+    assert evidence == []
+
+
+def test_wire_evidence_sink_writes_machine_readable_records(tmp_path: Path) -> None:
+    output = tmp_path / "wire" / "observations.jsonl"
+    sink = cli._WireEvidenceSink(output)
+    startup = SimpleNamespace(to_log_fields=lambda: {"transport_policy": "auto"})
+    operation = SimpleNamespace(to_log_fields=lambda: {"operation_id": 7, "terminal_outcome": "completed"})
+
+    sink.observe_server_startup(startup)  # type: ignore[arg-type]
+    sink.observe_operation(operation)  # type: ignore[arg-type]
+
+    assert [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] == [
+        {"record_type": "server_startup", "transport_policy": "auto"},
+        {"operation_id": 7, "record_type": "operation", "terminal_outcome": "completed"},
+    ]
 
 
 def test_wire_target_endpoint_requires_every_bound_provider() -> None:
