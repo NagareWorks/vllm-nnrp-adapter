@@ -127,6 +127,38 @@ The native role receives operation bodies directly. Ordered non-terminal profile
 `PARTIAL_RESULT`; exactly one `response.completed`, `response.error`, or `response.cancelled` event
 completes the operation through terminal `RESULT_PUSH`.
 
+## Observability
+
+The default server configuration writes immutable startup and terminal-operation records as
+structured JSON logs. To export metrics, install the optional dependency and register the adapter
+collector into the Prometheus registry already owned by the deployment:
+
+```bash
+python -m pip install "vllm-nnrp-adapter[prometheus]"
+```
+
+```python
+from prometheus_client import REGISTRY
+from vllm_nnrp_adapter import (
+    NnrpServerConfig,
+    PrometheusObservationSink,
+    StructuredLogObservationSink,
+)
+
+config = NnrpServerConfig(
+    endpoint="nnrp://runtime.example/vllm",
+    observation_sinks=(
+        StructuredLogObservationSink(),
+        PrometheusObservationSink(REGISTRY),
+    ),
+)
+```
+
+The adapter does not start an HTTP `/metrics` server. The host remains responsible for exposing its
+existing registry. Metric labels are restricted to bounded protocol/runtime categories; request
+identifiers, prompts, generated text, model ids, and arbitrary metadata never become labels. A sink
+failure is logged and isolated from request serving and from the remaining sinks.
+
 ## Conformance
 
 Run against the shared OpenAI API profile plan:

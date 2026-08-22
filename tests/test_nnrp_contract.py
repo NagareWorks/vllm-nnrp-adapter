@@ -22,11 +22,17 @@ EXPECTED_PUBLIC_API = {
     "NnrpServeStatistics",
     "NnrpServerConfig",
     "NnrpRuntimeContractError",
+    "ObservationSink",
+    "OperationIdentity",
+    "OperationObservation",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
     "OpenAiNnrpError",
     "OpenAiNnrpRequest",
     "ProfileEvent",
+    "PrometheusObservationSink",
+    "ServerStartupObservation",
+    "StructuredLogObservationSink",
     "VllmBackend",
     "build_cancelled_event",
     "build_diagnostics_event",
@@ -58,7 +64,8 @@ EXPECTED_ENTRYPOINT_SIGNATURES = {
     "transport_policy: 'TransportPolicy' = <TransportPolicy.AUTO: 0>, "
     "session_options: 'NativeServerSessionOptions' = <factory>, "
     "accept_timeout_ms: 'int' = 100, receive_timeout_ms: 'int' = 100, max_active_sessions: 'int' = 8, "
-    "max_operations_per_session: 'int' = 4, native_worker_count: 'int' = 9) -> None",
+    "max_operations_per_session: 'int' = 4, native_worker_count: 'int' = 9, "
+    "observation_sinks: 'Sequence[ObservationSink]' = <factory>) -> None",
     "VllmBackend": "(serving_chat: 'object', *, request_factory: 'object | None' = None, "
     "prefer_engine_direct: 'bool' = True) -> 'None'",
     "build_cancelled_event": "(reason: 'str' = 'client_cancelled') -> 'dict[str, Any]'",
@@ -228,6 +235,7 @@ def test_project_dependency_metadata_requires_preview4_without_native_payloads()
     assert "nnrp-py>=1.0.0rc4.post18,<1.0.0rc5" in dependencies
     assert all("rc3" not in dependency for dependency in dependencies)
     assert metadata["project"]["optional-dependencies"]["vllm"] == ["vllm>=0.18.0,<0.27"]
+    assert metadata["project"]["optional-dependencies"]["prometheus"] == ["prometheus-client>=0.21,<1"]
 
     native_suffixes = {".dll", ".dylib", ".so", ".wasm"}
     packaged_native_files = [

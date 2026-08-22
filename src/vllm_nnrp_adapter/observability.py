@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from nnrp import NativeRuntimeServerOperation, NativeTransportEndpoint  # type: ignore[import-untyped]
 from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
@@ -13,12 +13,49 @@ from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
 from .operation_state import OperationState
 from .runtime_control import RuntimeControlRequest
 
+if TYPE_CHECKING:
+    from prometheus_client.registry import CollectorRegistry
+
 _LOGGER = logging.getLogger("vllm_nnrp_adapter.operation")
 _SERVER_LOGGER = logging.getLogger("vllm_nnrp_adapter.server")
+_SINK_LOGGER = logging.getLogger("vllm_nnrp_adapter.observability")
+
+_KNOWN_TRANSPORTS = frozenset({"ipc", "quic", "tcp", "websocket"})
+_KNOWN_TRANSPORT_POLICIES = frozenset(
+    {
+        "auto",
+        "force_ipc",
+        "force_quic",
+        "force_tcp",
+        "force_websocket",
+        "prefer_ipc",
+        "prefer_quic",
+        "prefer_tcp",
+        "prefer_websocket",
+    }
+)
+_KNOWN_TERMINAL_OUTCOMES = frozenset({"cancelled", "completed", "dropped", "failed"})
+_KNOWN_CANCELLATION_KINDS = frozenset(
+    {"abort", "cancel", "deadline_expired", "peer_disconnect", "server_shutdown", "supersede"}
+)
+_KNOWN_DROP_REASONS = frozenset(
+    {
+        "backpressure",
+        "budget_exceeded",
+        "capability_mismatch",
+        "conformance_injection",
+        "deadline_expired",
+        "object_invalidated",
+        "peer_cancelled",
+        "superseded",
+        "transport_closed",
+    }
+)
+_KNOWN_PROFILE_OPERATIONS = {"chat.completions.create": "chat_completions_create"}
 
 
 @dataclass(frozen=True, slots=True)
-class _ServerStartupObservation:
+class ServerStartupObservation:
     application_endpoint: str
     transport_policy: str
     bound_provider_endpoints: tuple[tuple[str, str], ...]
@@ -30,7 +67,7 @@ class _ServerStartupObservation:
         application_endpoint: str,
         transport_policy: str,
         bound_provider_endpoints: Mapping[str, NativeTransportEndpoint],
-    ) -> _ServerStartupObservation:
+    ) -> ServerStartupObservation:
         return cls(
             application_endpoint=application_endpoint,
             transport_policy=transport_policy,
@@ -49,7 +86,7 @@ class _ServerStartupObservation:
 
 
 @dataclass(frozen=True, slots=True)
-class _OperationIdentity:
+class OperationIdentity:
     selected_transport: str
     session_id: int
     operation_id: int
@@ -61,8 +98,8 @@ class _OperationIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class _OperationObservation:
-    identity: _OperationIdentity
+class OperationObservation:
+    identity: OperationIdentity
     model_id: str | None
     profile_operation: str | None
     backend_family: str
@@ -121,7 +158,7 @@ class _OperationObservation:
 
 @dataclass(slots=True)
 class _OperationObservationTracker:
-    identity: _OperationIdentity
+    identity: OperationIdentity
     backend_family: str
     backend_binding: str | None
     vllm_version: str | None
@@ -163,7 +200,7 @@ class _OperationObservationTracker:
             raise TypeError("FRAME_SUBMIT observation requires FrameSubmitMetadata")
         header = submit.header
         return cls(
-            identity=_OperationIdentity(
+            identity=OperationIdentity(
                 selected_transport=selected_transport,
                 session_id=header.session_id,
                 operation_id=operation.operation_id,
@@ -224,12 +261,12 @@ class _OperationObservationTracker:
     def record_backend_abort(self, accepted: bool | None) -> None:
         self._backend_abort_accepted = accepted
 
-    def finish(self, terminal_state: OperationState) -> _OperationObservation:
+    def finish(self, terminal_state: OperationState) -> OperationObservation:
         if self._finished:
             raise RuntimeError(f"operation {self.identity.operation_id} observation already finished")
         self._finished = True
         terminal_ns = self._clock_ns()
-        return _OperationObservation(
+        return OperationObservation(
             identity=self.identity,
             model_id=self._model_id,
             profile_operation=self._profile_operation,
@@ -263,14 +300,169 @@ class _OperationObservationTracker:
         self._total_tokens = _optional_int(usage.get("total_tokens"))
 
 
-def _emit_operation_observation(observation: _OperationObservation) -> None:
-    fields = observation.to_log_fields()
-    _LOGGER.info("nnrp_operation_observation %s", json.dumps(fields, sort_keys=True, separators=(",", ":")))
+@runtime_checkable
+class ObservationSink(Protocol):
+    def observe_server_startup(self, observation: ServerStartupObservation) -> None: ...
+
+    def observe_operation(self, observation: OperationObservation) -> None: ...
 
 
-def _emit_server_startup_observation(observation: _ServerStartupObservation) -> None:
-    fields = observation.to_log_fields()
-    _SERVER_LOGGER.info("nnrp_server_startup %s", json.dumps(fields, sort_keys=True, separators=(",", ":")))
+class StructuredLogObservationSink:
+    def __init__(
+        self,
+        *,
+        operation_logger: logging.Logger = _LOGGER,
+        server_logger: logging.Logger = _SERVER_LOGGER,
+    ) -> None:
+        self._operation_logger = operation_logger
+        self._server_logger = server_logger
+
+    def observe_server_startup(self, observation: ServerStartupObservation) -> None:
+        self._server_logger.info(
+            "nnrp_server_startup %s",
+            json.dumps(observation.to_log_fields(), sort_keys=True, separators=(",", ":")),
+        )
+
+    def observe_operation(self, observation: OperationObservation) -> None:
+        self._operation_logger.info(
+            "nnrp_operation_observation %s",
+            json.dumps(observation.to_log_fields(), sort_keys=True, separators=(",", ":")),
+        )
+
+
+class PrometheusObservationSink:
+    """Export bounded adapter metrics into a caller-owned Prometheus registry."""
+
+    def __init__(self, registry: CollectorRegistry) -> None:
+        try:
+            from prometheus_client import Counter, Histogram
+        except ImportError as error:
+            raise RuntimeError(
+                "PrometheusObservationSink requires the 'prometheus' optional dependency"
+            ) from error
+
+        self._server_starts = Counter(
+            "vllm_nnrp_adapter_server_starts_total",
+            "NNRP adapter server provider bindings started.",
+            ("transport_policy", "provider"),
+            registry=registry,
+        )
+        self._operations = Counter(
+            "vllm_nnrp_adapter_operations_total",
+            "NNRP adapter operations reaching a terminal outcome.",
+            ("transport", "operation", "outcome"),
+            registry=registry,
+        )
+        self._latency = Histogram(
+            "vllm_nnrp_adapter_operation_latency_seconds",
+            "NNRP adapter operation stage latency.",
+            ("transport", "operation", "outcome", "stage"),
+            registry=registry,
+        )
+        self._output_events = Counter(
+            "vllm_nnrp_adapter_output_events_total",
+            "NNRP adapter output events.",
+            ("transport", "operation"),
+            registry=registry,
+        )
+        self._output_bytes = Counter(
+            "vllm_nnrp_adapter_output_bytes_total",
+            "NNRP adapter encoded output bytes.",
+            ("transport", "operation"),
+            registry=registry,
+        )
+        self._tokens = Counter(
+            "vllm_nnrp_adapter_tokens_total",
+            "NNRP adapter token usage reported by the backend.",
+            ("transport", "operation", "kind"),
+            registry=registry,
+        )
+        self._cancellations = Counter(
+            "vllm_nnrp_adapter_cancellations_total",
+            "NNRP adapter operation cancellations.",
+            ("transport", "kind"),
+            registry=registry,
+        )
+        self._drops = Counter(
+            "vllm_nnrp_adapter_result_drops_total",
+            "NNRP adapter result drops.",
+            ("transport", "reason"),
+            registry=registry,
+        )
+
+    def observe_server_startup(self, observation: ServerStartupObservation) -> None:
+        policy = _bounded_label(observation.transport_policy, _KNOWN_TRANSPORT_POLICIES)
+        for provider, _endpoint in observation.bound_provider_endpoints:
+            self._server_starts.labels(
+                transport_policy=policy,
+                provider=_bounded_transport(provider),
+            ).inc()
+
+    def observe_operation(self, observation: OperationObservation) -> None:
+        transport = _bounded_transport(observation.identity.selected_transport)
+        operation = _KNOWN_PROFILE_OPERATIONS.get(observation.profile_operation or "", "other")
+        outcome = _bounded_label(observation.terminal_outcome, _KNOWN_TERMINAL_OUTCOMES)
+        labels = {"transport": transport, "operation": operation, "outcome": outcome}
+
+        self._operations.labels(**labels).inc()
+        self._observe_latency(labels, "queue", observation.queue_delay_ms)
+        self._observe_latency(labels, "first_event", observation.first_event_latency_ms)
+        self._observe_latency(labels, "terminal", observation.terminal_latency_ms)
+        event_labels = {"transport": transport, "operation": operation}
+        self._output_events.labels(**event_labels).inc(observation.output_event_count)
+        self._output_bytes.labels(**event_labels).inc(observation.output_bytes)
+        for kind, value in (
+            ("prompt", observation.prompt_tokens),
+            ("completion", observation.completion_tokens),
+            ("total", observation.total_tokens),
+        ):
+            if value is not None:
+                self._tokens.labels(**event_labels, kind=kind).inc(value)
+        if observation.cancellation_kind is not None:
+            self._cancellations.labels(
+                transport=transport,
+                kind=_bounded_label(observation.cancellation_kind, _KNOWN_CANCELLATION_KINDS),
+            ).inc()
+        if observation.drop_reason is not None:
+            self._drops.labels(
+                transport=transport,
+                reason=_bounded_label(observation.drop_reason, _KNOWN_DROP_REASONS),
+            ).inc()
+
+    def _observe_latency(self, labels: Mapping[str, str], stage: str, value_ms: float | None) -> None:
+        if value_ms is not None:
+            self._latency.labels(**labels, stage=stage).observe(value_ms / 1_000)
+
+
+def _emit_operation_observation(
+    observation: OperationObservation,
+    sinks: Sequence[ObservationSink],
+) -> None:
+    for sink in sinks:
+        try:
+            sink.observe_operation(observation)
+        except Exception:
+            _SINK_LOGGER.exception("operation observation sink failed")
+
+
+def _emit_server_startup_observation(
+    observation: ServerStartupObservation,
+    sinks: Sequence[ObservationSink],
+) -> None:
+    for sink in sinks:
+        try:
+            sink.observe_server_startup(observation)
+        except Exception:
+            _SINK_LOGGER.exception("server startup observation sink failed")
+
+
+def _bounded_transport(value: str) -> str:
+    return _bounded_label(value, _KNOWN_TRANSPORTS)
+
+
+def _bounded_label(value: str, known_values: frozenset[str]) -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in known_values else "other"
 
 
 def _optional_int(value: object) -> int | None:

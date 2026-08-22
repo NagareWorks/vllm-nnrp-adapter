@@ -48,10 +48,12 @@ from nnrp.server import (  # type: ignore[import-untyped]
 from .adapter import OpenAiNnrpAdapter
 from .nnrp_contract import validate_nnrp_runtime_contract
 from .observability import (
+    ObservationSink,
+    ServerStartupObservation,
+    StructuredLogObservationSink,
     _emit_operation_observation,
     _emit_server_startup_observation,
     _OperationObservationTracker,
-    _ServerStartupObservation,
 )
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
@@ -82,6 +84,9 @@ class NnrpServerConfig:
     max_active_sessions: int = 8
     max_operations_per_session: int = 4
     native_worker_count: int = 9
+    observation_sinks: Sequence[ObservationSink] = field(
+        default_factory=lambda: (StructuredLogObservationSink(),)
+    )
 
     def __post_init__(self) -> None:
         if not self.endpoint.startswith(("nnrp://", "nnrps://")):
@@ -103,8 +108,12 @@ class NnrpServerConfig:
             raise TypeError("transports values must be NativeTransportBinding")
         if not isinstance(self.transport_policy, TransportPolicy):
             raise TypeError("transport_policy must be TransportPolicy")
+        observation_sinks = tuple(self.observation_sinks)
+        if any(not isinstance(sink, ObservationSink) for sink in observation_sinks):
+            raise TypeError("observation_sinks values must implement ObservationSink")
         object.__setattr__(self, "provider_routes", routes)
         object.__setattr__(self, "transports", transports)
+        object.__setattr__(self, "observation_sinks", observation_sinks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,11 +203,12 @@ async def _serve(
     try:
         server = await native.call(server_context.__enter__)
         _emit_server_startup_observation(
-            _ServerStartupObservation.from_bound_endpoints(
+            ServerStartupObservation.from_bound_endpoints(
                 application_endpoint=config.endpoint,
                 transport_policy=config.transport_policy.name.lower(),
                 bound_provider_endpoints=server.bound_provider_endpoints,
-            )
+            ),
+            config.observation_sinks,
         )
         if on_ready is not None:
             on_ready(server.bound_provider_endpoints)
@@ -317,6 +327,7 @@ async def _serve_session(
                     record=record,
                     control=control,
                     observation=observation,
+                    observation_sinks=config.observation_sinks,
                     counters=counters,
                 )
             )
@@ -357,6 +368,7 @@ async def _serve_operation(
     record: OperationRecord,
     control: OperationControlSlot,
     observation: _OperationObservationTracker,
+    observation_sinks: Sequence[ObservationSink],
     counters: _ServeCounters,
 ) -> None:
     result_sequence = 0
@@ -501,7 +513,7 @@ async def _serve_operation(
                 if record.is_terminal and not record.resources_released:
                     record.release_resources()
             finally:
-                _emit_operation_observation(observation.finish(record.state))
+                _emit_operation_observation(observation.finish(record.state), observation_sinks)
 
 
 async def _handle_runtime_control(

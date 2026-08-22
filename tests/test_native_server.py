@@ -571,6 +571,7 @@ async def test_terminal_send_cancellation_preserves_completed_operation_state() 
         record=record,
         control=control,
         observation=observation,
+        observation_sinks=(),
         counters=counters,
     )
 
@@ -594,6 +595,14 @@ def test_server_config_rejects_non_binding_transport_entries() -> None:
         NnrpServerConfig(
             endpoint="nnrp://runtime.local/vllm",
             transports=[object()],  # type: ignore[list-item]
+        )
+
+
+def test_server_config_rejects_invalid_observation_sink() -> None:
+    with pytest.raises(TypeError, match="observation_sinks values must implement ObservationSink"):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            observation_sinks=[object()],  # type: ignore[list-item]
         )
 
 

@@ -14,11 +14,11 @@
 
 ## Export Boundary
 
-- [ ] Expose an observation sink protocol and a structured-log sink.
-- [ ] Provide an optional Prometheus collector that registers into an existing registry.
-- [ ] Do not bind an HTTP `/metrics` server by default.
+- [x] Expose an observation sink protocol and a structured-log sink.
+- [x] Provide an optional Prometheus collector that registers into an existing registry.
+- [x] Do not bind an HTTP `/metrics` server by default.
 - [ ] Keep standalone metrics serving behind an explicit deployment command and port.
-- [ ] Use stable metric names and bounded labels; never put request ids, prompts, generated text, or
+- [x] Use stable metric names and bounded labels; never put request ids, prompts, generated text, or
   arbitrary model metadata in labels.
 - [ ] Keep diagnostic and metrics values consistent by deriving both from the same terminal record.
 
@@ -26,5 +26,5 @@
 
 - [x] Test successful, failed, cancelled, expired, superseded, dropped, and disconnected records.
 - [x] Test concurrent operations for identity isolation and one terminal observation each.
-- [ ] Test exporters with no vLLM or GPU dependency.
+- [x] Test exporters with no vLLM or GPU dependency.
 - [ ] Include observation evidence in wire E2E and GPU benchmark artifacts.

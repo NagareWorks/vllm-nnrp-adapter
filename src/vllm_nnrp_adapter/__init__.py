@@ -2,6 +2,14 @@ from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark
 from .nnrp_contract import NNRP_PY_REQUIRED_RANGE, NnrpRuntimeContractError, validate_nnrp_runtime_contract
 from .nnrp_runtime import NnrpServerConfig, NnrpServeStatistics, serve
+from .observability import (
+    ObservationSink,
+    OperationIdentity,
+    OperationObservation,
+    PrometheusObservationSink,
+    ServerStartupObservation,
+    StructuredLogObservationSink,
+)
 from .profile import (
     OPENAI_COMPATIBLE_PROFILE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -26,11 +34,17 @@ __all__ = [
     "NnrpServeStatistics",
     "NnrpServerConfig",
     "NnrpRuntimeContractError",
+    "ObservationSink",
+    "OperationIdentity",
+    "OperationObservation",
     "OpenAiNnrpAdapter",
     "OpenAiNnrpCapabilityDocument",
     "OpenAiNnrpError",
     "OpenAiNnrpRequest",
     "ProfileEvent",
+    "PrometheusObservationSink",
+    "ServerStartupObservation",
+    "StructuredLogObservationSink",
     "VllmBackend",
     "build_cancelled_event",
     "build_diagnostics_event",

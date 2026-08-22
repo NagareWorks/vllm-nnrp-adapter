@@ -27,7 +27,7 @@
   under `06-transport-provider-serving.md`.
 - [ ] Assign OpenAI envelope/event semantics to `profile.py` and `adapter.py` under
   `07-openai-profile-runtime.md`.
-- [ ] Add a dedicated observation/export module owned by `08-observability-and-exporters.md`.
+- [x] Add a dedicated observation/export module owned by `08-observability-and-exporters.md`.
 - [ ] Assign manifests, execution-plan handling, and E2E targets to
   `09-conformance-and-vllm-integration.md`.
 - [ ] Assign benchmark, workflow, README, and final export integration to

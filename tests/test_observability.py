@@ -17,12 +17,17 @@ from nnrp.runtime import (
     RuntimeFrameHeader,
     RuntimeRole,
 )
+from prometheus_client import CollectorRegistry, generate_latest
 
 from vllm_nnrp_adapter.observability import (
+    OperationIdentity,
+    OperationObservation,
+    PrometheusObservationSink,
+    ServerStartupObservation,
+    StructuredLogObservationSink,
     _emit_operation_observation,
     _emit_server_startup_observation,
     _OperationObservationTracker,
-    _ServerStartupObservation,
 )
 from vllm_nnrp_adapter.operation_state import OperationState
 from vllm_nnrp_adapter.runtime_control import RuntimeControlKind, RuntimeControlRequest
@@ -113,7 +118,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
         tracker.finish(OperationState.DROPPED)
 
     caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
-    _emit_operation_observation(observation)
+    _emit_operation_observation(observation, (StructuredLogObservationSink(),))
     payload = json.loads(caplog.records[-1].getMessage().removeprefix("nnrp_operation_observation "))
     assert payload["operation_id"] == 7
     assert payload["model_id"] == "test-model"
@@ -150,7 +155,7 @@ def test_operation_observation_keeps_unavailable_values_absent() -> None:
 def test_server_startup_observation_is_immutable_sorted_and_structured(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    observation = _ServerStartupObservation.from_bound_endpoints(
+    observation = ServerStartupObservation.from_bound_endpoints(
         application_endpoint="nnrp://runtime.local/vllm",
         transport_policy="auto",
         bound_provider_endpoints={
@@ -167,7 +172,7 @@ def test_server_startup_observation_is_immutable_sorted_and_structured(
         observation.transport_policy = "force_tcp"  # type: ignore[misc]
 
     caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.server")
-    _emit_server_startup_observation(observation)
+    _emit_server_startup_observation(observation, (StructuredLogObservationSink(),))
     payload = json.loads(caplog.records[-1].getMessage().removeprefix("nnrp_server_startup "))
     assert payload == {
         "application_endpoint": "nnrp://runtime.local/vllm",
@@ -178,6 +183,98 @@ def test_server_startup_observation_is_immutable_sorted_and_structured(
         "eligible_providers": ["ipc", "websocket"],
         "transport_policy": "auto",
     }
+
+
+def test_prometheus_sink_registers_bounded_metrics_in_existing_registry() -> None:
+    registry = CollectorRegistry()
+    sink = PrometheusObservationSink(registry)
+    sink.observe_server_startup(
+        ServerStartupObservation(
+            application_endpoint="nnrp://runtime.local/vllm",
+            transport_policy="auto",
+            bound_provider_endpoints=(("ipc", "unix:///tmp/nnrp.sock"),),
+        )
+    )
+    sink.observe_operation(_public_observation())
+
+    metrics = generate_latest(registry).decode("utf-8")
+    assert 'vllm_nnrp_adapter_server_starts_total{provider="ipc",transport_policy="auto"} 1.0' in metrics
+    assert (
+        'vllm_nnrp_adapter_operations_total{operation="chat_completions_create",outcome="completed",'
+        'transport="ipc"} 1.0'
+    ) in metrics
+    assert 'vllm_nnrp_adapter_output_events_total{operation="chat_completions_create",transport="ipc"} 2.0' in metrics
+    assert 'vllm_nnrp_adapter_output_bytes_total{operation="chat_completions_create",transport="ipc"} 40.0' in metrics
+    assert (
+        'vllm_nnrp_adapter_tokens_total{kind="total",operation="chat_completions_create",transport="ipc"} 6.0'
+        in metrics
+    )
+    assert "test-model" not in metrics
+    assert "trace_id" not in metrics
+    assert "operation_id" not in metrics
+
+
+def test_observation_sink_failure_isolated_from_following_sinks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    recorded: list[OperationObservation] = []
+
+    class FailingSink:
+        def observe_server_startup(self, observation: ServerStartupObservation) -> None:
+            raise RuntimeError(observation.application_endpoint)
+
+        def observe_operation(self, observation: OperationObservation) -> None:
+            raise RuntimeError(str(observation.identity.operation_id))
+
+    class RecordingSink:
+        def observe_server_startup(self, observation: ServerStartupObservation) -> None:
+            pass
+
+        def observe_operation(self, observation: OperationObservation) -> None:
+            recorded.append(observation)
+
+    observation = _public_observation()
+    caplog.set_level(logging.ERROR, logger="vllm_nnrp_adapter.observability")
+    _emit_operation_observation(observation, (FailingSink(), RecordingSink()))
+
+    assert recorded == [observation]
+    assert "operation observation sink failed" in caplog.records[-1].getMessage()
+
+
+def _public_observation() -> OperationObservation:
+    return OperationObservation(
+        identity=OperationIdentity(
+            selected_transport="ipc",
+            session_id=11,
+            operation_id=7,
+            frame_id=17,
+            route_id=27,
+            view_id=37,
+            trace_id=47,
+            profile_id=int(InputProfile.UNSPECIFIED),
+        ),
+        model_id="test-model",
+        profile_operation="chat.completions.create",
+        backend_family="VllmBackend",
+        backend_binding="current-0.26",
+        vllm_version="0.26.0",
+        queue_delay_ms=2.0,
+        first_event_latency_ms=5.0,
+        inter_event_latency_ms=(3.0,),
+        terminal_latency_ms=11.0,
+        output_event_count=2,
+        output_bytes=40,
+        prompt_tokens=4,
+        completion_tokens=2,
+        total_tokens=6,
+        error_family=None,
+        cancellation_kind=None,
+        cancellation_source=None,
+        cancellation_reason_code=None,
+        backend_abort_accepted=None,
+        drop_reason=None,
+        terminal_outcome="completed",
+    )
 
 
 def _operation() -> Any:

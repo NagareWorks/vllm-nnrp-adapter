@@ -51,6 +51,8 @@ explicit `HttpSseSmokeBackend` remains internal comparison tooling and is never 
 - `src/vllm_nnrp_adapter/vllm_compat.py`: named compatibility registry and startup validation.
 - `src/vllm_nnrp_adapter/http_sse_smoke.py`: explicit HTTP/SSE comparison backend outside production selection.
 - `src/vllm_nnrp_adapter/conformance.py`: OpenAI NNRP API conformance plan executor and result writer.
+- `src/vllm_nnrp_adapter/observability.py`: immutable observation records, structured logs, and
+  optional caller-owned Prometheus registry integration.
 - `conformance/openai-api-capabilities.json`: Level 1 capability declaration consumed by `nnrp-conformance`.
 - `tests/`: profile and adapter mapping tests that do not require a GPU runtime.
 - `doc/todo/v1-preview4/`: Preview4 implementation checklist for the adapter.
@@ -116,6 +118,10 @@ vllm-nnrp-adapter serve \
 The adapter does not implement carriers or package native provider artifacts. Installed `nnrp-py`
 transport distributions own TCP, QUIC, IPC, and WebSocket listeners; the adapter passes typed
 routes and policy to the native server role.
+
+Observability defaults to structured JSON logs. The optional `prometheus` extra exposes a collector
+that registers into an existing Prometheus registry; the adapter never binds a `/metrics` server by
+default. See [doc/usage.md](doc/usage.md#observability).
 
 ## Conformance Smoke
 
