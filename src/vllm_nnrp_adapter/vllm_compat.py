@@ -27,6 +27,7 @@ class VllmEngineDirectBinding:
     parser_accepts_model_config: bool
     parser_accepts_finished: bool
     honors_include_reasoning: bool
+    live_priority_method: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +61,7 @@ _LEGACY_ENGINE_DIRECT = VllmEngineDirectBinding(
     parser_accepts_model_config=False,
     parser_accepts_finished=False,
     honors_include_reasoning=False,
+    live_priority_method=None,
 )
 _TRANSITION_ENGINE_DIRECT = VllmEngineDirectBinding(
     required_serving_features=_ENGINE_DIRECT_FEATURES,
@@ -72,6 +74,7 @@ _TRANSITION_ENGINE_DIRECT = VllmEngineDirectBinding(
     parser_accepts_model_config=False,
     parser_accepts_finished=False,
     honors_include_reasoning=True,
+    live_priority_method=None,
 )
 _CURRENT_ENGINE_DIRECT = VllmEngineDirectBinding(
     required_serving_features=_ENGINE_DIRECT_FEATURES,
@@ -84,6 +87,7 @@ _CURRENT_ENGINE_DIRECT = VllmEngineDirectBinding(
     parser_accepts_model_config=True,
     parser_accepts_finished=True,
     honors_include_reasoning=True,
+    live_priority_method=None,
 )
 
 VLLM_COMPATIBILITY_BINDINGS = (

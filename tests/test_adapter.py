@@ -145,6 +145,7 @@ class FakeEngineClient:
     def __init__(self) -> None:
         self.aborted: list[str] = []
         self.last_generate_kwargs: dict[str, object] = {}
+        self.expected_priority = 0
 
     def generate(
         self,
@@ -155,7 +156,7 @@ class FakeEngineClient:
     ) -> AsyncIterator[FakeRequestOutput]:
         assert engine_prompt == {"prompt_token_ids": [1, 2, 3]}
         assert sampling_params == {"max_tokens": 16, "temperature": 0.2}
-        assert kwargs["priority"] == 0
+        assert kwargs["priority"] == self.expected_priority
         self.last_generate_kwargs = dict(kwargs)
 
         async def outputs() -> AsyncIterator[FakeRequestOutput]:
@@ -1295,6 +1296,42 @@ async def test_engine_direct_forwards_explicit_trace_headers_without_http_fallba
     assert isinstance(stream, EngineDirectChatStream)
     assert serving_chat.engine_client.last_generate_kwargs["trace_headers"] is trace_headers
     assert serving_chat.fallback_calls == 0
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_index", "module_name"),
+    (
+        (0, "vllm.entrypoints.utils"),
+        (1, "vllm.entrypoints.utils"),
+        (2, "vllm.entrypoints.serve.utils.api_utils"),
+    ),
+)
+async def test_engine_direct_applies_runtime_priority_without_openai_body_injection(
+    monkeypatch: pytest.MonkeyPatch,
+    binding_index: int,
+    module_name: str,
+) -> None:
+    binding = VLLM_COMPATIBILITY_BINDINGS[binding_index].engine_direct
+    helper_module, _calls = _module_with_versioned_get_max_tokens(
+        module_name,
+        supports_truncate=binding.supports_truncate_prompt_tokens,
+    )
+    monkeypatch.setitem(sys.modules, module_name, helper_module)
+    serving_chat = FakeDirectServingChat()
+    serving_chat.engine_client.expected_priority = -5
+    backend = VllmBackend(serving_chat, request_factory=FakeBoundRequestFactory(binding))
+    body = {"model": "llama", "stream": True}
+
+    stream = await backend.create_chat_completion_with_context(body, priority=-5)
+
+    assert isinstance(stream, EngineDirectChatStream)
+    assert serving_chat.engine_client.last_generate_kwargs["priority"] == -5
+    assert "priority" not in body
+    assert serving_chat.fallback_calls == 0
+    assert backend.supports_live_runtime_priority is False
+    assert await backend.update_runtime_priority("test", -7) is False
     await stream.aclose()
 
 

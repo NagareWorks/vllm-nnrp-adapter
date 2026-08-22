@@ -12,8 +12,8 @@
 
 ## Scheduling And Budgets
 
-- [ ] Apply `PRIORITY_UPDATE` before vLLM admission and through a supported live scheduler hook.
-- [ ] Return a typed recoverable error for a mandatory live reprioritization that the selected vLLM
+- [x] Apply `PRIORITY_UPDATE` before vLLM admission and through a supported live scheduler hook.
+- [x] Return a typed recoverable error for a mandatory live reprioritization that the selected vLLM
   binding cannot honor.
 - [ ] Apply `BUDGET_UPDATE` to token, compute, memory, and bandwidth limits without mutating the
   OpenAI request body after validation.

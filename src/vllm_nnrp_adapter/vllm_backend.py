@@ -45,6 +45,34 @@ class VllmBackend:
         binding = _engine_direct_binding(self._request_factory)
         return binding is not None and _serving_supports_tool_calls(self._serving_chat, binding)
 
+    @property
+    def supports_runtime_priority(self) -> bool:
+        return callable(self._request_factory)
+
+    @property
+    def supports_live_runtime_priority(self) -> bool:
+        binding = _engine_direct_binding(self._request_factory)
+        engine_client = _getattr_default(self._serving_chat, "engine_client", None)
+        return (
+            binding is not None
+            and binding.live_priority_method is not None
+            and callable(getattr(engine_client, binding.live_priority_method, None))
+        )
+
+    async def update_runtime_priority(self, request_id: str, priority: int) -> bool:
+        binding = _engine_direct_binding(self._request_factory)
+        method_name = None if binding is None else binding.live_priority_method
+        if method_name is None:
+            return False
+        engine_client = _getattr_default(self._serving_chat, "engine_client", None)
+        method = getattr(engine_client, method_name, None)
+        if not callable(method):
+            return False
+        result = method(request_id, priority)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, bool) else True
+
     def benchmark_metadata(self) -> Mapping[str, object]:
         model_config = _getattr_default(self._serving_chat, "model_config", None)
         engine_configuration = {
@@ -59,23 +87,40 @@ class VllmBackend:
         }
 
     async def create_chat_completion(self, body: Mapping[str, Any]) -> Any:
-        return await self._create_chat_completion(body, trace_headers=None)
+        return await self._create_chat_completion(body, trace_headers=None, priority=None)
 
     async def create_chat_completion_with_context(
         self,
         body: Mapping[str, Any],
         *,
-        trace_headers: Mapping[str, str],
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int | None = None,
     ) -> Any:
-        return await self._create_chat_completion(body, trace_headers=trace_headers)
+        return await self._create_chat_completion(
+            body,
+            trace_headers=trace_headers,
+            priority=priority,
+        )
 
     async def _create_chat_completion(
         self,
         body: Mapping[str, Any],
         *,
         trace_headers: Mapping[str, str] | None,
+        priority: int | None,
     ) -> Any:
         request = self._build_request(body)
+        if priority is not None:
+            if not callable(self._request_factory):
+                raise VllmProductionBoundaryError(
+                    "runtime priority requires a versioned vLLM request binding"
+                )
+            try:
+                _set_compat_attribute(request, "priority", priority)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise VllmProductionBoundaryError(
+                    "the selected vLLM request binding rejected runtime priority"
+                ) from error
         if body.get("stream", False):
             if not self._prefer_engine_direct:
                 raise VllmProductionBoundaryError("production streaming requires the engine-direct backend")

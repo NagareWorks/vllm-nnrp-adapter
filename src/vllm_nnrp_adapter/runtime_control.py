@@ -31,6 +31,8 @@ class RuntimeControlDisposition(StrEnum):
     STALE = "stale"
     UNKNOWN_OPERATION = "unknown_operation"
     TERMINAL_OPERATION = "terminal_operation"
+    LIVE_UPDATE_REQUIRED = "live_update_required"
+    UNSUPPORTED_LIVE_UPDATE = "unsupported_live_update"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +55,19 @@ class RuntimeDeadlineUpdate:
     flags: int
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimePriorityUpdate:
+    operation_id: int
+    control_sequence: int
+    priority_class: int
+    priority_delta: int
+    flags: int
+
+    @property
+    def backend_priority(self) -> int:
+        return self.priority_class + self.priority_delta
+
+
 @dataclass(slots=True)
 class OperationControlSlot:
     operation_id: int
@@ -60,6 +75,8 @@ class OperationControlSlot:
     last_control_sequence: int = 0
     terminal_request: RuntimeControlRequest | None = None
     deadline_update: RuntimeDeadlineUpdate | None = None
+    priority_update: RuntimePriorityUpdate | None = None
+    backend_dispatched: bool = False
     _deadline_task: asyncio.Task[None] | None = None
 
     def bind(self, task: asyncio.Task[None]) -> None:
@@ -120,6 +137,30 @@ class OperationControlSlot:
         await self._cancel_deadline()
         self._schedule_deadline()
         return RuntimeControlDisposition.APPLIED
+
+    def apply_priority(
+        self,
+        update: RuntimePriorityUpdate,
+        *,
+        terminal: bool,
+        backend_supported: bool = True,
+    ) -> RuntimeControlDisposition:
+        if update.control_sequence <= self.last_control_sequence:
+            return RuntimeControlDisposition.STALE
+        self.last_control_sequence = update.control_sequence
+        if terminal or self.terminal_request is not None:
+            return RuntimeControlDisposition.TERMINAL_OPERATION
+        if not backend_supported:
+            return RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE
+        self.priority_update = update
+        if self.backend_dispatched:
+            return RuntimeControlDisposition.LIVE_UPDATE_REQUIRED
+        return RuntimeControlDisposition.APPLIED
+
+    def begin_backend_dispatch(self) -> int | None:
+        self.backend_dispatched = True
+        update = self.priority_update
+        return None if update is None else update.backend_priority
 
     async def complete(self) -> None:
         await self._cancel_deadline()
@@ -192,6 +233,22 @@ class RuntimeControlRegistry:
             return RuntimeControlDisposition.STALE
         self._pending_deadlines[update.operation_id] = update
         return RuntimeControlDisposition.APPLIED
+
+    def apply_priority(
+        self,
+        update: RuntimePriorityUpdate,
+        *,
+        terminal: bool,
+        backend_supported: bool = True,
+    ) -> RuntimeControlDisposition:
+        slot = self._slots.get(update.operation_id)
+        if slot is None:
+            return RuntimeControlDisposition.UNKNOWN_OPERATION
+        return slot.apply_priority(
+            update,
+            terminal=terminal,
+            backend_supported=backend_supported,
+        )
 
     async def apply_supersede(
         self,
@@ -327,6 +384,23 @@ def decode_deadline_update(event: NativeRuntimeEvent) -> RuntimeDeadlineUpdate |
         operation_id=metadata.operation_id,
         control_sequence=metadata.control_sequence,
         deadline_unix_ms=metadata.deadline_unix_ms,
+        flags=metadata.flags,
+    )
+
+
+def decode_priority_update(event: NativeRuntimeEvent) -> RuntimePriorityUpdate | None:
+    if event.header.message_type is not MessageType.PRIORITY_UPDATE:
+        return None
+    metadata = event.metadata.value
+    if not isinstance(metadata, SchedulingMetadata):
+        raise TypeError("PRIORITY_UPDATE requires SchedulingMetadata")
+    if metadata.operation_id <= 0:
+        raise ValueError("PRIORITY_UPDATE requires a non-zero operation_id")
+    return RuntimePriorityUpdate(
+        operation_id=metadata.operation_id,
+        control_sequence=metadata.control_sequence,
+        priority_class=metadata.priority_class,
+        priority_delta=metadata.priority_delta,
         flags=metadata.flags,
     )
 

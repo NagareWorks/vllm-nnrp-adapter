@@ -19,6 +19,8 @@ from nnrp import (  # type: ignore[import-untyped]
     TransportPolicy,
 )
 from nnrp.core import (  # type: ignore[import-untyped]
+    ErrorCode,
+    ErrorScope,
     FrameSubmitMetadata,
     MessageType,
     ResultClass,
@@ -33,6 +35,7 @@ from nnrp.core import (  # type: ignore[import-untyped]
 from nnrp.runtime import (  # type: ignore[import-untyped]
     NativeRuntimeEvent,
     PartialResultMetadata,
+    RecoverableErrorMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
     RuntimeEventMetadataKind,
@@ -69,6 +72,7 @@ from .runtime_control import (
     RuntimeControlRequest,
     decode_deadline_update,
     decode_operation_control,
+    decode_priority_update,
 )
 
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "response.cancelled"})
@@ -310,6 +314,9 @@ async def _serve_session(
                         continue
                     await _handle_runtime_control(
                         runtime_event,
+                        adapter=adapter,
+                        session=session,
+                        native=native,
                         registry=registry,
                         controls=controls,
                         counters=counters,
@@ -481,6 +488,7 @@ async def _serve_operation(
                 backend_trace_headers_factory=(
                     None if backend_trace is None else backend_trace.begin_dispatch
                 ),
+                backend_priority_factory=control.begin_backend_dispatch,
             ):
                 body = _encode_event(event)
                 observation.record_event(event, body_bytes=len(body))
@@ -611,22 +619,35 @@ async def _serve_operation(
 async def _handle_runtime_control(
     event: NativeRuntimeEvent,
     *,
+    adapter: OpenAiNnrpAdapter,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
     registry: OperationRegistry,
     controls: RuntimeControlRegistry,
     counters: _ServeCounters,
 ) -> None:
     request = decode_operation_control(event)
     deadline = None if request is not None else decode_deadline_update(event)
-    if request is None and deadline is None:
+    priority = (
+        None
+        if request is not None or deadline is not None
+        else decode_priority_update(event)
+    )
+    if request is None and deadline is None and priority is None:
         return
     if request is not None:
         operation_id = request.operation_id
-    else:
+    elif deadline is not None:
         assert deadline is not None
         operation_id = deadline.operation_id
+    else:
+        assert priority is not None
+        operation_id = priority.operation_id
     try:
-        terminal = registry.get(operation_id).is_terminal
+        operation_record = registry.get(operation_id)
+        terminal = operation_record.is_terminal
     except OperationStateError:
+        operation_record = None
         terminal = False
     if request is not None:
         if request.kind is RuntimeControlKind.SUPERSEDE:
@@ -641,13 +662,63 @@ async def _handle_runtime_control(
             )
         else:
             disposition = await controls.apply(request, terminal=terminal)
-    else:
+    elif deadline is not None:
         assert deadline is not None
         disposition = await controls.apply_deadline(deadline, terminal=terminal)
+    else:
+        assert priority is not None
+        disposition = controls.apply_priority(
+            priority,
+            terminal=terminal,
+            backend_supported=adapter._supports_runtime_priority(),
+        )
+        if disposition is RuntimeControlDisposition.LIVE_UPDATE_REQUIRED:
+            live_update_accepted = (
+                operation_record is not None
+                and await adapter._update_runtime_priority(
+                    operation_record.backend_request_id,
+                    priority.backend_priority,
+                )
+            )
+            disposition = (
+                RuntimeControlDisposition.APPLIED
+                if live_update_accepted
+                else RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE
+            )
+        if disposition is RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE:
+            await _send_unsupported_priority_update(
+                event,
+                operation_id=operation_id,
+                session=session,
+                native=native,
+            )
     if disposition is RuntimeControlDisposition.APPLIED:
         counters.applied_control_events += 1
     else:
         counters.rejected_control_events += 1
+
+
+async def _send_unsupported_priority_update(
+    event: NativeRuntimeEvent,
+    *,
+    operation_id: int,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
+) -> None:
+    diagnostic = b"live_priority_update_unsupported"
+    metadata = RecoverableErrorMetadata(
+        error_code=ErrorCode.UNSUPPORTED_CAPABILITY,
+        error_scope=ErrorScope.FRAME,
+        recovery_action=0,
+        source_role=RuntimeRole.RUNTIME,
+        flags=0,
+        retry_after_ms=0,
+        related_session_id=event.header.session_id,
+        related_frame_id=operation_id & 0xFFFF_FFFF,
+        related_view_id=event.header.view_id,
+        diagnostic_bytes=len(diagnostic),
+    )
+    await native.call(session.send_recoverable_error, metadata, diagnostic)
 
 
 async def _send_cancelled_outcome(

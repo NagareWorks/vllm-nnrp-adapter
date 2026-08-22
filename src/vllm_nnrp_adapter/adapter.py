@@ -37,13 +37,26 @@ class ChatCompletionBackend(Protocol):
 
 
 @runtime_checkable
-class _TraceAwareChatCompletionBackend(Protocol):
+class _RuntimeContextAwareChatCompletionBackend(Protocol):
     def create_chat_completion_with_context(
         self,
         body: Mapping[str, Any],
         *,
-        trace_headers: Mapping[str, str],
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int | None = None,
     ) -> ChatCompletionResult | Awaitable[ChatCompletionResult]:
+        pass
+
+
+@runtime_checkable
+class _LivePriorityChatCompletionBackend(Protocol):
+    supports_live_runtime_priority: bool
+
+    def update_runtime_priority(
+        self,
+        request_id: str,
+        priority: int,
+    ) -> bool | Awaitable[bool]:
         pass
 
 
@@ -64,6 +77,24 @@ class OpenAiNnrpAdapter:
             _optional_string_attribute(self._backend, "vllm_version"),
         )
 
+    def _supports_runtime_priority(self) -> bool:
+        return (
+            getattr(self._backend, "supports_runtime_priority", False) is True
+            and isinstance(self._backend, _RuntimeContextAwareChatCompletionBackend)
+        )
+
+    async def _update_runtime_priority(self, request_id: str, priority: int) -> bool:
+        backend = self._backend
+        if (
+            not isinstance(backend, _LivePriorityChatCompletionBackend)
+            or backend.supports_live_runtime_priority is not True
+        ):
+            return False
+        result = backend.update_runtime_priority(request_id, priority)
+        if inspect.isawaitable(result):
+            result = await result
+        return result is True
+
     async def handle_request(self, request: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
         async for event in self._handle_native_request(request):
             yield event
@@ -74,6 +105,7 @@ class OpenAiNnrpAdapter:
         *,
         backend_abort_observer: Callable[[bool | None], None] | None = None,
         backend_trace_headers_factory: Callable[[], Mapping[str, str] | None] | None = None,
+        backend_priority_factory: Callable[[], int | None] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             envelope = validate_request(request, self.capabilities)
@@ -102,10 +134,32 @@ class OpenAiNnrpAdapter:
             backend_trace_headers = (
                 None if backend_trace_headers_factory is None else backend_trace_headers_factory()
             )
-            if backend_trace_headers is not None and isinstance(self._backend, _TraceAwareChatCompletionBackend):
-                result = self._backend.create_chat_completion_with_context(
-                    backend_body,
-                    trace_headers=backend_trace_headers,
+            backend_priority = None if backend_priority_factory is None else backend_priority_factory()
+            if (
+                backend_trace_headers is not None or backend_priority is not None
+            ) and isinstance(self._backend, _RuntimeContextAwareChatCompletionBackend):
+                context_backend = self._backend
+                if backend_trace_headers is not None and backend_priority is not None:
+                    result = context_backend.create_chat_completion_with_context(
+                        backend_body,
+                        trace_headers=backend_trace_headers,
+                        priority=backend_priority,
+                    )
+                elif backend_trace_headers is not None:
+                    result = context_backend.create_chat_completion_with_context(
+                        backend_body,
+                        trace_headers=backend_trace_headers,
+                    )
+                else:
+                    result = context_backend.create_chat_completion_with_context(
+                        backend_body,
+                        priority=backend_priority,
+                    )
+            elif backend_priority is not None:
+                raise OpenAiNnrpError(
+                    "server_error",
+                    "runtime_priority_unsupported",
+                    "The selected backend cannot apply NNRP runtime priority before admission.",
                 )
             else:
                 result = self._backend.create_chat_completion(backend_body)

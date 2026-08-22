@@ -26,6 +26,8 @@ from nnrp import (
     TransportId,
 )
 from nnrp.core import (
+    ErrorCode,
+    ErrorScope,
     FrameSubmitMetadata,
     InputProfile,
     MessageType,
@@ -45,6 +47,7 @@ from nnrp.runtime import (
     NativeRuntimeEvent,
     PartialResultMetadata,
     ProgressMetadata,
+    RecoverableErrorMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
     RuntimeEventMetadata,
@@ -71,7 +74,13 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _w3c_trace_headers,
 )
 from vllm_nnrp_adapter.operation_state import OperationRegistry, OperationState
-from vllm_nnrp_adapter.runtime_control import OperationControlSlot, RuntimeControlKind, RuntimeControlRequest
+from vllm_nnrp_adapter.runtime_control import (
+    OperationControlSlot,
+    RuntimeControlDisposition,
+    RuntimeControlKind,
+    RuntimeControlRequest,
+    RuntimePriorityUpdate,
+)
 
 
 class StreamingBackend:
@@ -109,6 +118,31 @@ class TraceAwareStreamingBackend:
 
         async def events() -> AsyncIterator[Mapping[str, Any]]:
             yield {"choices": [{"index": 0, "delta": {"content": "traced"}}]}
+
+        return events()
+
+
+class PriorityAwareStreamingBackend:
+    supports_runtime_priority = True
+
+    def __init__(self) -> None:
+        self.requests: list[Mapping[str, Any]] = []
+        self.priorities: list[int] = []
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        raise AssertionError("priority-aware backend must receive the explicit context call")
+
+    def create_chat_completion_with_context(
+        self,
+        body: Mapping[str, Any],
+        *,
+        priority: int,
+    ) -> object:
+        self.requests.append(body)
+        self.priorities.append(priority)
+
+        async def events() -> AsyncIterator[Mapping[str, Any]]:
+            yield {"choices": [{"index": 0, "delta": {"content": "prioritized"}}]}
 
         return events()
 
@@ -159,6 +193,29 @@ class CancellableBackend:
 
     def _record_close(self) -> None:
         self.close_calls += 1
+
+
+class LivePriorityCancellableBackend(CancellableBackend):
+    supports_runtime_priority = True
+    supports_live_runtime_priority = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.priority_updates: list[tuple[str, int]] = []
+
+    def create_chat_completion_with_context(
+        self,
+        body: Mapping[str, Any],
+        *,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int | None = None,
+    ) -> object:
+        del trace_headers, priority
+        return self.create_chat_completion(body)
+
+    async def update_runtime_priority(self, request_id: str, priority: int) -> bool:
+        self.priority_updates.append((request_id, priority))
+        return True
 
 
 class AcceptedCloseStream:
@@ -350,6 +407,7 @@ class ScriptedEventSession:
         self._stop_event = stop_event
         self._loop = asyncio.get_running_loop()
         self._stop_after_last_event = stop_after_last_event
+        self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -366,6 +424,13 @@ class ScriptedEventSession:
 
     def close(self) -> None:
         self.closed = True
+
+    def send_recoverable_error(
+        self,
+        metadata: RecoverableErrorMetadata,
+        diagnostic: bytes = b"",
+    ) -> None:
+        self.recoverable_errors.append((metadata, diagnostic))
 
 
 class FakeServer:
@@ -613,6 +678,51 @@ async def test_terminal_send_cancellation_preserves_completed_operation_state() 
     assert record.state is OperationState.COMPLETED
     assert record.resources_released is True
     assert counters.terminal_results == 0
+
+
+@pytest.mark.asyncio
+async def test_priority_update_reaches_backend_admission_without_request_body_pollution() -> None:
+    operation = FakeOperation(
+        operation_id=76,
+        frame_id=26,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=76),
+        terminal_results=[],
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-76")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    assert (
+        control.apply_priority(
+            RuntimePriorityUpdate(operation.operation_id, 1, 2, -5, 0),
+            terminal=False,
+        )
+        is RuntimeControlDisposition.APPLIED
+    )
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        backend_family="PriorityAwareStreamingBackend",
+        backend_binding=None,
+        vllm_version=None,
+    )
+    backend = PriorityAwareStreamingBackend()
+
+    await _serve_operation(
+        OpenAiNnrpAdapter(backend),
+        operation,
+        record=record,
+        control=control,
+        observation=observation,
+        observation_sinks=(),
+        counters=_ServeCounters(),
+    )
+
+    assert backend.priorities == [-3]
+    assert len(backend.requests) == 1
+    assert "priority" not in backend.requests[0]
+    assert _decode_terminal_profile_body(*operation.terminal_results[0])["type"] == "response.completed"
 
 
 def _trace_context_event(
@@ -1276,6 +1386,121 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
 
 
 @pytest.mark.asyncio
+async def test_live_priority_update_returns_typed_recoverable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=109,
+        frame_id=209,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=109),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_priority_event(
+                    operation_id=109,
+                    sequence=1,
+                    priority_class=0,
+                    priority_delta=-4,
+                ),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+        stop_after_last_event=True,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+            observation_sinks=(),
+        ),
+        stop_event=stop_event,
+    )
+
+    assert len(session.recoverable_errors) == 1
+    metadata, diagnostic = session.recoverable_errors[0]
+    assert metadata.error_code is ErrorCode.UNSUPPORTED_CAPABILITY
+    assert metadata.error_scope is ErrorScope.FRAME
+    assert metadata.related_session_id == 1
+    assert metadata.related_frame_id == 109
+    assert diagnostic == b"live_priority_update_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_live_priority_update_uses_explicit_backend_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = LivePriorityCancellableBackend()
+    operation = FakeOperation(
+        operation_id=110,
+        frame_id=210,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=110),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_priority_event(
+                    operation_id=110,
+                    sequence=1,
+                    priority_class=1,
+                    priority_delta=-5,
+                ),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+        stop_after_last_event=True,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+            observation_sinks=(),
+        ),
+        stop_event=stop_event,
+    )
+
+    assert backend.priority_updates == [("nnrp-110-210", -4)]
+    assert session.recoverable_errors == []
+
+
+@pytest.mark.asyncio
 async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cannot_be_delivered(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1774,6 +1999,28 @@ def _deadline_event(
     )
     return NativeRuntimeEvent(
         RuntimeFrameHeader(message_type=message_type, session_id=1),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
+        RuntimeEventTail.none(),
+    )
+
+
+def _priority_event(
+    *,
+    operation_id: int,
+    sequence: int,
+    priority_class: int,
+    priority_delta: int,
+) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=operation_id,
+        control_sequence=sequence,
+        priority_class=priority_class,
+        priority_delta=priority_delta,
+        deadline_unix_ms=0,
+        flags=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.PRIORITY_UPDATE, session_id=1),
         RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
         RuntimeEventTail.none(),
     )

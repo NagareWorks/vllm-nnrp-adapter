@@ -24,8 +24,10 @@ from vllm_nnrp_adapter.runtime_control import (
     RuntimeControlRegistry,
     RuntimeControlRequest,
     RuntimeDeadlineUpdate,
+    RuntimePriorityUpdate,
     decode_deadline_update,
     decode_operation_control,
+    decode_priority_update,
 )
 
 
@@ -107,6 +109,61 @@ def test_decode_deadline_update_rejects_wrong_metadata_and_zero_values() -> None
         decode_deadline_update(_deadline_event(MessageType.DEADLINE, operation_id=0, sequence=1))
     with pytest.raises(ValueError, match="non-zero deadline_unix_ms"):
         decode_deadline_update(_deadline_event(MessageType.DEADLINE, operation_id=1, sequence=1, deadline_unix_ms=0))
+
+
+def test_decode_priority_update_preserves_frozen_metadata() -> None:
+    update = decode_priority_update(
+        _priority_event(operation_id=9, sequence=12, priority_class=2, priority_delta=-5)
+    )
+
+    assert update == RuntimePriorityUpdate(
+        operation_id=9,
+        control_sequence=12,
+        priority_class=2,
+        priority_delta=-5,
+        flags=3,
+    )
+    assert update.backend_priority == -3
+    assert decode_priority_update(_runtime_event(MessageType.PROGRESS)) is None
+
+
+def test_decode_priority_update_rejects_wrong_metadata_and_session_scope() -> None:
+    with pytest.raises(TypeError, match="PRIORITY_UPDATE requires SchedulingMetadata"):
+        decode_priority_update(_runtime_event(MessageType.PRIORITY_UPDATE))
+    with pytest.raises(ValueError, match="non-zero operation_id"):
+        decode_priority_update(
+            _priority_event(operation_id=0, sequence=1, priority_class=1, priority_delta=0)
+        )
+
+
+def test_control_slot_applies_priority_before_dispatch_and_rejects_live_update() -> None:
+    slot = OperationControlSlot(10)
+    initial = RuntimePriorityUpdate(10, 1, 2, -4, 0)
+
+    assert slot.apply_priority(initial, terminal=False) is RuntimeControlDisposition.APPLIED
+    assert slot.begin_backend_dispatch() == -2
+
+    live = RuntimePriorityUpdate(10, 2, 0, -8, 0)
+    assert (
+        slot.apply_priority(live, terminal=False)
+        is RuntimeControlDisposition.LIVE_UPDATE_REQUIRED
+    )
+    assert slot.apply_priority(live, terminal=False) is RuntimeControlDisposition.STALE
+
+
+def test_control_slot_consumes_unsupported_backend_priority_sequence() -> None:
+    slot = OperationControlSlot(11)
+    update = RuntimePriorityUpdate(11, 3, 1, 0, 0)
+
+    assert (
+        slot.apply_priority(update, terminal=False, backend_supported=False)
+        is RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE
+    )
+    assert (
+        slot.apply_priority(update, terminal=False, backend_supported=False)
+        is RuntimeControlDisposition.STALE
+    )
+    assert slot.priority_update is None
 
 
 @pytest.mark.asyncio
@@ -361,6 +418,28 @@ def _deadline_event(
     )
     return NativeRuntimeEvent(
         RuntimeFrameHeader(message_type=message_type),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
+        RuntimeEventTail.none(),
+    )
+
+
+def _priority_event(
+    *,
+    operation_id: int,
+    sequence: int,
+    priority_class: int,
+    priority_delta: int,
+) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=operation_id,
+        control_sequence=sequence,
+        priority_class=priority_class,
+        priority_delta=priority_delta,
+        deadline_unix_ms=0,
+        flags=3,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.PRIORITY_UPDATE, session_id=1),
         RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
         RuntimeEventTail.none(),
     )
