@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -181,20 +182,21 @@ async def _serve_backend(backend_spec: str, config: NnrpServerConfig) -> None:
 
 async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_version: str) -> None:
     backend = await load_backend_async(backend_spec)
+    provider_routes = _wire_target_provider_routes(ready_output)
     config = NnrpServerConfig(
         endpoint="nnrp://wire-target.local/vllm",
-        provider_routes={"tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0")},
-        transports=(load_native_transport_binding("tcp"),),
+        provider_routes=provider_routes,
+        transports=tuple(load_native_transport_binding(name) for name in provider_routes),
         max_active_sessions=1,
         max_operations_per_session=1,
         native_worker_count=2,
     )
+    ready = asyncio.get_running_loop().create_future()
 
     def publish_ready(bound_endpoints: Mapping[str, object]) -> None:
-        endpoint = bound_endpoints.get("tcp")
-        address = getattr(endpoint, "address", None)
-        if not isinstance(address, str) or not address:
-            raise RuntimeError("wire target did not expose its bound TCP endpoint")
+        tcp = _wire_target_endpoint(bound_endpoints, "tcp", attribute="address")
+        ipc = _wire_target_endpoint(bound_endpoints, "ipc", attribute="uri")
+        websocket = _wire_target_endpoint(bound_endpoints, "websocket", attribute="uri")
         document = {
             "$schema": "https://github.com/NagareWorks/nnrp-conformance/schemas/wire-conformance-target.schema.json",
             "target_name": "vllm-nnrp-adapter",
@@ -202,7 +204,11 @@ async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_versio
             "suite_version": suite_version,
             "wire_conformance": {
                 "modes": ["suite_as_client"],
-                "transports": [{"name": "tcp", "endpoint": address, "tls": False}],
+                "transports": [
+                    {"name": "tcp", "endpoint": tcp, "tls": False},
+                    {"name": "ipc", "endpoint": ipc, "tls": False},
+                    {"name": "websocket", "endpoint": websocket, "tls": False},
+                ],
                 "host_route_providers": [],
                 "capabilities": ["profile.openai-compatible.level1.wire"],
                 "limits": {"max_frame_bytes": 67_108_864, "max_in_flight": 1},
@@ -213,11 +219,48 @@ async def _serve_wire_target(backend_spec: str, ready_output: Path, suite_versio
         temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         temporary.replace(ready_output)
 
-    await _serve_with_ready(
-        OpenAiNnrpAdapter(backend),
-        config=config,
-        on_ready=publish_ready,
+    def capture_ready(bound_endpoints: Mapping[str, object]) -> None:
+        if ready.done():
+            raise RuntimeError("wire target readiness was published more than once")
+        ready.set_result(dict(bound_endpoints))
+
+    serve_task = asyncio.create_task(
+        _serve_with_ready(
+            OpenAiNnrpAdapter(backend),
+            config=config,
+            on_ready=capture_ready,
+        )
     )
+    try:
+        await asyncio.wait((serve_task, ready), return_when=asyncio.FIRST_COMPLETED)
+        if ready.done():
+            publish_ready(ready.result())
+        await serve_task
+    finally:
+        if not serve_task.done():
+            serve_task.cancel()
+            await asyncio.gather(serve_task, return_exceptions=True)
+
+
+def _wire_target_provider_routes(ready_output: Path) -> Mapping[str, NativeServerProviderRoute]:
+    if os.name == "nt":
+        ipc_endpoint = f"npipe://nnrp-vllm-wire-{os.getpid()}"
+    else:
+        socket_path = (ready_output.parent.resolve() / "nnrp-vllm-wire.sock").as_posix()
+        ipc_endpoint = f"unix://{socket_path}"
+    return {
+        "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
+        "ipc": NativeServerProviderRoute(provider_endpoint=ipc_endpoint),
+        "websocket": NativeServerProviderRoute(provider_endpoint="ws://127.0.0.1:0/nnrp"),
+    }
+
+
+def _wire_target_endpoint(bound_endpoints: Mapping[str, object], name: str, *, attribute: str) -> str:
+    endpoint = bound_endpoints.get(name)
+    value = getattr(endpoint, attribute, None)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"wire target did not expose its bound {name} endpoint")
+    return value
 
 
 def _provider_routes(

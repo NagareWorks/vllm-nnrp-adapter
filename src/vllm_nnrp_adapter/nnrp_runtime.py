@@ -406,6 +406,13 @@ async def _serve_operation(
                 counters.partial_results += 1
         except asyncio.CancelledError:
             control_request = control.terminal_request
+            if record.is_terminal:
+                if control_request is not None:
+                    observation.record_control(
+                        control_request,
+                        drop_reason=ResultDropReasonCode.TRANSPORT_CLOSED,
+                    )
+                return
             if control_request is None:
                 if not record.is_terminal:
                     record.terminate(OperationState.CANCELLED)

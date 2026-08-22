@@ -59,6 +59,9 @@ from nnrp.runtime import (
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
+from vllm_nnrp_adapter.nnrp_runtime import _OperationObservationTracker, _serve_operation, _ServeCounters
+from vllm_nnrp_adapter.operation_state import OperationRegistry, OperationState
+from vllm_nnrp_adapter.runtime_control import OperationControlSlot, RuntimeControlKind, RuntimeControlRequest
 
 
 class StreamingBackend:
@@ -187,6 +190,7 @@ class FakeOperation:
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
     on_terminal: Callable[[], None] | None = None
     fail_next_terminal_result: bool = False
+    cancel_next_terminal_result: bool = False
 
     def __post_init__(self, body: bytes, metadata: FrameSubmitMetadata) -> None:
         self.submit = NativeRuntimeEvent(
@@ -203,6 +207,9 @@ class FakeOperation:
         )
 
     async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
+        if self.cancel_next_terminal_result:
+            self.cancel_next_terminal_result = False
+            raise asyncio.CancelledError
         if self.fail_next_terminal_result:
             self.fail_next_terminal_result = False
             raise OSError("terminal profile result unavailable")
@@ -524,6 +531,52 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert operation.native_thread_ids
     assert threading.get_ident() not in operation.native_thread_ids
     assert backend.requests[0]["request_id"] == "nnrp-71-19"
+
+
+@pytest.mark.asyncio
+async def test_terminal_send_cancellation_preserves_completed_operation_state() -> None:
+    operation = FakeOperation(
+        operation_id=72,
+        frame_id=20,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=72),
+        terminal_results=[],
+        cancel_next_terminal_result=True,
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-72")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    control.terminal_request = RuntimeControlRequest(
+        kind=RuntimeControlKind.PEER_DISCONNECT,
+        operation_id=operation.operation_id,
+        control_sequence=1,
+        reason_code=0,
+        source_role=RuntimeRole.CLIENT,
+        flags=0,
+        diagnostic=b"peer_disconnect",
+    )
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="tcp",
+        backend_family="StreamingBackend",
+        backend_binding=None,
+        vllm_version=None,
+    )
+    counters = _ServeCounters()
+
+    await _serve_operation(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        operation,
+        record=record,
+        control=control,
+        observation=observation,
+        counters=counters,
+    )
+
+    assert record.state is OperationState.COMPLETED
+    assert record.resources_released is True
+    assert counters.terminal_results == 0
 
 
 @pytest.mark.parametrize("endpoint", ["tcp://127.0.0.1:7766", "unix:///tmp/nnrp.sock", "ws://host/nnrp"])

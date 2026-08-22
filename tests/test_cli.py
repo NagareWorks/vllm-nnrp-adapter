@@ -120,7 +120,7 @@ async def test_serve_backend_loads_factory_and_enters_native_runtime(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_wire_target_publishes_bound_tcp_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     backend = object()
     ready_output = tmp_path / "target.json"
 
@@ -137,7 +137,18 @@ async def test_wire_target_publishes_bound_tcp_manifest(monkeypatch: pytest.Monk
         assert adapter._backend is backend
         assert config.endpoint == "nnrp://wire-target.local/vllm"
         assert config.provider_routes["tcp"].provider_endpoint == "tcp://127.0.0.1:0"
-        on_ready({"tcp": SimpleNamespace(address="127.0.0.1:39123")})
+        assert config.provider_routes["websocket"].provider_endpoint == "ws://127.0.0.1:0/nnrp"
+        ipc_endpoint = config.provider_routes["ipc"].provider_endpoint
+        assert ipc_endpoint.startswith(("npipe://", "unix://"))
+        assert config.transports is not None
+        assert len(config.transports) == 3
+        on_ready(
+            {
+                "tcp": SimpleNamespace(address="127.0.0.1:39123"),
+                "ipc": SimpleNamespace(uri=ipc_endpoint),
+                "websocket": SimpleNamespace(uri="ws://127.0.0.1:39124/nnrp"),
+            }
+        )
 
     monkeypatch.setattr(cli, "load_backend_async", fake_load_backend)
     monkeypatch.setattr(cli, "_serve_with_ready", fake_serve_with_ready)
@@ -149,6 +160,17 @@ async def test_wire_target_publishes_bound_tcp_manifest(monkeypatch: pytest.Monk
     assert manifest["protocol_version"] == "nnrp-1-preview4"
     assert manifest["suite_version"] == "0.1.0"
     assert manifest["wire_conformance"]["transports"] == [
-        {"name": "tcp", "endpoint": "127.0.0.1:39123", "tls": False}
+        {"name": "tcp", "endpoint": "127.0.0.1:39123", "tls": False},
+        {
+            "name": "ipc",
+            "endpoint": cli._wire_target_provider_routes(ready_output)["ipc"].provider_endpoint,
+            "tls": False,
+        },
+        {"name": "websocket", "endpoint": "ws://127.0.0.1:39124/nnrp", "tls": False},
     ]
     assert manifest["wire_conformance"]["capabilities"] == ["profile.openai-compatible.level1.wire"]
+
+
+def test_wire_target_endpoint_requires_every_bound_provider() -> None:
+    with pytest.raises(RuntimeError, match="bound websocket endpoint"):
+        cli._wire_target_endpoint({}, "websocket", attribute="uri")
