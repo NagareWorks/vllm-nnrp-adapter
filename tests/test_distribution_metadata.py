@@ -13,7 +13,7 @@ from vllm_nnrp_adapter.distribution_metadata import (
 )
 
 
-def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post18,<1.0.0rc5") -> str:
+def _metadata(*, nnrp_range: str = ">=1.0.0rc4.post19,<1.0.0rc5") -> str:
     return "\n".join(
         (
             "Metadata-Version: 2.4",

@@ -42,6 +42,7 @@ from nnrp.core import (
 )
 from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
 from nnrp.runtime import (
+    CapabilityMetadata,
     ControlRequestMetadata,
     InFlightPolicy,
     NativeRuntimeEvent,
@@ -407,6 +408,8 @@ class ScriptedEventSession:
         self._stop_event = stop_event
         self._loop = asyncio.get_running_loop()
         self._stop_after_last_event = stop_after_last_event
+        self.capability_negotiations: list[tuple[CapabilityMetadata, bytes]] = []
+        self.profile_degradations: list[tuple[CapabilityMetadata, bytes]] = []
         self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
         self.closed = False
 
@@ -431,6 +434,12 @@ class ScriptedEventSession:
         diagnostic: bytes = b"",
     ) -> None:
         self.recoverable_errors.append((metadata, diagnostic))
+
+    def negotiate_capabilities(self, metadata: CapabilityMetadata, body: bytes = b"") -> None:
+        self.capability_negotiations.append((metadata, body))
+
+    def degrade_profile(self, metadata: CapabilityMetadata, body: bytes = b"") -> None:
+        self.profile_degradations.append((metadata, body))
 
 
 class FakeServer:
@@ -742,6 +751,189 @@ def _trace_context_event(
         RuntimeEventMetadata(RuntimeEventMetadataKind.TRACE_CONTEXT, metadata),
         RuntimeEventTail.with_body(body),
     )
+
+
+@pytest.mark.asyncio
+async def test_capability_negotiation_returns_only_supported_runtime_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await _serve_capability_request(
+        monkeypatch,
+        _capability_event(
+            "control.capability_costs",
+            "control.route_execution_hint",
+            cost_model_id=6,
+            preference_rank=3,
+            limit_bytes=8_192,
+            limit_units=512,
+        ),
+        backend=StreamingBackend(),
+    )
+
+    assert session.profile_degradations == []
+    assert len(session.capability_negotiations) == 1
+    metadata, body = session.capability_negotiations[0]
+    assert _decode_capability_body(body) == ("control.capability_costs",)
+    assert metadata == CapabilityMetadata(
+        profile_id=0,
+        capability_count=1,
+        cost_model_id=0,
+        preference_rank=0,
+        limit_bytes=0,
+        limit_units=0,
+        body_bytes=len(body),
+        flags=0,
+    )
+    assert session.recoverable_errors == []
+
+
+@pytest.mark.asyncio
+async def test_capability_negotiation_emits_degrade_only_when_request_allows_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await _serve_capability_request(
+        monkeypatch,
+        _capability_event(
+            "control.capability_costs",
+            "control.route_execution_hint",
+            flags=0x0000_0002,
+        ),
+        backend=StreamingBackend(),
+    )
+
+    assert session.capability_negotiations == []
+    assert len(session.profile_degradations) == 1
+    metadata, body = session.profile_degradations[0]
+    assert metadata.flags == 0x0000_0002
+    assert _decode_capability_body(body) == ("control.capability_costs",)
+    assert session.recoverable_errors == []
+
+
+@pytest.mark.asyncio
+async def test_hard_capability_mismatch_returns_empty_subset_and_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await _serve_capability_request(
+        monkeypatch,
+        _capability_event("control.route_execution_hint", flags=0x0000_0001),
+        backend=StreamingBackend(),
+    )
+
+    assert session.profile_degradations == []
+    assert len(session.capability_negotiations) == 1
+    response, body = session.capability_negotiations[0]
+    assert response.capability_count == 0
+    assert response.body_bytes == 0
+    assert body == b""
+    assert len(session.recoverable_errors) == 1
+    error, diagnostic = session.recoverable_errors[0]
+    assert error.error_code is ErrorCode.UNSUPPORTED_CAPABILITY
+    assert error.error_scope is ErrorScope.SESSION
+    assert diagnostic == b"capability_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_negotiation_advertises_priority_only_for_supporting_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await _serve_capability_request(
+        monkeypatch,
+        _capability_event("control.priority_update"),
+        backend=PriorityAwareStreamingBackend(),
+    )
+
+    assert len(session.capability_negotiations) == 1
+    _metadata, body = session.capability_negotiations[0]
+    assert _decode_capability_body(body) == ("control.priority_update",)
+
+
+async def _serve_capability_request(
+    monkeypatch: pytest.MonkeyPatch,
+    event: NativeRuntimeEvent,
+    *,
+    backend: object,
+) -> ScriptedEventSession:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=901,
+        frame_id=902,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=901),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [FakeServerEvent(runtime=event)],
+        operation=operation,
+        backend_started=threading.Event(),
+        stop_event=stop_event,
+        stop_after_last_event=True,
+    )
+    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),  # type: ignore[arg-type]
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+    return session
+
+
+def _capability_event(
+    *tokens: str,
+    cost_model_id: int = 0,
+    preference_rank: int = 0,
+    limit_bytes: int = 0,
+    limit_units: int = 0,
+    flags: int = 0,
+) -> NativeRuntimeEvent:
+    body = _capability_body(*tokens)
+    metadata = CapabilityMetadata(
+        profile_id=0,
+        capability_count=len(tokens),
+        cost_model_id=cost_model_id,
+        preference_rank=preference_rank,
+        limit_bytes=limit_bytes,
+        limit_units=limit_units,
+        body_bytes=len(body),
+        flags=flags,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.CAPABILITY_NEGOTIATION, session_id=1),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.CAPABILITY, metadata),
+        RuntimeEventTail.with_body(body),
+    )
+
+
+def _capability_body(*tokens: str) -> bytes:
+    body = bytearray()
+    for token in sorted(tokens, key=lambda value: value.encode("ascii")):
+        encoded = token.encode("ascii")
+        body.extend(len(encoded).to_bytes(2, "little"))
+        body.extend(encoded)
+    return bytes(body)
+
+
+def _decode_capability_body(body: bytes) -> tuple[str, ...]:
+    tokens: list[str] = []
+    offset = 0
+    while offset < len(body):
+        token_length = int.from_bytes(body[offset : offset + 2], "little")
+        token_start = offset + 2
+        token_end = token_start + token_length
+        tokens.append(body[token_start:token_end].decode("ascii"))
+        offset = token_end
+    return tuple(tokens)
 
 
 def test_trace_context_correlates_session_and_active_operation_frames() -> None:

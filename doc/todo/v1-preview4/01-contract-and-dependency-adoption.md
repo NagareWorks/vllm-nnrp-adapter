@@ -2,7 +2,7 @@
 
 ## Dependency Baseline
 
-- [x] Replace the Preview3 dependency with `nnrp-py>=1.0.0rc4.post18,<1.0.0rc5`.
+- [x] Replace the Preview3 dependency with `nnrp-py>=1.0.0rc4.post19,<1.0.0rc5`.
 - [x] Remove imports of packet-only `serve_tcp`, `accept_server_session`, `ServerSession`, and
   Preview3 submit/result wrappers from the production adapter path.
 - [x] Import the frozen native server, operation, event, endpoint, transport-policy, provider-route,

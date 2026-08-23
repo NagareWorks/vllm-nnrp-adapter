@@ -30,9 +30,10 @@
   profile mapping with JSON control messages.
 - [ ] Map adapter queue and output pressure to `BACKPRESSURE` and `CREDIT_UPDATE`.
 - [ ] Stop reading or emitting beyond the effective credit window.
-- [ ] Answer `CAPABILITY_NEGOTIATION` with supported controls, cost model, preference rank, byte
-  limit, unit limit, backend family, and vLLM version.
-- [ ] Emit `DEGRADE_PROFILE` only for a capability downgrade permitted by the request flags.
+- [x] Answer `CAPABILITY_NEGOTIATION` with the supported control subset and explicit cost,
+  preference, byte-limit, and unit-limit fields; keep backend family and vLLM version in the
+  existing observation record because the frozen capability body contains registered tokens only.
+- [x] Emit `DEGRADE_PROFILE` only for a capability downgrade permitted by the request flags.
 
 ## Diagnostics And Recovery
 

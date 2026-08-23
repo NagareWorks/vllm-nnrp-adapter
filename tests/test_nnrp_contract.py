@@ -111,7 +111,7 @@ def test_contract_rejects_missing_preview4_symbol(monkeypatch: pytest.MonkeyPatc
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="nnrp.server.NativeServer"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post19")
 
 
 def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,6 +131,7 @@ def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.
         **{
             name: getattr(nnrp, name)
             for name in (
+                "PREVIEW4_CAPABILITY_TOKENS",
                 "NativeRuntimeServerSession",
                 "NativeTransportBinding",
                 "NativeTransportEndpoint",
@@ -147,7 +148,7 @@ def test_contract_rejects_old_synchronous_native_role_shape(monkeypatch: pytest.
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="incompatible Preview4 native role contract"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post19")
 
 
 def test_contract_rejects_private_transport_binding_keyword(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,7 +178,7 @@ def test_contract_rejects_private_transport_binding_keyword(monkeypatch: pytest.
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="public transports keyword"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post19")
 
 
 def test_contract_rejects_transport_binding_without_role_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,6 +192,7 @@ def test_contract_rejects_transport_binding_without_role_ownership(monkeypatch: 
         **{
             name: getattr(nnrp, name)
             for name in (
+                "PREVIEW4_CAPABILITY_TOKENS",
                 "NativeRuntimeServerOperation",
                 "NativeRuntimeServerSession",
                 "NativeTransportEndpoint",
@@ -207,7 +209,7 @@ def test_contract_rejects_transport_binding_without_role_ownership(monkeypatch: 
     )
 
     with pytest.raises(NnrpRuntimeContractError, match="NativeTransportBinding.adopt_server"):
-        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post18")
+        validate_nnrp_runtime_contract(installed_version="1.0.0rc4.post19")
 
 
 def test_contract_rejects_versions_outside_preview4_range() -> None:
@@ -233,7 +235,7 @@ def test_project_dependency_metadata_requires_preview4_without_native_payloads()
     metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = metadata["project"]["dependencies"]
 
-    assert "nnrp-py>=1.0.0rc4.post18,<1.0.0rc5" in dependencies
+    assert "nnrp-py>=1.0.0rc4.post19,<1.0.0rc5" in dependencies
     assert all("rc3" not in dependency for dependency in dependencies)
     assert metadata["project"]["optional-dependencies"]["vllm"] == ["vllm>=0.18.0,<0.27"]
     assert metadata["project"]["optional-dependencies"]["prometheus"] == ["prometheus-client>=0.21,<1"]

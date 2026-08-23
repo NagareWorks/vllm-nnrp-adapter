@@ -8,11 +8,12 @@ from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 NNRP_PY_DISTRIBUTION = "nnrp-py"
-NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post18,<1.0.0rc5"
+NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post19,<1.0.0rc5"
 _NNRP_PY_REQUIRED_SPECIFIER = SpecifierSet(NNRP_PY_REQUIRED_RANGE)
 
 _REQUIRED_NNRP_SYMBOLS = {
     "nnrp": (
+        "PREVIEW4_CAPABILITY_TOKENS",
         "NativeRuntimeServerOperation",
         "NativeRuntimeServerSession",
         "NativeTransportBinding",
@@ -22,6 +23,7 @@ _REQUIRED_NNRP_SYMBOLS = {
     ),
     "nnrp.runtime": (
         "CacheReferenceMetadata",
+        "CapabilityMetadata",
         "ControlRequestMetadata",
         "NativeRuntimeEvent",
         "ObjectDescriptorMetadata",
@@ -43,6 +45,8 @@ _REQUIRED_NNRP_METHODS = {
         "adopt_server": False,
     },
     "nnrp.NativeRuntimeServerSession": {
+        "degrade_profile": False,
+        "negotiate_capabilities": False,
         "poll_events": False,
     },
     "nnrp.NativeRuntimeServerOperation": {

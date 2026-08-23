@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, TypeVar
 
 from nnrp import (  # type: ignore[import-untyped]
+    PREVIEW4_CAPABILITY_TOKENS,
     NativeRuntimeServerOperation,
     NativeRuntimeServerSession,
     NativeTransportBinding,
@@ -33,6 +34,7 @@ from nnrp.core import (  # type: ignore[import-untyped]
     validate_frame_submit_body,
 )
 from nnrp.runtime import (  # type: ignore[import-untyped]
+    CapabilityMetadata,
     NativeRuntimeEvent,
     PartialResultMetadata,
     RecoverableErrorMetadata,
@@ -76,6 +78,23 @@ from .runtime_control import (
 )
 
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "response.cancelled"})
+_CAPABILITY_FLAG_HARD_REQUIREMENT = 0x0000_0001
+_CAPABILITY_FLAG_DOWNGRADE_ALLOWED = 0x0000_0002
+_OPENAI_COMPATIBLE_PROFILE_ID = 0
+_SUPPORTED_RUNTIME_CAPABILITIES = frozenset(
+    {
+        "control.cancel_abort",
+        "control.supersede",
+        "control.deadline_expire",
+        "control.progress_partial",
+        "control.capability_costs",
+        "control.trace_context",
+        "control.result_drop_reason",
+        "control.degrade_profile",
+        "control.recoverable_error",
+        "payload.typed",
+    }
+)
 _T = TypeVar("_T")
 
 
@@ -312,6 +331,15 @@ async def _serve_session(
                         )
                         counters.applied_control_events += 1
                         continue
+                    if runtime_event.header.message_type is MessageType.CAPABILITY_NEGOTIATION:
+                        await _handle_capability_negotiation(
+                            runtime_event,
+                            adapter=adapter,
+                            session=session,
+                            native=native,
+                            counters=counters,
+                        )
+                        continue
                     await _handle_runtime_control(
                         runtime_event,
                         adapter=adapter,
@@ -411,6 +439,116 @@ async def _serve_session(
             finally:
                 await controls.clear()
                 registry.clear()
+
+
+async def _handle_capability_negotiation(
+    event: NativeRuntimeEvent,
+    *,
+    adapter: OpenAiNnrpAdapter,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
+    counters: _ServeCounters,
+) -> None:
+    metadata, requested = _decode_capability_offer(event)
+    supported = set(_SUPPORTED_RUNTIME_CAPABILITIES)
+    if adapter._supports_runtime_priority():
+        supported.add("control.priority_update")
+    accepted = tuple(token for token in requested if token in supported)
+    accepted_body = _encode_capability_tokens(accepted)
+    response = CapabilityMetadata(
+        profile_id=metadata.profile_id,
+        capability_count=len(accepted),
+        cost_model_id=0,
+        preference_rank=0,
+        limit_bytes=0,
+        limit_units=0,
+        body_bytes=len(accepted_body),
+        flags=metadata.flags,
+    )
+    downgraded = len(accepted) != len(requested)
+    if downgraded and accepted and metadata.flags & _CAPABILITY_FLAG_DOWNGRADE_ALLOWED:
+        await native.call(session.degrade_profile, response, accepted_body)
+    else:
+        await native.call(session.negotiate_capabilities, response, accepted_body)
+    if not accepted and metadata.flags & _CAPABILITY_FLAG_HARD_REQUIREMENT:
+        await _send_capability_mismatch(event, session=session, native=native)
+        counters.rejected_control_events += 1
+    else:
+        counters.applied_control_events += 1
+
+
+def _decode_capability_offer(event: NativeRuntimeEvent) -> tuple[CapabilityMetadata, tuple[str, ...]]:
+    if event.metadata.kind is not RuntimeEventMetadataKind.CAPABILITY or not isinstance(
+        event.metadata.value, CapabilityMetadata
+    ):
+        raise ValueError("CAPABILITY_NEGOTIATION requires CapabilityMetadata")
+    metadata = event.metadata.value
+    if event.tail.kind is RuntimeEventTailKind.NONE:
+        body = b""
+    elif event.tail.kind is RuntimeEventTailKind.BODY:
+        body = event.tail.body
+    else:
+        raise ValueError("CAPABILITY_NEGOTIATION requires a capability token body")
+    if metadata.body_bytes != len(body):
+        raise ValueError("CAPABILITY_NEGOTIATION body_bytes does not match the capability token body")
+    tokens: list[str] = []
+    offset = 0
+    while offset < len(body):
+        if offset + 2 > len(body):
+            raise ValueError("capability entry is missing its token length")
+        token_length = int.from_bytes(body[offset : offset + 2], "little")
+        if token_length == 0:
+            raise ValueError("capability token length must be non-zero")
+        token_start = offset + 2
+        token_end = token_start + token_length
+        if token_end > len(body):
+            raise ValueError("capability token exceeds the declared body")
+        try:
+            token = body[token_start:token_end].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError("capability token must be ASCII") from error
+        if token not in PREVIEW4_CAPABILITY_TOKENS:
+            raise ValueError(f"unknown Preview4 capability token {token!r}")
+        if tokens and tokens[-1].encode("ascii") >= token.encode("ascii"):
+            raise ValueError("capability tokens must be unique and use canonical byte order")
+        tokens.append(token)
+        offset = token_end
+    if len(tokens) != metadata.capability_count:
+        raise ValueError("CAPABILITY_NEGOTIATION capability_count does not match the capability token body")
+    if metadata.profile_id != _OPENAI_COMPATIBLE_PROFILE_ID:
+        return metadata, ()
+    return metadata, tuple(tokens)
+
+
+def _encode_capability_tokens(tokens: Sequence[str]) -> bytes:
+    body = bytearray()
+    for token in sorted(tokens, key=lambda value: value.encode("ascii")):
+        encoded = token.encode("ascii")
+        body.extend(len(encoded).to_bytes(2, "little"))
+        body.extend(encoded)
+    return bytes(body)
+
+
+async def _send_capability_mismatch(
+    event: NativeRuntimeEvent,
+    *,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
+) -> None:
+    diagnostic = b"capability_mismatch"
+    metadata = RecoverableErrorMetadata(
+        error_code=ErrorCode.UNSUPPORTED_CAPABILITY,
+        error_scope=ErrorScope.SESSION,
+        recovery_action=0,
+        source_role=RuntimeRole.RUNTIME,
+        flags=0,
+        retry_after_ms=0,
+        related_session_id=event.header.session_id,
+        related_frame_id=event.header.frame_id,
+        related_view_id=event.header.view_id,
+        diagnostic_bytes=len(diagnostic),
+    )
+    await native.call(session.send_recoverable_error, metadata, diagnostic)
 
 
 def _apply_trace_context(
