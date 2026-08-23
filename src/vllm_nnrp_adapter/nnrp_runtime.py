@@ -37,6 +37,7 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
     CapabilityMetadata,
     NativeRuntimeEvent,
     PartialResultMetadata,
+    PressureMetadata,
     RecoverableErrorMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
@@ -65,6 +66,7 @@ from .observability import (
 )
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
+from .pressure import OutboundCreditController
 from .profile import build_cancelled_event
 from .runtime_control import (
     OperationControlSlot,
@@ -87,6 +89,7 @@ _SUPPORTED_RUNTIME_CAPABILITIES = frozenset(
         "control.supersede",
         "control.deadline_expire",
         "control.progress_partial",
+        "control.credit_backpressure",
         "control.capability_costs",
         "control.trace_context",
         "control.result_drop_reason",
@@ -197,6 +200,44 @@ class _NativeCallExecutor:
         self._executor.shutdown(wait=True, cancel_futures=True)
 
 
+@dataclass(slots=True)
+class _AdmissionWindowReporter:
+    session: NativeRuntimeServerSession
+    native: _NativeCallExecutor
+    capacity: int
+    retry_after_ms: int
+    last_available: int | None = None
+    enabled: bool = False
+    scope_id: int = 0
+
+    async def enable(self, active_operations: int, *, scope_id: int) -> None:
+        if self.enabled:
+            return
+        self.enabled = True
+        self.scope_id = scope_id
+        await self.update(active_operations, force=True)
+
+    async def update(self, active_operations: int, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        available = max(0, self.capacity - active_operations)
+        if not force and available == self.last_available:
+            return
+        metadata = PressureMetadata(
+            scope_id=self.scope_id,
+            credit_window=available,
+            pressure_level=0 if available else 2,
+            pressure_reason=0 if available else 1,
+            retry_after_ms=0 if available else self.retry_after_ms,
+            flags=0,
+        )
+        if available:
+            await self.native.call(self.session.send_credit_update, metadata)
+        else:
+            await self.native.call(self.session.send_backpressure, metadata)
+        self.last_available = available
+
+
 async def serve(
     adapter: OpenAiNnrpAdapter,
     *,
@@ -297,10 +338,22 @@ async def _serve_session(
         tuple[OperationRecord, _OperationObservationTracker, _BackendTraceContextSlot],
     ] = {}
     session_trace_context: tuple[TraceContextMetadata, bytes] | None = None
+    credit_backpressure_negotiated = False
+    output_credits = OutboundCreditController()
+    admission_window = _AdmissionWindowReporter(
+        session=session,
+        native=native,
+        capacity=config.max_operations_per_session,
+        retry_after_ms=config.receive_timeout_ms,
+    )
     backend_family, backend_binding, vllm_version = adapter._backend_observation_identity()
     try:
+        await admission_window.update(0)
         while not shutdown.is_set():
+            previous_operation_count = len(operations)
             _retire_completed_tasks(operations)
+            if len(operations) != previous_operation_count:
+                await admission_window.update(len(operations))
             try:
                 events = await native.call(
                     session.poll_events,
@@ -332,13 +385,34 @@ async def _serve_session(
                         counters.applied_control_events += 1
                         continue
                     if runtime_event.header.message_type is MessageType.CAPABILITY_NEGOTIATION:
-                        await _handle_capability_negotiation(
+                        accepted_capabilities = await _handle_capability_negotiation(
                             runtime_event,
                             adapter=adapter,
                             session=session,
                             native=native,
                             counters=counters,
                         )
+                        if (
+                            not credit_backpressure_negotiated
+                            and "control.credit_backpressure" in accepted_capabilities
+                        ):
+                            credit_backpressure_negotiated = True
+                            await admission_window.enable(
+                                len(operations),
+                                scope_id=runtime_event.header.session_id,
+                            )
+                        continue
+                    if runtime_event.header.message_type in {
+                        MessageType.BACKPRESSURE,
+                        MessageType.CREDIT_UPDATE,
+                    }:
+                        if not credit_backpressure_negotiated:
+                            raise ValueError(
+                                "BACKPRESSURE and CREDIT_UPDATE require negotiated "
+                                "control.credit_backpressure"
+                            )
+                        await _apply_output_pressure(runtime_event, output_credits=output_credits)
+                        counters.applied_control_events += 1
                         continue
                     await _handle_runtime_control(
                         runtime_event,
@@ -351,6 +425,7 @@ async def _serve_session(
                     )
                 continue
             if len(operations) >= config.max_operations_per_session:
+                await admission_window.update(len(operations), force=True)
                 capacity_event = _operation_capacity_event(config.max_operations_per_session)
                 metadata, body = _terminal_reply(operation, capacity_event)
                 await operation.send_result(
@@ -409,10 +484,12 @@ async def _serve_session(
                     observation_sinks=config.observation_sinks,
                     counters=counters,
                     backend_trace=backend_trace,
+                    output_credits=output_credits,
                 )
             )
             control.bind(task)
             operations.add(task)
+            await admission_window.update(len(operations))
     except asyncio.CancelledError:
         await controls.terminate_all(
             RuntimeControlKind.SERVER_SHUTDOWN,
@@ -432,6 +509,7 @@ async def _serve_session(
                     source_role=(RuntimeRole.SERVER if shutdown.is_set() else RuntimeRole.CLIENT),
                     diagnostic=termination_kind.value.encode("ascii"),
                 )
+            await output_credits.close()
             await _finish_tasks(operations, cancel=False)
         finally:
             try:
@@ -448,7 +526,7 @@ async def _handle_capability_negotiation(
     session: NativeRuntimeServerSession,
     native: _NativeCallExecutor,
     counters: _ServeCounters,
-) -> None:
+) -> tuple[str, ...]:
     metadata, requested = _decode_capability_offer(event)
     supported = set(_SUPPORTED_RUNTIME_CAPABILITIES)
     if adapter._supports_runtime_priority():
@@ -475,6 +553,21 @@ async def _handle_capability_negotiation(
         counters.rejected_control_events += 1
     else:
         counters.applied_control_events += 1
+    return accepted
+
+
+async def _apply_output_pressure(
+    event: NativeRuntimeEvent,
+    *,
+    output_credits: OutboundCreditController,
+) -> None:
+    if event.metadata.kind is not RuntimeEventMetadataKind.PRESSURE or not isinstance(
+        event.metadata.value, PressureMetadata
+    ):
+        raise ValueError("BACKPRESSURE and CREDIT_UPDATE require PressureMetadata")
+    if event.tail.kind is not RuntimeEventTailKind.NONE:
+        raise ValueError("BACKPRESSURE and CREDIT_UPDATE cannot carry a body")
+    await output_credits.apply(event.header.message_type, event.metadata.value)
 
 
 def _decode_capability_offer(event: NativeRuntimeEvent) -> tuple[CapabilityMetadata, tuple[str, ...]]:
@@ -604,6 +697,7 @@ async def _serve_operation(
     observation_sinks: Sequence[ObservationSink],
     counters: _ServeCounters,
     backend_trace: _BackendTraceContextSlot | None = None,
+    output_credits: OutboundCreditController | None = None,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
@@ -620,14 +714,30 @@ async def _serve_operation(
             await progress.emit(OperationProgressStage.ADMITTED)
             await progress.emit(OperationProgressStage.PREPROCESSING)
             await progress.emit(OperationProgressStage.EXECUTING)
-            async for event in adapter._handle_native_request(
+            backend_events = adapter._handle_native_request(
                 request,
                 backend_abort_observer=observation.record_backend_abort,
                 backend_trace_headers_factory=(
                     None if backend_trace is None else backend_trace.begin_dispatch
                 ),
                 backend_priority_factory=control.begin_backend_dispatch,
-            ):
+            ).__aiter__()
+            while True:
+                reservation = (
+                    None
+                    if output_credits is None
+                    else await output_credits.reserve(operation.operation_id)
+                )
+                try:
+                    event = await anext(backend_events)
+                except StopAsyncIteration:
+                    if output_credits is not None and reservation is not None:
+                        await output_credits.refund(reservation)
+                    break
+                except BaseException:
+                    if output_credits is not None and reservation is not None:
+                        await output_credits.refund(reservation)
+                    raise
                 body = _encode_event(event)
                 observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):
@@ -748,6 +858,8 @@ async def _serve_operation(
             await control.complete()
         finally:
             try:
+                if output_credits is not None:
+                    await output_credits.retire(operation.operation_id)
                 if record.is_terminal and not record.resources_released:
                     record.release_resources()
             finally:

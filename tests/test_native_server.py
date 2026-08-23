@@ -47,6 +47,7 @@ from nnrp.runtime import (
     InFlightPolicy,
     NativeRuntimeEvent,
     PartialResultMetadata,
+    PressureMetadata,
     ProgressMetadata,
     RecoverableErrorMetadata,
     ResultDropReasonCode,
@@ -66,15 +67,18 @@ from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions,
 
 from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
 from vllm_nnrp_adapter.nnrp_runtime import (
+    _AdmissionWindowReporter,
     _apply_trace_context,
     _BackendTraceContextSlot,
     _native_handle_identity,
+    _NativeCallExecutor,
     _OperationObservationTracker,
     _serve_operation,
     _ServeCounters,
     _w3c_trace_headers,
 )
 from vllm_nnrp_adapter.operation_state import OperationRegistry, OperationState
+from vllm_nnrp_adapter.pressure import OutboundCreditController
 from vllm_nnrp_adapter.runtime_control import (
     OperationControlSlot,
     RuntimeControlDisposition,
@@ -345,6 +349,8 @@ class FakeSession:
         self._stop_event = stop_event
         self._delivered = False
         self.partial_results = operation.partial_results
+        self.backpressure_updates: list[PressureMetadata] = []
+        self.credit_updates: list[PressureMetadata] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -361,6 +367,12 @@ class FakeSession:
         self._operation.native_thread_ids.append(threading.get_ident())
         self.closed = True
 
+    def send_backpressure(self, metadata: PressureMetadata) -> None:
+        self.backpressure_updates.append(metadata)
+
+    def send_credit_update(self, metadata: PressureMetadata) -> None:
+        self.credit_updates.append(metadata)
+
 
 class MultiOperationFakeSession:
     def __init__(
@@ -375,6 +387,8 @@ class MultiOperationFakeSession:
         self.partial_results: list[tuple[PartialResultMetadata, bytes]] = []
         for operation in operations:
             operation.partial_results = self.partial_results
+        self.backpressure_updates: list[PressureMetadata] = []
+        self.credit_updates: list[PressureMetadata] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -389,6 +403,12 @@ class MultiOperationFakeSession:
 
     def close(self) -> None:
         self.closed = True
+
+    def send_backpressure(self, metadata: PressureMetadata) -> None:
+        self.backpressure_updates.append(metadata)
+
+    def send_credit_update(self, metadata: PressureMetadata) -> None:
+        self.credit_updates.append(metadata)
 
 
 class ScriptedEventSession:
@@ -411,6 +431,8 @@ class ScriptedEventSession:
         self.capability_negotiations: list[tuple[CapabilityMetadata, bytes]] = []
         self.profile_degradations: list[tuple[CapabilityMetadata, bytes]] = []
         self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
+        self.backpressure_updates: list[PressureMetadata] = []
+        self.credit_updates: list[PressureMetadata] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -427,6 +449,12 @@ class ScriptedEventSession:
 
     def close(self) -> None:
         self.closed = True
+
+    def send_backpressure(self, metadata: PressureMetadata) -> None:
+        self.backpressure_updates.append(metadata)
+
+    def send_credit_update(self, metadata: PressureMetadata) -> None:
+        self.credit_updates.append(metadata)
 
     def send_recoverable_error(
         self,
@@ -531,6 +559,42 @@ def _listen_with_context(server_context: FakeServerContext) -> Callable[..., Fak
         return server_context
 
     return listen
+
+
+@pytest.mark.asyncio
+async def test_admission_window_reports_only_after_capability_is_enabled() -> None:
+    operation = FakeOperation(
+        operation_id=70,
+        frame_id=18,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=70),
+        terminal_results=[],
+    )
+    session = FakeSession(operation, asyncio.Event())
+    native = _NativeCallExecutor(1)
+    reporter = _AdmissionWindowReporter(
+        session=session,  # type: ignore[arg-type]
+        native=native,
+        capacity=1,
+        retry_after_ms=25,
+    )
+    try:
+        await reporter.update(0)
+        assert session.credit_updates == []
+        assert session.backpressure_updates == []
+
+        await reporter.enable(0, scope_id=1)
+        await reporter.update(1)
+        await reporter.update(0)
+    finally:
+        native.close()
+
+    assert [metadata.credit_window for metadata in session.credit_updates] == [1, 1]
+    assert [metadata.credit_window for metadata in session.backpressure_updates] == [0]
+    assert all(metadata.scope_id == 1 for metadata in session.credit_updates)
+    assert session.backpressure_updates[0].scope_id == 1
+    assert session.backpressure_updates[0].pressure_reason == 1
+    assert session.backpressure_updates[0].retry_after_ms == 25
 
 
 @pytest.mark.asyncio
@@ -640,6 +704,158 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert operation.native_thread_ids
     assert threading.get_ident() not in operation.native_thread_ids
     assert backend.requests[0]["request_id"] == "nnrp-71-19"
+    assert session.credit_updates == []
+    assert session.backpressure_updates == []
+
+
+@pytest.mark.asyncio
+async def test_output_credit_blocks_backend_pull_until_peer_grants_window() -> None:
+    operation = FakeOperation(
+        operation_id=73,
+        frame_id=21,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=73),
+        terminal_results=[],
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-73")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        backend_family="StreamingBackend",
+        backend_binding=None,
+        vllm_version=None,
+    )
+    credits = OutboundCreditController()
+    await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(scope_id=operation.operation_id, credit_window=0, flags=0x2),
+    )
+    backend = StreamingBackend()
+
+    task = asyncio.create_task(
+        _serve_operation(
+            OpenAiNnrpAdapter(backend),
+            operation,
+            record=record,
+            control=control,
+            observation=observation,
+            observation_sinks=(),
+            counters=_ServeCounters(),
+            output_credits=credits,
+        )
+    )
+    await asyncio.sleep(0)
+    assert backend.requests == []
+
+    await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(scope_id=operation.operation_id, credit_window=1, flags=0x2),
+    )
+    for _ in range(100):
+        if len(operation.partial_results) == 1:
+            break
+        await asyncio.sleep(0.001)
+    assert len(operation.partial_results) == 1
+    assert task.done() is False
+
+    await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(scope_id=operation.operation_id, credit_window=2, flags=0x2),
+    )
+    await asyncio.wait_for(task, timeout=1)
+
+    assert [json.loads(body)["type"] for _metadata, body in operation.partial_results] == [
+        "response.output_text.delta",
+        "response.usage",
+    ]
+    assert _decode_terminal_profile_body(*operation.terminal_results[0])["type"] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_output_credit_uses_effective_connection_session_and_operation_window() -> None:
+    credits = OutboundCreditController()
+    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=2, flags=0x1))
+    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=1))
+    await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(scope_id=91, credit_window=1, flags=0x2),
+    )
+
+    await credits.reserve(91)
+    blocked = asyncio.create_task(credits.reserve(91))
+    await asyncio.sleep(0)
+    assert blocked.done() is False
+
+    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=1))
+    await asyncio.sleep(0)
+    assert blocked.done() is False
+    await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(scope_id=91, credit_window=1, flags=0x2),
+    )
+    await asyncio.wait_for(blocked, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_paused_pressure_and_invalid_scope_do_not_leak_credit() -> None:
+    credits = OutboundCreditController()
+    with pytest.raises(ValueError, match="cannot target connection and operation"):
+        await credits.apply(
+            MessageType.CREDIT_UPDATE,
+            _pressure_metadata(scope_id=1, credit_window=1, flags=0x3),
+        )
+    with pytest.raises(ValueError, match="non-zero scope_id"):
+        await credits.apply(
+            MessageType.CREDIT_UPDATE,
+            _pressure_metadata(credit_window=1, flags=0x2),
+        )
+
+    await credits.apply(
+        MessageType.BACKPRESSURE,
+        _pressure_metadata(credit_window=4, pressure_level=3),
+    )
+    blocked = asyncio.create_task(credits.reserve(92))
+    await asyncio.sleep(0)
+    assert blocked.done() is False
+    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=1))
+    await asyncio.wait_for(blocked, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_output_credit_honors_retry_delay_and_refunds_unused_reservation() -> None:
+    credits = OutboundCreditController()
+    await credits.apply(
+        MessageType.BACKPRESSURE,
+        _pressure_metadata(credit_window=1, pressure_level=1, retry_after_ms=20),
+    )
+    started = asyncio.get_running_loop().time()
+    reservation = await asyncio.wait_for(credits.reserve(93), timeout=1)
+    assert asyncio.get_running_loop().time() - started >= 0.015
+
+    blocked = asyncio.create_task(credits.reserve(93))
+    await asyncio.sleep(0)
+    assert blocked.done() is False
+    await credits.refund(reservation)
+    await asyncio.wait_for(blocked, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_output_credit_rejects_invalid_frames_and_closes_waiters() -> None:
+    credits = OutboundCreditController()
+    with pytest.raises(ValueError, match="requires BACKPRESSURE or CREDIT_UPDATE"):
+        await credits.apply(MessageType.PROGRESS, _pressure_metadata(credit_window=1))
+    with pytest.raises(ValueError, match="non-zero pressure level"):
+        await credits.apply(MessageType.BACKPRESSURE, _pressure_metadata(credit_window=1))
+
+    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=0))
+    blocked = asyncio.create_task(credits.reserve(94))
+    await asyncio.sleep(0)
+    await credits.close()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
 
 
 @pytest.mark.asyncio
@@ -788,6 +1004,23 @@ async def test_capability_negotiation_returns_only_supported_runtime_controls(
 
 
 @pytest.mark.asyncio
+async def test_capability_negotiation_advertises_credit_backpressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = await _serve_capability_request(
+        monkeypatch,
+        _capability_event("control.credit_backpressure"),
+        backend=StreamingBackend(),
+    )
+
+    assert len(session.capability_negotiations) == 1
+    _metadata, body = session.capability_negotiations[0]
+    assert _decode_capability_body(body) == ("control.credit_backpressure",)
+    assert [metadata.credit_window for metadata in session.credit_updates] == [1]
+    assert session.backpressure_updates == []
+
+
+@pytest.mark.asyncio
 async def test_capability_negotiation_emits_degrade_only_when_request_allows_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -922,6 +1155,25 @@ def _capability_body(*tokens: str) -> bytes:
         body.extend(len(encoded).to_bytes(2, "little"))
         body.extend(encoded)
     return bytes(body)
+
+
+def _pressure_metadata(
+    *,
+    scope_id: int = 0,
+    credit_window: int,
+    pressure_level: int = 0,
+    pressure_reason: int = 0,
+    retry_after_ms: int = 0,
+    flags: int = 0,
+) -> PressureMetadata:
+    return PressureMetadata(
+        scope_id=scope_id,
+        credit_window=credit_window,
+        pressure_level=pressure_level,
+        pressure_reason=pressure_reason,
+        retry_after_ms=retry_after_ms,
+        flags=flags,
+    )
 
 
 def _decode_capability_body(body: bytes) -> tuple[str, ...]:

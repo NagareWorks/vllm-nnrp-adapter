@@ -28,6 +28,7 @@ _REQUIRED_NNRP_SYMBOLS = {
         "NativeRuntimeEvent",
         "ObjectDescriptorMetadata",
         "PartialResultMetadata",
+        "PressureMetadata",
     ),
     "nnrp.server": (
         "NativeServer",
@@ -48,6 +49,8 @@ _REQUIRED_NNRP_METHODS = {
         "degrade_profile": False,
         "negotiate_capabilities": False,
         "poll_events": False,
+        "send_backpressure": False,
+        "send_credit_update": False,
     },
     "nnrp.NativeRuntimeServerOperation": {
         "send_partial_result": True,

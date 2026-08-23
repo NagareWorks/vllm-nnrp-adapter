@@ -26,10 +26,10 @@
 
 - [x] Emit `PROGRESS` with frozen stage codes for queued, admitted, preprocessing, executing,
   producing-partial, finalizing, completed, dropped, and failed transitions.
-- [ ] Preserve ordered OpenAI profile events in the NNRP result stream; do not replace the frozen
+- [x] Preserve ordered OpenAI profile events in the NNRP result stream; do not replace the frozen
   profile mapping with JSON control messages.
-- [ ] Map adapter queue and output pressure to `BACKPRESSURE` and `CREDIT_UPDATE`.
-- [ ] Stop reading or emitting beyond the effective credit window.
+- [x] Map adapter queue and output pressure to `BACKPRESSURE` and `CREDIT_UPDATE`.
+- [x] Stop reading or emitting beyond the effective credit window.
 - [x] Answer `CAPABILITY_NEGOTIATION` with the supported control subset and explicit cost,
   preference, byte-limit, and unit-limit fields; keep backend family and vLLM version in the
   existing observation record because the frozen capability body contains registered tokens only.
