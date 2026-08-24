@@ -29,6 +29,7 @@ _REQUIRED_NNRP_SYMBOLS = {
         "ObjectDescriptorMetadata",
         "PartialResultMetadata",
         "PressureMetadata",
+        "RetryAfterMetadata",
     ),
     "nnrp.server": (
         "NativeServer",
@@ -51,6 +52,8 @@ _REQUIRED_NNRP_METHODS = {
         "poll_events": False,
         "send_backpressure": False,
         "send_credit_update": False,
+        "send_recoverable_error": False,
+        "send_retry_after": False,
     },
     "nnrp.NativeRuntimeServerOperation": {
         "send_partial_result": True,

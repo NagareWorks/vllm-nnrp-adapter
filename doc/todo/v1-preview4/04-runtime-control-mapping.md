@@ -43,7 +43,7 @@
   support trace propagation.
 - [ ] Emit `RESULT_DROP_REASON` for deadline, supersede, peer cancellation, backpressure, capability
   mismatch, budget, object invalidation, and transport closure outcomes.
-- [ ] Emit `ERROR_RECOVERABLE` and `RETRY_AFTER` for transient admission, queue, and backend errors.
+- [x] Emit `ERROR_RECOVERABLE` and `RETRY_AFTER` for transient admission, queue, and backend errors.
 - [ ] Test every control frame with the frozen metadata model and reserved-value validation.
 - [ ] Test unsupported mandatory semantics explicitly; no control frame may disappear without an
   observation or response.

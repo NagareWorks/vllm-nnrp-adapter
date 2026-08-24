@@ -41,6 +41,7 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
     RecoverableErrorMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
+    RetryAfterMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTailKind,
     RuntimeRole,
@@ -238,6 +239,63 @@ class _AdmissionWindowReporter:
         self.last_available = available
 
 
+@dataclass(slots=True)
+class _RecoveryReporter:
+    session: NativeRuntimeServerSession
+    native: _NativeCallExecutor
+    retry_after_ms: int
+    enabled: bool = False
+    control_sequence: int = 0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    def enable(self) -> None:
+        self.enabled = True
+
+    async def report(
+        self,
+        operation: NativeRuntimeServerOperation,
+        *,
+        diagnostic: bytes,
+        source_role: RuntimeRole,
+    ) -> None:
+        if not self.enabled:
+            return
+        async with self._lock:
+            self.control_sequence += 1
+            control_sequence = self.control_sequence
+            header = operation.submit.header
+            await self.native.call(
+                self.session.send_recoverable_error,
+                RecoverableErrorMetadata(
+                    error_code=ErrorCode.SERVER_BUSY,
+                    error_scope=ErrorScope.FRAME,
+                    recovery_action=0,
+                    source_role=source_role,
+                    flags=0x02,
+                    retry_after_ms=self.retry_after_ms,
+                    related_session_id=header.session_id,
+                    related_frame_id=header.frame_id,
+                    related_view_id=header.view_id,
+                    diagnostic_bytes=len(diagnostic),
+                ),
+                diagnostic,
+            )
+            await self.native.call(
+                self.session.send_retry_after,
+                RetryAfterMetadata(
+                    scope_id=operation.operation_id,
+                    control_sequence=control_sequence,
+                    retry_after_ms=self.retry_after_ms,
+                    jitter_ms=0,
+                    reason_code=0,
+                    source_role=source_role,
+                    flags=0x02,
+                    diagnostic_bytes=len(diagnostic),
+                ),
+                diagnostic,
+            )
+
+
 async def serve(
     adapter: OpenAiNnrpAdapter,
     *,
@@ -346,6 +404,11 @@ async def _serve_session(
         capacity=config.max_operations_per_session,
         retry_after_ms=config.receive_timeout_ms,
     )
+    recovery = _RecoveryReporter(
+        session=session,
+        native=native,
+        retry_after_ms=config.receive_timeout_ms,
+    )
     backend_family, backend_binding, vllm_version = adapter._backend_observation_identity()
     try:
         await admission_window.update(0)
@@ -401,6 +464,8 @@ async def _serve_session(
                                 len(operations),
                                 scope_id=runtime_event.header.session_id,
                             )
+                        if "control.recoverable_error" in accepted_capabilities:
+                            recovery.enable()
                         continue
                     if runtime_event.header.message_type in {
                         MessageType.BACKPRESSURE,
@@ -426,6 +491,11 @@ async def _serve_session(
                 continue
             if len(operations) >= config.max_operations_per_session:
                 await admission_window.update(len(operations), force=True)
+                await recovery.report(
+                    operation,
+                    diagnostic=b"adapter_operation_limit",
+                    source_role=RuntimeRole.SCHEDULER,
+                )
                 capacity_event = _operation_capacity_event(config.max_operations_per_session)
                 metadata, body = _terminal_reply(operation, capacity_event)
                 await operation.send_result(
@@ -485,6 +555,7 @@ async def _serve_session(
                     counters=counters,
                     backend_trace=backend_trace,
                     output_credits=output_credits,
+                    recovery=recovery,
                 )
             )
             control.bind(task)
@@ -698,6 +769,7 @@ async def _serve_operation(
     counters: _ServeCounters,
     backend_trace: _BackendTraceContextSlot | None = None,
     output_credits: OutboundCreditController | None = None,
+    recovery: _RecoveryReporter | None = None,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
@@ -739,6 +811,13 @@ async def _serve_operation(
                         await output_credits.refund(reservation)
                     raise
                 body = _encode_event(event)
+                recovery_diagnostic = _recoverable_event_diagnostic(event)
+                if recovery is not None and recovery_diagnostic is not None:
+                    await recovery.report(
+                        operation,
+                        diagnostic=recovery_diagnostic,
+                        source_role=RuntimeRole.RUNTIME,
+                    )
                 observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):
                     await progress.emit(OperationProgressStage.FINALIZING)
@@ -1129,6 +1208,16 @@ def _operation_capacity_event(limit: int) -> dict[str, Any]:
             "message": f"Adapter session operation limit {limit} is active.",
         },
     }
+
+
+def _recoverable_event_diagnostic(event: Mapping[str, Any]) -> bytes | None:
+    if event.get("type") != "response.error":
+        return None
+    error = event.get("error")
+    code = error.get("code") if isinstance(error, Mapping) else None
+    if code not in {"backend_overload", "scheduler_rejected", "request_timeout"}:
+        return None
+    return str(code).encode("ascii")
 
 
 def _terminal_metadata(

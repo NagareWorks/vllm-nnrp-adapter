@@ -52,6 +52,7 @@ from nnrp.runtime import (
     RecoverableErrorMetadata,
     ResultDropReasonCode,
     ResultDropReasonMetadata,
+    RetryAfterMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
@@ -73,6 +74,7 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _native_handle_identity,
     _NativeCallExecutor,
     _OperationObservationTracker,
+    _RecoveryReporter,
     _serve_operation,
     _ServeCounters,
     _w3c_trace_headers,
@@ -155,6 +157,11 @@ class PriorityAwareStreamingBackend:
 class FailingBackend:
     def create_chat_completion(self, body: Mapping[str, Any]) -> object:
         raise RuntimeError(f"backend failed for {body['model']}")
+
+
+class OverloadedBackend:
+    def create_chat_completion(self, body: Mapping[str, Any]) -> object:
+        raise RuntimeError(f"scheduler full: reject request for {body['model']}")
 
 
 class InterleavingBackend:
@@ -351,6 +358,8 @@ class FakeSession:
         self.partial_results = operation.partial_results
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
+        self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
+        self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -373,6 +382,20 @@ class FakeSession:
     def send_credit_update(self, metadata: PressureMetadata) -> None:
         self.credit_updates.append(metadata)
 
+    def send_recoverable_error(
+        self,
+        metadata: RecoverableErrorMetadata,
+        diagnostic: bytes = b"",
+    ) -> None:
+        self.recoverable_errors.append((metadata, diagnostic))
+
+    def send_retry_after(
+        self,
+        metadata: RetryAfterMetadata,
+        diagnostic: bytes = b"",
+    ) -> None:
+        self.retry_after_updates.append((metadata, diagnostic))
+
 
 class MultiOperationFakeSession:
     def __init__(
@@ -389,6 +412,8 @@ class MultiOperationFakeSession:
             operation.partial_results = self.partial_results
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
+        self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
+        self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -409,6 +434,20 @@ class MultiOperationFakeSession:
 
     def send_credit_update(self, metadata: PressureMetadata) -> None:
         self.credit_updates.append(metadata)
+
+    def send_recoverable_error(
+        self,
+        metadata: RecoverableErrorMetadata,
+        diagnostic: bytes = b"",
+    ) -> None:
+        self.recoverable_errors.append((metadata, diagnostic))
+
+    def send_retry_after(
+        self,
+        metadata: RetryAfterMetadata,
+        diagnostic: bytes = b"",
+    ) -> None:
+        self.retry_after_updates.append((metadata, diagnostic))
 
 
 class ScriptedEventSession:
@@ -431,6 +470,7 @@ class ScriptedEventSession:
         self.capability_negotiations: list[tuple[CapabilityMetadata, bytes]] = []
         self.profile_degradations: list[tuple[CapabilityMetadata, bytes]] = []
         self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
+        self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
         self.closed = False
@@ -462,6 +502,13 @@ class ScriptedEventSession:
         diagnostic: bytes = b"",
     ) -> None:
         self.recoverable_errors.append((metadata, diagnostic))
+
+    def send_retry_after(
+        self,
+        metadata: RetryAfterMetadata,
+        diagnostic: bytes,
+    ) -> None:
+        self.retry_after_updates.append((metadata, diagnostic))
 
     def negotiate_capabilities(self, metadata: CapabilityMetadata, body: bytes = b"") -> None:
         self.capability_negotiations.append((metadata, body))
@@ -595,6 +642,151 @@ async def test_admission_window_reports_only_after_capability_is_enabled() -> No
     assert session.backpressure_updates[0].scope_id == 1
     assert session.backpressure_updates[0].pressure_reason == 1
     assert session.backpressure_updates[0].retry_after_ms == 25
+
+
+@pytest.mark.asyncio
+async def test_recovery_reporter_emits_correlated_error_and_retry_after_only_when_enabled() -> None:
+    operation = FakeOperation(
+        operation_id=71,
+        frame_id=19,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=71),
+        terminal_results=[],
+    )
+    session = FakeSession(operation, asyncio.Event())
+    native = _NativeCallExecutor(1)
+    reporter = _RecoveryReporter(session=session, native=native, retry_after_ms=40)  # type: ignore[arg-type]
+    try:
+        await reporter.report(
+            operation,  # type: ignore[arg-type]
+            diagnostic=b"adapter_operation_limit",
+            source_role=RuntimeRole.SCHEDULER,
+        )
+        assert session.recoverable_errors == []
+        assert session.retry_after_updates == []
+
+        reporter.enable()
+        await asyncio.gather(
+            reporter.report(
+                operation,  # type: ignore[arg-type]
+                diagnostic=b"adapter_operation_limit",
+                source_role=RuntimeRole.SCHEDULER,
+            ),
+            reporter.report(
+                operation,  # type: ignore[arg-type]
+                diagnostic=b"adapter_operation_limit",
+                source_role=RuntimeRole.SCHEDULER,
+            ),
+        )
+    finally:
+        native.close()
+
+    error, error_diagnostic = session.recoverable_errors[0]
+    retry, retry_diagnostic = session.retry_after_updates[0]
+    assert error.error_code is ErrorCode.SERVER_BUSY
+    assert error.error_scope is ErrorScope.FRAME
+    assert error.source_role is RuntimeRole.SCHEDULER
+    assert error.flags == 0x02
+    assert error.retry_after_ms == 40
+    assert error.related_frame_id == operation.frame_id
+    assert error_diagnostic == b"adapter_operation_limit"
+    assert retry.scope_id == operation.operation_id
+    assert retry.control_sequence == 1
+    assert retry.retry_after_ms == 40
+    assert retry.flags == 0x02
+    assert retry_diagnostic == error_diagnostic
+    assert [metadata.control_sequence for metadata, _body in session.retry_after_updates] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_negotiated_transient_backend_rejection_emits_recovery_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=72,
+        frame_id=20,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=72),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(runtime=_capability_event("control.recoverable_error")),
+            FakeServerEvent(submit=operation),
+        ],
+        operation=operation,
+        backend_started=threading.Event(),
+        stop_event=stop_event,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(FakeServer(session))),  # type: ignore[arg-type]
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(OverloadedBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 1
+    assert len(session.capability_negotiations) == 1
+    assert len(session.recoverable_errors) == 1
+    assert session.recoverable_errors[0][1] == b"scheduler_rejected"
+    assert len(session.retry_after_updates) == 1
+    assert session.retry_after_updates[0][0].scope_id == operation.operation_id
+    assert session.retry_after_updates[0][0].retry_after_ms == 10
+    metadata, body = operation.terminal_results[0]
+    assert metadata.status_code == 503
+    assert _decode_terminal_profile_body(metadata, body)["error"]["code"] == "scheduler_rejected"
+
+
+@pytest.mark.asyncio
+async def test_unnegotiated_backend_failure_does_not_emit_recovery_controls() -> None:
+    operation = FakeOperation(
+        operation_id=74,
+        frame_id=22,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=74),
+        terminal_results=[],
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-74")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        backend_family="OverloadedBackend",
+    )
+    session = FakeSession(operation, asyncio.Event())
+    native = _NativeCallExecutor(1)
+    reporter = _RecoveryReporter(session=session, native=native, retry_after_ms=30)  # type: ignore[arg-type]
+    try:
+        await _serve_operation(
+            OpenAiNnrpAdapter(OverloadedBackend()),
+            operation,  # type: ignore[arg-type]
+            record=record,
+            control=control,
+            observation=observation,
+            observation_sinks=(),
+            counters=_ServeCounters(),
+            recovery=reporter,
+        )
+    finally:
+        native.close()
+
+    assert session.recoverable_errors == []
+    assert session.retry_after_updates == []
 
 
 @pytest.mark.asyncio
