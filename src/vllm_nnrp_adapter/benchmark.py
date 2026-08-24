@@ -10,9 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter
+from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter, map_openai_stream_chunk
 from .conformance import load_backend_async
-from .profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
+from .profile import (
+    CHAT_COMPLETIONS_CREATE,
+    OPENAI_COMPATIBLE_SCHEMA_VERSION,
+    OpenAiNnrpCapabilityDocument,
+    validate_request,
+)
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,8 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
 
     adapter = OpenAiNnrpAdapter(backend)
     scenarios = [
+        _measure_profile_validation(config),
+        _measure_profile_event_mapping(config),
         await _measure_non_streaming_roundtrip(adapter, config),
         await _measure_streaming_event_latency(adapter, config),
         await _measure_cancellation_latency(adapter, config),
@@ -103,6 +110,52 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
+
+
+def _measure_profile_validation(config: BenchmarkConfig) -> dict[str, Any]:
+    request = _chat_request(config.model, stream=True)
+    capabilities = OpenAiNnrpCapabilityDocument.level1()
+    for _ in range(config.warmup):
+        validate_request(request, capabilities)
+
+    samples: list[float] = []
+    for _ in range(config.iterations):
+        started = time.perf_counter_ns()
+        validate_request(request, capabilities)
+        samples.append(_elapsed_us(started, time.perf_counter_ns()))
+    return _latency_scenario(
+        "profile.validation",
+        samples,
+        event_count=config.iterations,
+    )
+
+
+def _measure_profile_event_mapping(config: BenchmarkConfig) -> dict[str, Any]:
+    chunk = {
+        "id": "chatcmpl-benchmark",
+        "model": config.model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "hello"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    for _ in range(config.warmup):
+        map_openai_stream_chunk(chunk)
+
+    samples: list[float] = []
+    mapped_events = 0
+    for _ in range(config.iterations):
+        started = time.perf_counter_ns()
+        mapped_events += len(map_openai_stream_chunk(chunk))
+        samples.append(_elapsed_us(started, time.perf_counter_ns()))
+    return _latency_scenario(
+        "profile.event_mapping",
+        samples,
+        event_count=mapped_events,
+    )
 
 
 async def run_in_process_comparison_benchmark(
@@ -186,9 +239,7 @@ async def run_in_process_comparison_benchmark(
         "integration": _integration_metadata(backend, config.model),
         "max_completion_tokens": config.max_completion_tokens,
         "paths": (
-            ["nnrp.direct_profile_events", "openai.http_sse"]
-            if config.http_url
-            else ["nnrp.direct_profile_events"]
+            ["nnrp.direct_profile_events", "openai.http_sse"] if config.http_url else ["nnrp.direct_profile_events"]
         ),
         "scenarios": scenarios,
     }

@@ -50,6 +50,8 @@ async def test_benchmark_reports_core_latency_scenarios(monkeypatch: pytest.Monk
     }
     scenario_names = {scenario["name"] for scenario in report["scenarios"]}
     assert scenario_names == {
+        "profile.validation",
+        "profile.event_mapping",
         "chat.non_streaming.roundtrip",
         "chat.streaming.event_latency",
         "chat.streaming.cancellation_latency",
@@ -80,7 +82,7 @@ def test_cli_writes_benchmark_report_file(tmp_path: Path) -> None:
     assert exit_code == 0
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["adapter"] == "vllm-nnrp-adapter"
-    assert report["scenarios"][0]["name"] == "chat.non_streaming.roundtrip"
+    assert report["scenarios"][0]["name"] == "profile.validation"
 
 
 @pytest.mark.asyncio

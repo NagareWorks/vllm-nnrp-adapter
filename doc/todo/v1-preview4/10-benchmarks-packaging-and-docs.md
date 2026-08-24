@@ -4,7 +4,7 @@
 
 - [ ] Keep this workstream focused on adapter overhead, regression detection, and reproducible
   technical evidence; keep adoption-value claims in `11-adoption-value-and-overdesign-gate.md`.
-- [ ] Measure profile validation and event mapping without vLLM to isolate adapter overhead.
+- [x] Measure profile validation and event mapping without vLLM to isolate adapter overhead.
 - [ ] Measure native submit-to-admission, backend chunk-to-result, control-frame handling, and
   cancellation-to-abort latency.
 - [ ] Measure queue pressure, backpressure response, credit recovery, stale-result suppression, and
