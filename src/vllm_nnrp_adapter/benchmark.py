@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import statistics
 import time
 import urllib.error
 import urllib.request
@@ -195,16 +197,13 @@ async def run_in_process_comparison_benchmark(
                     cancel_after_first_event=True,
                 )
 
-            scenarios.append(
-                await _measure_path_matrix(
-                    "nnrp.direct_profile_events",
-                    nnrp_runner,
-                    cancellation_runner=nnrp_cancel_runner,
-                    config=config,
-                    prompt_tokens=prompt_tokens,
-                    concurrency=concurrency,
-                )
-            )
+            paths: list[
+                tuple[
+                    str,
+                    Callable[[], Awaitable[dict[str, Any]]],
+                    Callable[[], Awaitable[dict[str, Any]]],
+                ]
+            ] = [("nnrp.direct_profile_events", nnrp_runner, nnrp_cancel_runner)]
             if config.http_url:
 
                 async def http_runner(prompt: str = prompt) -> dict[str, Any]:
@@ -217,17 +216,21 @@ async def run_in_process_comparison_benchmark(
                         cancel_after_first_event=True,
                     )
 
-                scenarios.append(
-                    await _measure_path_matrix(
-                        "openai.http_sse",
-                        http_runner,
-                        cancellation_runner=http_cancel_runner,
-                        config=config,
-                        prompt_tokens=prompt_tokens,
-                        concurrency=concurrency,
-                    )
-                )
+                paths.append(("openai.http_sse", http_runner, http_cancel_runner))
 
+            scenarios.extend(
+                await _measure_interleaved_path_matrix(
+                    paths,
+                    config=config,
+                    prompt_tokens=prompt_tokens,
+                    concurrency=concurrency,
+                )
+            )
+
+    path_names = (
+        ["nnrp.direct_profile_events", "openai.http_sse"] if config.http_url else ["nnrp.direct_profile_events"]
+    )
+    schedule = "rotating-batch-interleave" if config.http_url else "single-path"
     return {
         "profile": "openai-compatible",
         "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -238,9 +241,18 @@ async def run_in_process_comparison_benchmark(
         "model": config.model,
         "integration": _integration_metadata(backend, config.model),
         "max_completion_tokens": config.max_completion_tokens,
-        "paths": (
-            ["nnrp.direct_profile_events", "openai.http_sse"] if config.http_url else ["nnrp.direct_profile_events"]
-        ),
+        "paths": path_names,
+        "schedule": schedule,
+        "input_manifest": {
+            "model": config.model,
+            "iterations": config.iterations,
+            "warmup": config.warmup,
+            "prompt_tokens": list(config.prompt_tokens),
+            "concurrency": list(config.concurrency),
+            "max_completion_tokens": config.max_completion_tokens,
+            "paths": path_names,
+            "schedule": schedule,
+        },
         "scenarios": scenarios,
     }
 
@@ -402,6 +414,102 @@ async def _measure_path_matrix(
         concurrency=concurrency,
     )
 
+    return _build_path_scenario(
+        path_name,
+        results,
+        cancellation_results,
+        prompt_tokens=prompt_tokens,
+        concurrency=concurrency,
+        elapsed_s=elapsed_s,
+    )
+
+
+async def _measure_interleaved_path_matrix(
+    paths: list[
+        tuple[
+            str,
+            Callable[[], Awaitable[dict[str, Any]]],
+            Callable[[], Awaitable[dict[str, Any]]],
+        ]
+    ],
+    *,
+    config: BenchmarkConfig,
+    prompt_tokens: int,
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    if not paths:
+        raise ValueError("paths must not be empty")
+
+    for warmup_index in range(config.warmup):
+        for _name, request_runner, _cancellation_runner in _rotated(paths, warmup_index):
+            await request_runner()
+
+    request_results: dict[str, list[dict[str, Any]]] = {name: [] for name, _runner, _cancel in paths}
+    cancellation_results: dict[str, list[dict[str, Any]]] = {name: [] for name, _runner, _cancel in paths}
+    request_elapsed_ns = {name: 0 for name, _runner, _cancel in paths}
+    remaining = config.iterations
+    batch_index = 0
+    while remaining > 0:
+        batch_size = min(concurrency, remaining)
+        for name, request_runner, _cancellation_runner in _rotated(paths, batch_index):
+            started = time.perf_counter_ns()
+            request_results[name].extend(await asyncio.gather(*(request_runner() for _ in range(batch_size))))
+            request_elapsed_ns[name] += time.perf_counter_ns() - started
+        remaining -= batch_size
+        batch_index += 1
+
+    remaining = config.iterations
+    batch_index = 0
+    while remaining > 0:
+        batch_size = min(concurrency, remaining)
+        for name, _request_runner, cancellation_runner in _rotated(paths, batch_index):
+            cancellation_results[name].extend(await asyncio.gather(*(cancellation_runner() for _ in range(batch_size))))
+        remaining -= batch_size
+        batch_index += 1
+
+    return [
+        _build_path_scenario(
+            name,
+            request_results[name],
+            cancellation_results[name],
+            prompt_tokens=prompt_tokens,
+            concurrency=concurrency,
+            elapsed_s=request_elapsed_ns[name] / 1_000_000_000,
+        )
+        for name, _runner, _cancel in paths
+    ]
+
+
+def _rotated(
+    paths: list[
+        tuple[
+            str,
+            Callable[[], Awaitable[dict[str, Any]]],
+            Callable[[], Awaitable[dict[str, Any]]],
+        ]
+    ],
+    index: int,
+) -> list[
+    tuple[
+        str,
+        Callable[[], Awaitable[dict[str, Any]]],
+        Callable[[], Awaitable[dict[str, Any]]],
+    ]
+]:
+    offset = index % len(paths)
+    return paths[offset:] + paths[:offset]
+
+
+def _build_path_scenario(
+    path_name: str,
+    results: list[dict[str, Any]],
+    cancellation_results: list[dict[str, Any]],
+    *,
+    prompt_tokens: int,
+    concurrency: int,
+    elapsed_s: float,
+) -> dict[str, Any]:
+
     successes = [result for result in results if result["ok"]]
     errors = [result for result in results if not result["ok"]]
     cancellation_successes = [result for result in cancellation_results if result["ok"]]
@@ -415,7 +523,9 @@ async def _measure_path_matrix(
         "path": path_name,
         "prompt_tokens": prompt_tokens,
         "concurrency": concurrency,
-        "iterations": config.iterations,
+        "iterations": len(results),
+        "sample_count": len(results),
+        "cancellation_sample_count": len(cancellation_results),
         "success_count": len(successes),
         "error_count": len(errors),
         "error_rate": len(errors) / len(results) if results else 0.0,
@@ -431,6 +541,14 @@ async def _measure_path_matrix(
         "output_tokens_per_sec": output_tokens / elapsed_s if elapsed_s > 0 else 0.0,
         "requests_per_sec": len(successes) / elapsed_s if elapsed_s > 0 else 0.0,
         "elapsed_s": elapsed_s,
+        "mean_90ci_us": {
+            "ttft": _mean_confidence_interval(ttft_samples),
+            "tpot": _mean_confidence_interval(tpot_samples),
+            "rtt": _mean_confidence_interval(rtt_samples),
+            "cancellation": _mean_confidence_interval(cancellation_samples),
+        },
+        "samples": results,
+        "cancellation_samples": cancellation_results,
         "errors": [result["error"] for result in errors[:5]],
     }
 
@@ -639,6 +757,19 @@ def _percentile(sorted_samples: list[float], percentile: float) -> float:
         raise ValueError("samples must not be empty")
     index = min(len(sorted_samples) - 1, max(0, int(round((len(sorted_samples) - 1) * percentile))))
     return sorted_samples[index]
+
+
+def _mean_confidence_interval(samples: list[float]) -> dict[str, float | int] | None:
+    if not samples:
+        return None
+    mean = statistics.fmean(samples)
+    margin = 0.0 if len(samples) == 1 else 1.6448536269514722 * statistics.stdev(samples) / math.sqrt(len(samples))
+    return {
+        "sample_count": len(samples),
+        "mean_us": mean,
+        "lower_us": max(0.0, mean - margin),
+        "upper_us": mean + margin,
+    }
 
 
 def _elapsed_us(started_ns: int, finished_ns: int) -> float:

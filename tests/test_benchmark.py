@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from vllm_nnrp_adapter.benchmark import (
     _failed_sample,
     _http_headers,
     _long_context_chat_request,
+    _measure_interleaved_path_matrix,
     _measure_path_matrix,
     _openai_chunk_text_deltas,
     _run_http_sse_request_sync,
@@ -110,6 +112,17 @@ async def test_comparison_benchmark_reports_long_context_matrix() -> None:
     assert report["benchmark_kind"] == "in_process_comparison"
     assert report["integration"]["model"] == "mock-model"
     assert report["paths"] == ["nnrp.direct_profile_events"]
+    assert report["schedule"] == "single-path"
+    assert report["input_manifest"] == {
+        "model": "mock-model",
+        "iterations": 2,
+        "warmup": 0,
+        "prompt_tokens": [4, 8],
+        "concurrency": [1, 2],
+        "max_completion_tokens": 128,
+        "paths": ["nnrp.direct_profile_events"],
+        "schedule": "single-path",
+    }
     assert len(report["scenarios"]) == 4
     for scenario in report["scenarios"]:
         assert scenario["path"] == "nnrp.direct_profile_events"
@@ -118,6 +131,11 @@ async def test_comparison_benchmark_reports_long_context_matrix() -> None:
         assert scenario["ttft_p50_us"] is not None
         assert scenario["rtt_p95_us"] is not None
         assert scenario["output_tokens_per_sec"] >= 0
+        assert scenario["sample_count"] == 2
+        assert scenario["cancellation_sample_count"] == 2
+        assert scenario["mean_90ci_us"]["rtt"]["sample_count"] == 2
+        assert len(scenario["samples"]) == 2
+        assert len(scenario["cancellation_samples"]) == 2
 
 
 @pytest.mark.asyncio
@@ -149,6 +167,7 @@ async def test_comparison_benchmark_can_include_http_sse(monkeypatch: pytest.Mon
     )
 
     assert report["paths"] == ["nnrp.direct_profile_events", "openai.http_sse"]
+    assert report["schedule"] == "rotating-batch-interleave"
     assert {scenario["path"] for scenario in report["scenarios"]} == {"nnrp.direct_profile_events", "openai.http_sse"}
 
 
@@ -222,7 +241,34 @@ async def test_measure_path_matrix_reports_errors_and_cancellation() -> None:
     assert scenario["error_count"] == 1
     assert scenario["error_rate"] == 0.5
     assert scenario["cancellation_p50_us"] == 3.0
+    assert scenario["sample_count"] == 2
+    assert scenario["mean_90ci_us"]["rtt"]["sample_count"] == 1
+    assert scenario["samples"][0]["error"] == "boom"
     assert scenario["errors"] == ["boom"]
+
+
+@pytest.mark.asyncio
+async def test_comparison_paths_rotate_batch_order() -> None:
+    call_order: list[str] = []
+
+    def runner(name: str) -> Callable[[], Awaitable[dict[str, Any]]]:
+        async def run() -> dict[str, Any]:
+            call_order.append(name)
+            return {"ok": True, "ttft_us": 1.0, "tpot_us": None, "rtt_us": 2.0, "output_tokens": 1}
+
+        return run
+
+    first = runner("first")
+    second = runner("second")
+    scenarios = await _measure_interleaved_path_matrix(
+        [("first", first, first), ("second", second, second)],
+        config=BenchmarkConfig(iterations=3, warmup=0),
+        prompt_tokens=4,
+        concurrency=1,
+    )
+
+    assert call_order[:6] == ["first", "second", "second", "first", "first", "second"]
+    assert [scenario["path"] for scenario in scenarios] == ["first", "second"]
 
 
 def test_http_sse_sync_parses_stream_and_headers(monkeypatch: pytest.MonkeyPatch) -> None:

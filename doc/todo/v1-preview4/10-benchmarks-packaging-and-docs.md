@@ -17,7 +17,7 @@
 - [ ] Run the release matrix on vLLM `0.18.1`, `0.22.1`, and `0.26.0`.
 - [ ] Keep raw evidence and one combined comparison table under `doc/benchmarks` without host IPs,
   usernames, tokens, or machine ids.
-- [ ] Randomize or interleave compared runs, report sample counts and confidence intervals, and keep
+- [x] Randomize or interleave compared runs, report sample counts and confidence intervals, and keep
   the benchmark input manifest beside each result.
 - [ ] State plainly that model-dominated chat parity validates compatibility; it is not the primary
   heavy-transport performance claim.
