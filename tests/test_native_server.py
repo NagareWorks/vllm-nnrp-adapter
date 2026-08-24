@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 from nnrp import (
+    ERROR_FAMILY_LIFECYCLE,
     NativeInvalidStateError,
+    NativeProtocolError,
     NativeTransportBinding,
     NativeTransportEndpoint,
     NativeTransportProvider,
@@ -42,7 +44,12 @@ from nnrp.core import (
     unpack_typed_payload_frames,
     validate_result_push_body,
 )
-from nnrp.native import FFI_STATUS_INVALID_STATE, FFI_STATUS_WOULD_BLOCK, NativeStatus
+from nnrp.native import (
+    FFI_STATUS_INVALID_STATE,
+    FFI_STATUS_PROTOCOL_ERROR,
+    FFI_STATUS_WOULD_BLOCK,
+    NativeStatus,
+)
 from nnrp.runtime import (
     CapabilityMetadata,
     ControlRequestMetadata,
@@ -68,11 +75,17 @@ from nnrp.runtime import (
 )
 from nnrp.server import NativeServerAcceptOptions, NativeServerBootstrapOptions, NativeServerProviderRoute
 
-from vllm_nnrp_adapter import NnrpServerConfig, OpenAiNnrpAdapter, serve
+from vllm_nnrp_adapter import (
+    NnrpServerConfig,
+    OpenAiNnrpAdapter,
+    StructuredLogObservationSink,
+    serve,
+)
 from vllm_nnrp_adapter.nnrp_runtime import (
     _AdmissionWindowReporter,
     _apply_trace_context,
     _BackendTraceContextSlot,
+    _finalize_cancelled_operation,
     _native_handle_identity,
     _NativeCallExecutor,
     _OperationObservationTracker,
@@ -298,10 +311,12 @@ class FakeOperation:
     result_drops: list[tuple[ResultDropReasonMetadata, bytes]] = field(default_factory=list)
     on_terminal: Callable[[], None] | None = None
     fail_next_terminal_result: bool = False
+    fail_next_terminal_lifecycle_error: bool = False
     cancel_next_terminal_result: bool = False
     fail_next_progress_invalid_state: bool = False
     partial_send_gate: asyncio.Event | None = None
     partial_send_observer: Callable[[bool], None] | None = None
+    terminal_send_observer: Callable[[], None] | None = None
 
     def __post_init__(self, body: bytes, metadata: FrameSubmitMetadata) -> None:
         self.submit = NativeRuntimeEvent(
@@ -318,9 +333,20 @@ class FakeOperation:
         )
 
     async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
+        if self.terminal_send_observer is not None:
+            self.terminal_send_observer()
         if self.cancel_next_terminal_result:
             self.cancel_next_terminal_result = False
             raise asyncio.CancelledError
+        if self.fail_next_terminal_lifecycle_error:
+            self.fail_next_terminal_lifecycle_error = False
+            raise NativeProtocolError(
+                NativeStatus(
+                    FFI_STATUS_PROTOCOL_ERROR,
+                    error_family=ERROR_FAMILY_LIFECYCLE,
+                ),
+                "native runtime operation became terminal before RESULT_PUSH",
+            )
         if self.fail_next_terminal_result:
             self.fail_next_terminal_result = False
             raise OSError("terminal profile result unavailable")
@@ -1366,7 +1392,7 @@ async def test_operation_observation_records_effective_output_pressure(
 
 
 @pytest.mark.asyncio
-async def test_terminal_send_cancellation_preserves_completed_operation_state() -> None:
+async def test_terminal_send_cancellation_before_write_preserves_disconnect_drop() -> None:
     operation = FakeOperation(
         operation_id=72,
         frame_id=20,
@@ -1408,9 +1434,11 @@ async def test_terminal_send_cancellation_preserves_completed_operation_state() 
         counters=counters,
     )
 
-    assert record.state is OperationState.COMPLETED
+    assert record.state is OperationState.DROPPED
     assert record.resources_released is True
     assert counters.terminal_results == 0
+    assert operation.terminal_results == []
+    assert operation.result_drops == []
 
 
 @pytest.mark.asyncio
@@ -1880,6 +1908,124 @@ async def test_native_terminal_race_waits_for_control_before_emitting_drop_reaso
     assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
     assert counters.terminal_results == 1
     assert counters.result_drops == 1
+
+
+@pytest.mark.asyncio
+async def test_native_terminal_result_lifecycle_race_becomes_cancelled_drop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    terminal_attempted = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=68,
+        frame_id=168,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=68),
+        terminal_results=[],
+        fail_next_terminal_lifecycle_error=True,
+        terminal_send_observer=terminal_attempted.set,
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-68")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        active_profile_id=0,
+        backend_family="StreamingBackend",
+    )
+    counters = _ServeCounters()
+    task = asyncio.create_task(
+        _serve_operation(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            operation,  # type: ignore[arg-type]
+            record=record,
+            control=control,
+            observation=observation,
+            observation_sinks=(StructuredLogObservationSink(),),
+            counters=counters,
+        )
+    )
+    control.bind(task)
+    await asyncio.wait_for(terminal_attempted.wait(), timeout=1)
+
+    disposition = await control.apply(
+        RuntimeControlRequest(
+            kind=RuntimeControlKind.CANCEL,
+            operation_id=operation.operation_id,
+            control_sequence=1,
+            reason_code=3,
+            source_role=RuntimeRole.CLIENT,
+            flags=0,
+            diagnostic=b"peer_cancelled",
+        ),
+        terminal=False,
+    )
+    await task
+
+    assert disposition is RuntimeControlDisposition.APPLIED
+    assert operation.terminal_results == []
+    assert len(operation.partial_results) == 2
+    assert len(operation.result_drops) == 1
+    assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
+    assert counters.partial_results == 2
+    assert counters.terminal_results == 1
+    assert counters.result_drops == 1
+    observation_record = _observation_records(caplog)[0]
+    assert observation_record["terminal_outcome"] == "cancelled"
+    assert observation_record["output_event_count"] == 2
+    assert observation_record["cancellation_kind"] == "cancel"
+    assert observation_record["drop_reason"] == "peer_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_late_disconnect_does_not_reclassify_completed_observation() -> None:
+    operation = FakeOperation(
+        operation_id=69,
+        frame_id=169,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=69),
+        terminal_results=[],
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-69")
+    record.transition(OperationState.QUEUED)
+    record.transition(OperationState.ADMITTED)
+    record.terminate(OperationState.COMPLETED)
+    control = OperationControlSlot(operation.operation_id)
+    control.terminal_request = RuntimeControlRequest(
+        kind=RuntimeControlKind.PEER_DISCONNECT,
+        operation_id=operation.operation_id,
+        control_sequence=1,
+        reason_code=0,
+        source_role=RuntimeRole.CLIENT,
+        flags=0,
+        diagnostic=b"peer_disconnect",
+    )
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="tcp",
+        active_profile_id=0,
+    )
+
+    finalized = await _finalize_cancelled_operation(
+        operation,  # type: ignore[arg-type]
+        record=record,
+        control=control,
+        observation=observation,
+        result_sequence=0,
+        counters=_ServeCounters(),
+        session=None,
+        native=None,
+    )
+    result = observation.finish(record.state)
+
+    assert finalized is True
+    assert result.terminal_outcome == "completed"
+    assert result.cancellation_kind is None
+    assert result.cancellation_source is None
+    assert result.drop_reason is None
 
 
 @pytest.mark.asyncio

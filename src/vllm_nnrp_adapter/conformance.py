@@ -90,6 +90,11 @@ def _call_backend_factory(spec: str) -> object:
 class MockChatCompletionBackend:
     supports_tool_calls = True
 
+    def __init__(self, *, stream_inter_event_delay_s: float = 0.0) -> None:
+        if stream_inter_event_delay_s < 0:
+            raise ValueError("stream_inter_event_delay_s must be non-negative")
+        self._stream_inter_event_delay_s = stream_inter_event_delay_s
+
     def create_chat_completion(self, body: Mapping[str, Any]) -> Mapping[str, Any] | AsyncIterator[Mapping[str, Any]]:
         model = str(body.get("model", "mock-model"))
         if model == "backend-error":
@@ -122,6 +127,9 @@ class MockChatCompletionBackend:
             "model": str(body.get("model", "mock-model")),
             "choices": [{"index": 0, "delta": {"content": "hello"}}],
         }
+
+        if self._stream_inter_event_delay_s:
+            await asyncio.sleep(self._stream_inter_event_delay_s)
 
         tools = body.get("tools")
         if isinstance(tools, list) and tools:

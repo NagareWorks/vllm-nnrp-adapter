@@ -264,7 +264,13 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         },
         {"name": "websocket", "endpoint": "ws://127.0.0.1:39124/nnrp", "tls": False},
     ]
-    assert manifest["wire_conformance"]["capabilities"] == ["profile.openai-compatible.level1.wire"]
+    assert manifest["wire_conformance"]["capabilities"] == [
+        "profile.openai-compatible.level1.wire",
+        "control.cancel_abort",
+        "control.deadline_expire",
+        "control.result_drop_reason",
+        "control.trace_context",
+    ]
     evidence = [json.loads(line) for line in observation_output.read_text(encoding="utf-8").splitlines()]
     assert evidence == []
 

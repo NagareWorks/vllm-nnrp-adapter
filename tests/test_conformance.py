@@ -13,6 +13,29 @@ def make_backend() -> MockChatCompletionBackend:
     return MockChatCompletionBackend()
 
 
+def test_mock_backend_rejects_negative_stream_delay() -> None:
+    with pytest.raises(ValueError, match="must be non-negative"):
+        MockChatCompletionBackend(stream_inter_event_delay_s=-0.001)
+
+
+@pytest.mark.asyncio
+async def test_mock_backend_honors_stream_inter_event_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed_delays: list[float] = []
+
+    async def capture_delay(delay: float) -> None:
+        observed_delays.append(delay)
+
+    monkeypatch.setattr("vllm_nnrp_adapter.conformance.asyncio.sleep", capture_delay)
+    stream = MockChatCompletionBackend(stream_inter_event_delay_s=0.5).create_chat_completion({"stream": True})
+    assert hasattr(stream, "__aiter__")
+    iterator = stream.__aiter__()
+
+    await anext(iterator)
+    await anext(iterator)
+
+    assert observed_delays == [0.5]
+
+
 @pytest.mark.asyncio
 async def test_conformance_runner_executes_plan_with_mock_backend() -> None:
     plan = json.loads(FIXTURE_PLAN.read_text(encoding="utf-8"))

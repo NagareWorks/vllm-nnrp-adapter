@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 
@@ -59,6 +60,8 @@ def main() -> int:
                     str(target_manifest),
                     "--scenarios",
                     str(conformance_root / "wire-conformance/nnrp-1-preview4/cases/openai-compatible-e2e.json"),
+                    "--scenarios",
+                    str(conformance_root / "wire-conformance/nnrp-1-preview4/cases/runtime-control-e2e.json"),
                     "--output",
                     str(plan),
                     "--results-path",
@@ -131,18 +134,46 @@ def _validate_observation_evidence(path: Path) -> None:
     operation_records = [record for record in records if record.get("record_type") == "operation"]
     if len(startup_records) != 1:
         raise RuntimeError(f"wire target emitted {len(startup_records)} startup observation records")
-    if len(operation_records) != 3:
+    if len(operation_records) != 6:
         raise RuntimeError(f"wire target emitted {len(operation_records)} operation observation records")
-    transports = {record.get("selected_transport") for record in operation_records}
-    if transports != {"tcp", "ipc", "websocket"}:
-        raise RuntimeError(f"wire observation transports do not match the exercised providers: {transports}")
+    expected_operations = Counter(
+        {
+            (901, "tcp", "completed"): 1,
+            (901, "ipc", "completed"): 1,
+            (901, "websocket", "completed"): 1,
+            (101, "tcp", "cancelled"): 1,
+            (151, "tcp", "completed"): 1,
+            (101, "ipc", "cancelled"): 1,
+        }
+    )
+    observed_operations = Counter(
+        (record.get("operation_id"), record.get("selected_transport"), record.get("terminal_outcome"))
+        for record in operation_records
+    )
+    if observed_operations != expected_operations:
+        raise RuntimeError(
+            "wire observations do not match the exercised profile and runtime-control operations: "
+            f"{observed_operations}"
+        )
     for record in operation_records:
-        if record.get("terminal_outcome") != "completed":
-            raise RuntimeError("wire observation did not record a completed terminal outcome")
         if not isinstance(record.get("operation_id"), int) or record["operation_id"] <= 0:
             raise RuntimeError("wire observation did not preserve operation identity")
         if not isinstance(record.get("stage_transitions"), list) or not record["stage_transitions"]:
             raise RuntimeError("wire observation did not preserve the PROGRESS stage timeline")
+        if record.get("terminal_outcome") == "cancelled":
+            if (
+                record.get("cancellation_kind") != "cancel"
+                or record.get("cancellation_source") != "client"
+                or record.get("drop_reason") != "peer_cancelled"
+            ):
+                raise RuntimeError("wire cancellation observation did not preserve control and drop evidence")
+            if not isinstance(record.get("output_event_count"), int) or record["output_event_count"] < 1:
+                raise RuntimeError("wire cancellation observation did not preserve its in-flight partial result")
+        elif any(
+            record.get(field) is not None
+            for field in ("cancellation_kind", "cancellation_source", "drop_reason")
+        ):
+            raise RuntimeError("wire completion observation was reclassified by a late control event")
 
 
 if __name__ == "__main__":

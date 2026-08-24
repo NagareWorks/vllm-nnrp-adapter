@@ -17,7 +17,7 @@
 - [ ] Cover native handshake, submit/result order, cancellation/abort, priority/deadline, progress,
   pressure/credit, capability costs, route hints, trace context, result-drop reasons, objects,
   deltas, and cache references.
-- [ ] Assert that streaming profile events use ordered `PARTIAL_RESULT` frames and that exactly one
+- [x] Assert that streaming profile events use ordered `PARTIAL_RESULT` frames and that exactly one
   terminal `RESULT_PUSH` or typed drop/error outcome closes each operation.
 - [ ] Run installed-provider scenarios for TCP, QUIC, IPC, and WebSocket.
 - [ ] Validate missing, reordered, duplicate, unexpected, late-after-terminal, and malformed frames.

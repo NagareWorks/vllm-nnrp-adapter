@@ -10,8 +10,10 @@ from types import MappingProxyType
 from typing import Any, TypeVar
 
 from nnrp import (  # type: ignore[import-untyped]
+    ERROR_FAMILY_LIFECYCLE,
     PREVIEW4_CAPABILITY_TOKENS,
     NativeInvalidStateError,
+    NativeProtocolError,
     NativeRuntimeServerOperation,
     NativeRuntimeServerSession,
     NativeTransportBinding,
@@ -896,14 +898,14 @@ async def _serve_operation(
                     )
                     if retry is not None:
                         observation.record_retry_hint(retry)
-                observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):
                     await progress.emit(OperationProgressStage.FINALIZING)
-                    record.terminate(_terminal_operation_state(event))
                     await progress.emit(_terminal_progress_stage(event))
-                    terminal_sent = True
                     metadata, terminal_body = _terminal_reply(operation, event, encoded_event=body)
-                    await operation.send_result(metadata, terminal_body)
+                    await _send_terminal_result(operation, metadata, terminal_body)
+                    observation.record_event(event, body_bytes=len(body))
+                    record.terminate(_terminal_operation_state(event))
+                    terminal_sent = True
                     counters.terminal_results += 1
                     break
                 record.mark_partial()
@@ -920,6 +922,7 @@ async def _serve_operation(
                     ),
                     body,
                 )
+                observation.record_event(event, body_bytes=len(body))
                 counters.partial_results += 1
         except asyncio.CancelledError:
             if not await _finalize_cancelled_operation(
@@ -953,6 +956,8 @@ async def _serve_operation(
             ):
                 return
             raise
+        except _NativeTerminalRaceError:
+            raise
         except Exception as error:
             observation.record_exception(error)
             if terminal_sent:
@@ -961,22 +966,39 @@ async def _serve_operation(
         else:
             if not terminal_sent:
                 await progress.emit(OperationProgressStage.FINALIZING)
-                record.terminate(OperationState.COMPLETED)
                 await progress.emit(OperationProgressStage.COMPLETED)
+                await _send_terminal_result(operation, _terminal_metadata(operation, None), b"")
+                record.terminate(OperationState.COMPLETED)
                 terminal_sent = True
-                await operation.send_result(_terminal_metadata(operation, None), b"")
                 counters.terminal_results += 1
 
         if not terminal_sent:
             await progress.emit(OperationProgressStage.FINALIZING)
-            record.terminate(_terminal_operation_state(event))
             await progress.emit(_terminal_progress_stage(event))
             body = _encode_event(event)
-            observation.record_event(event, body_bytes=len(body))
-            terminal_sent = True
             metadata, terminal_body = _terminal_reply(operation, event, encoded_event=body)
-            await operation.send_result(metadata, terminal_body)
+            await _send_terminal_result(operation, metadata, terminal_body)
+            observation.record_event(event, body_bytes=len(body))
+            record.terminate(_terminal_operation_state(event))
+            terminal_sent = True
             counters.terminal_results += 1
+    except _NativeTerminalRaceError:
+        try:
+            await control.wait_for_terminal_request()
+        except asyncio.CancelledError:
+            pass
+        if await _finalize_cancelled_operation(
+            operation,
+            record=record,
+            control=control,
+            observation=observation,
+            result_sequence=result_sequence,
+            counters=counters,
+            session=session,
+            native=native,
+        ):
+            return
+        raise
     finally:
         try:
             await control.complete()
@@ -1132,11 +1154,6 @@ async def _finalize_cancelled_operation(
 ) -> bool:
     control_request = control.terminal_request
     if record.is_terminal:
-        if control_request is not None:
-            observation.record_control(
-                control_request,
-                drop_reason=ResultDropReasonCode.TRANSPORT_CLOSED,
-            )
         return True
     if control_request is None:
         record.terminate(OperationState.CANCELLED)
@@ -1149,13 +1166,13 @@ async def _finalize_cancelled_operation(
     }:
         await _send_terminal_trace_context(operation, session=session, native=native)
     if control_request.kind is RuntimeControlKind.CANCEL:
-        record.terminate(OperationState.CANCELLED)
         drop_reason = await _send_cancelled_outcome(
             operation,
             control_request=control_request,
             result_sequence=result_sequence,
             counters=counters,
         )
+        record.terminate(OperationState.CANCELLED)
         observation.record_control(control_request, drop_reason=drop_reason)
         return True
     if control_request.kind in {
@@ -1164,7 +1181,6 @@ async def _finalize_cancelled_operation(
         RuntimeControlKind.DEADLINE_EXPIRED,
         RuntimeControlKind.SUPERSEDE,
     }:
-        record.terminate(OperationState.DROPPED)
         diagnostic = control_request.diagnostic or {
             RuntimeControlKind.ABORT: b"peer_abort",
             RuntimeControlKind.SERVER_SHUTDOWN: b"server_shutdown",
@@ -1189,12 +1205,35 @@ async def _finalize_cancelled_operation(
             ),
             diagnostic,
         )
+        record.terminate(OperationState.DROPPED)
         counters.result_drops += 1
         counters.terminal_results += 1
         return True
     record.terminate(OperationState.DROPPED)
     observation.record_control(control_request)
     return True
+
+
+class _NativeTerminalRaceError(RuntimeError):
+    pass
+
+
+async def _send_terminal_result(
+    operation: NativeRuntimeServerOperation,
+    metadata: ResultPushMetadata,
+    body: bytes,
+) -> None:
+    try:
+        await operation.send_result(metadata, body)
+    except NativeProtocolError as error:
+        status = error.status
+        if (
+            status.error_family != ERROR_FAMILY_LIFECYCLE
+            or status.protocol_error_code != 0
+            or status.detail_code != 0
+        ):
+            raise
+        raise _NativeTerminalRaceError from error
 
 
 async def _send_terminal_trace_context(

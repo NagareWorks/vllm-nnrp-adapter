@@ -18,7 +18,7 @@ from nnrp.server import NativeServerProviderRoute  # type: ignore[import-untyped
 
 from .adapter import OpenAiNnrpAdapter
 from .benchmark import BenchmarkConfig, run_benchmark_sync, run_comparison_benchmark_sync
-from .conformance import load_backend_async, run_conformance_plan_sync
+from .conformance import MockChatCompletionBackend, load_backend_async, run_conformance_plan_sync
 from .nnrp_runtime import NnrpServerConfig, _serve_with_ready, serve
 from .observability import (
     ObservationSink,
@@ -263,6 +263,8 @@ async def _serve_wire_target(
     observation_output: Path | None = None,
 ) -> None:
     backend = await load_backend_async(backend_spec)
+    if isinstance(backend, MockChatCompletionBackend):
+        backend = MockChatCompletionBackend(stream_inter_event_delay_s=0.5)
     provider_routes = _wire_target_provider_routes(ready_output)
     observation_sinks: tuple[ObservationSink, ...] = (StructuredLogObservationSink(),)
     if observation_output is not None:
@@ -296,7 +298,13 @@ async def _serve_wire_target(
                     {"name": "websocket", "endpoint": websocket, "tls": False},
                 ],
                 "host_route_providers": [],
-                "capabilities": ["profile.openai-compatible.level1.wire"],
+                "capabilities": [
+                    "profile.openai-compatible.level1.wire",
+                    "control.cancel_abort",
+                    "control.deadline_expire",
+                    "control.result_drop_reason",
+                    "control.trace_context",
+                ],
                 "limits": {"max_frame_bytes": 67_108_864, "max_in_flight": 1},
             },
         }
