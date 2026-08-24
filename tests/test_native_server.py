@@ -295,6 +295,8 @@ class FakeOperation:
     on_terminal: Callable[[], None] | None = None
     fail_next_terminal_result: bool = False
     cancel_next_terminal_result: bool = False
+    partial_send_gate: asyncio.Event | None = None
+    partial_send_observer: Callable[[bool], None] | None = None
 
     def __post_init__(self, body: bytes, metadata: FrameSubmitMetadata) -> None:
         self.submit = NativeRuntimeEvent(
@@ -322,7 +324,15 @@ class FakeOperation:
             self.on_terminal()
 
     async def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
-        self.partial_results.append((metadata, body))
+        if self.partial_send_observer is not None:
+            self.partial_send_observer(True)
+        try:
+            if self.partial_send_gate is not None:
+                await self.partial_send_gate.wait()
+            self.partial_results.append((metadata, body))
+        finally:
+            if self.partial_send_observer is not None:
+                self.partial_send_observer(False)
 
     async def send_progress(self, metadata: ProgressMetadata, body: bytes = b"") -> None:
         self.progress_results.append((metadata, body))
@@ -541,12 +551,14 @@ class FakeServer:
 class MultiSessionFakeServer:
     def __init__(self, sessions: list[Any]) -> None:
         self._pending = list(sessions)
+        self.accepted_count = 0
         self.bound_provider_endpoints: dict[str, NativeTransportEndpoint] = {}
 
     async def accept(self, options: NativeServerAcceptOptions | None = None) -> Any:
         assert options is not None
         assert options.timeout_ms == 10
         if self._pending:
+            self.accepted_count += 1
             return self._pending.pop(0)
         raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
 
@@ -2003,6 +2015,166 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         assert observation["selected_transport"] == "ipc"
         assert observation["output_event_count"] == 3
         assert observation["terminal_outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_native_server_never_accepts_more_sessions_than_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    first_terminal = threading.Event()
+    second_terminal = threading.Event()
+    first = FakeOperation(
+        operation_id=81,
+        frame_id=181,
+        body=_typed_profile_body(_chat_request(model="first")),
+        metadata=_submit_metadata(operation_id=81),
+        terminal_results=[],
+        on_terminal=first_terminal.set,
+    )
+
+    def finish_second() -> None:
+        second_terminal.set()
+        stop_event.set()
+
+    second = FakeOperation(
+        operation_id=82,
+        frame_id=182,
+        body=_typed_profile_body(_chat_request(model="second")),
+        metadata=_submit_metadata(operation_id=82),
+        terminal_results=[],
+        on_terminal=finish_second,
+    )
+    sessions = [
+        ScriptedEventSession(
+            [
+                FakeServerEvent(submit=first),
+                FakeServerEvent(runtime=_session_close_event(last_operation_id=81), wait_for_backend=True),
+            ],
+            operation=first,
+            backend_started=first_terminal,
+            stop_event=stop_event,
+        ),
+        ScriptedEventSession(
+            [
+                FakeServerEvent(submit=second),
+                FakeServerEvent(runtime=_session_close_event(last_operation_id=82), wait_for_backend=True),
+            ],
+            operation=second,
+            backend_started=second_terminal,
+            stop_event=stop_event,
+        ),
+    ]
+    server = MultiSessionFakeServer(sessions)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(server)),
+    )
+
+    serve_task = asyncio.create_task(
+        serve(
+            OpenAiNnrpAdapter(backend),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=3,
+                observation_sinks=(),
+            ),
+            stop_event=stop_event,
+        )
+    )
+    assert await asyncio.to_thread(backend.started.wait, 1)
+    await asyncio.sleep(0.02)
+    assert server.accepted_count == 1
+
+    backend._release.set()
+    statistics = await asyncio.wait_for(serve_task, timeout=2)
+
+    assert server.accepted_count == 2
+    assert statistics.accepted_sessions == 2
+    assert statistics.accepted_operations == 2
+    assert all(session.closed for session in sessions)
+
+
+@pytest.mark.asyncio
+async def test_native_server_bounds_operations_and_pending_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    output_gate = asyncio.Event()
+    pending_ready = asyncio.Event()
+    third_rejected = asyncio.Event()
+    pending_outputs = 0
+    max_pending_outputs = 0
+    completed = 0
+
+    def observe_pending(started: bool) -> None:
+        nonlocal pending_outputs, max_pending_outputs
+        pending_outputs += 1 if started else -1
+        max_pending_outputs = max(max_pending_outputs, pending_outputs)
+        if max_pending_outputs == 2:
+            pending_ready.set()
+
+    def finish_admitted() -> None:
+        nonlocal completed
+        completed += 1
+        if completed == 2:
+            stop_event.set()
+
+    operations = [
+        FakeOperation(
+            operation_id=operation_id,
+            frame_id=operation_id + 100,
+            body=_typed_profile_body(_chat_request(model=f"model-{operation_id}")),
+            metadata=_submit_metadata(operation_id=operation_id),
+            terminal_results=[],
+            on_terminal=finish_admitted if operation_id < 3 else third_rejected.set,
+            partial_send_gate=output_gate if operation_id < 3 else None,
+            partial_send_observer=observe_pending if operation_id < 3 else None,
+        )
+        for operation_id in range(1, 4)
+    ]
+    session = MultiOperationFakeSession(operations, operation_accepted=lambda: None)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+    backend = StreamingBackend()
+    serve_task = asyncio.create_task(
+        serve(
+            OpenAiNnrpAdapter(backend),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=2,
+                native_worker_count=4,
+                observation_sinks=(),
+            ),
+            stop_event=stop_event,
+        )
+    )
+
+    await asyncio.wait_for(pending_ready.wait(), timeout=1)
+    await asyncio.wait_for(third_rejected.wait(), timeout=1)
+    assert pending_outputs == 2
+    assert max_pending_outputs == 2
+    assert len(backend.requests) == 2
+
+    output_gate.set()
+    statistics = await asyncio.wait_for(serve_task, timeout=2)
+
+    assert pending_outputs == 0
+    assert statistics.accepted_sessions == 1
+    assert statistics.accepted_operations == 2
+    assert statistics.terminal_results == 3
+    rejected = _decode_terminal_profile_body(*operations[2].terminal_results[0])
+    assert rejected["error"]["code"] == "adapter_operation_limit"
 
 
 @pytest.mark.asyncio
