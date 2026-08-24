@@ -43,10 +43,25 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref }}
 
+      - name: Checkout pinned conformance suite
+        uses: actions/checkout@v5
+        with:
+          repository: NagareWorks/nnrp-conformance
+          ref: 54f7f6c4ef7484ba67708405bb3a2b319cd995a5
+          path: nnrp-conformance
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nnrp-conformance
 
       - name: Resolve version
         id: version
@@ -86,6 +101,7 @@ jobs:
           fi
 
       - name: Validate immutable release identity
+        if: inputs.create_tag
         shell: bash
         run: |
           set -euo pipefail
@@ -93,6 +109,10 @@ jobs:
           python scripts/check_release_identity.py \
             --expected-ref origin/main \
             --tag "${{ steps.version.outputs.tag_name }}"
+
+      - name: Validate Preview4 TODO closure
+        if: inputs.create_tag
+        run: python scripts/check_preview4_todo.py
 
       - name: Install dependencies
         run: |
@@ -114,6 +134,12 @@ jobs:
             --backend mock \
             --iterations 200 \
             --warmup 20
+          python scripts/run_api_profile_conformance.py \
+            --conformance-root nnrp-conformance \
+            --artifact-directory artifacts/api-profile-conformance
+          python scripts/run_wire_e2e.py \
+            --conformance-root nnrp-conformance \
+            --artifact-directory artifacts/wire-e2e
 
       - name: Build distributions
         run: |
@@ -137,7 +163,10 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: vllm-nnrp-adapter-${{ steps.version.outputs.package_version }}
-          path: dist/*
+          path: |
+            dist/*
+            artifacts/api-profile-conformance
+            artifacts/wire-e2e
           if-no-files-found: error
           retention-days: 14
 

@@ -19,6 +19,7 @@ def test_release_validates_immutable_git_and_registry_identity() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
     assert "Validate immutable release identity" in workflow
+    assert "Validate immutable release identity\n        if: inputs.create_tag" in workflow
     assert "scripts/check_release_identity.py" in workflow
     assert "--expected-ref origin/main" in workflow
     assert "Resolve PyPI publication identity" in workflow
@@ -35,3 +36,22 @@ def test_release_creates_tag_only_after_validation_and_build() -> None:
     assert workflow.index("Build distributions") < workflow.index("Create git tag")
     assert workflow.index("Resolve PyPI publication identity") < workflow.index("Create git tag")
     assert workflow.index("Create git tag") < workflow.index("Publish GitHub release")
+
+
+def test_release_requires_preview4_todo_closure_before_validation() -> None:
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "Validate Preview4 TODO closure\n        if: inputs.create_tag" in workflow
+    assert "run: python scripts/check_preview4_todo.py" in workflow
+    assert workflow.index("run: python scripts/check_preview4_todo.py") < workflow.index("Create git tag")
+
+
+def test_release_reruns_pinned_api_and_wire_conformance_before_tagging() -> None:
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "ref: 54f7f6c4ef7484ba67708405bb3a2b319cd995a5" in workflow
+    assert "python scripts/run_api_profile_conformance.py" in workflow
+    assert "python scripts/run_wire_e2e.py" in workflow
+    assert "artifacts/api-profile-conformance" in workflow
+    assert "artifacts/wire-e2e" in workflow
+    assert workflow.index("python scripts/run_wire_e2e.py") < workflow.index("Create git tag")

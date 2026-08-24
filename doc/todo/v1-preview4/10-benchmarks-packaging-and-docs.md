@@ -29,7 +29,7 @@
 - [x] Keep vLLM optional for normal installation and CI.
 - [ ] Add explicit workflow inputs for the three GPU smoke versions and evidence destination.
 - [x] Make release reruns idempotent and keep publication opt-in.
-- [ ] Run the complete TODO, test, conformance, package, and documentation gate before a release tag.
+- [x] Run the complete TODO, test, conformance, package, and documentation gate before a release tag.
 
 ## Documentation
 
@@ -39,7 +39,7 @@
 - [ ] Document cancellation, abort, deadlines, priorities, budgets, progress, pressure, capability
   costs, route hints, traces, drops, recovery, objects, and cache behavior.
 - [x] Document the exact Level 1 JSON boundary and the typed binary runtime-control boundary.
-- [ ] Update the English and Chinese `nnrp-doc` vLLM design pages to distinguish the
+- [x] Update the English and Chinese `nnrp-doc` vLLM design pages to distinguish the
   `0.18.0..<0.27` installation band from the tested compatibility anchors.
 - [x] Verify every documented adapter symbol against the installed package.
 - [ ] Record evidence for every advertised compatibility anchor and every unsupported capability.
