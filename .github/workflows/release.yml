@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       ref:
@@ -44,7 +41,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ inputs.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -65,20 +62,7 @@ jobs:
           print(f"release_name=vllm-nnrp-adapter v{version}")
           PY
 
-      - name: Validate pushed tag
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_tag="${{ steps.version.outputs.tag_name }}"
-          actual_tag="${{ github.ref_name }}"
-          if [ "$actual_tag" != "$expected_tag" ]; then
-            echo "Release tag mismatch: expected $expected_tag but workflow was triggered by $actual_tag."
-            exit 1
-          fi
-
       - name: Validate manual release options
-        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -91,19 +75,24 @@ jobs:
             exit 1
           fi
 
-      - name: Create git tag
-        if: github.event_name == 'workflow_dispatch' && inputs.create_tag
+          if [ "${{ inputs.publish_to_pypi }}" = "true" ] && [ "$PYPI_PUBLISH_MODE" != "trusted" ] && [ "$PYPI_PUBLISH_MODE" != "token" ]; then
+            echo "PyPI publishing requires PYPI_PUBLISH_MODE=trusted or token."
+            exit 1
+          fi
+
+          if [ "${{ inputs.publish_to_pypi }}" = "true" ] && [ "$PYPI_PUBLISH_MODE" = "token" ] && [ -z "$PYPI_API_TOKEN" ]; then
+            echo "Token-mode PyPI publishing requires PYPI_API_TOKEN."
+            exit 1
+          fi
+
+      - name: Validate immutable release identity
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --tags
-          tag="${{ steps.version.outputs.tag_name }}"
-          if [ -z "$(git tag --list "$tag")" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$tag"
-            git push origin "$tag"
-          fi
+          git fetch origin main --tags
+          python scripts/check_release_identity.py \
+            --expected-ref origin/main \
+            --tag "${{ steps.version.outputs.tag_name }}"
 
       - name: Install dependencies
         run: |
@@ -132,6 +121,18 @@ jobs:
           python scripts/check_distribution_metadata.py dist
           python -m twine check dist/*
 
+      - name: Resolve PyPI publication identity
+        id: pypi
+        if: inputs.publish_to_pypi
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/check_pypi_identity.py \
+            --dist dist \
+            --package vllm-nnrp-adapter \
+            --version "${{ steps.version.outputs.package_version }}" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v6
         with:
@@ -140,20 +141,56 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Create git tag
+        if: inputs.create_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags
+          tag="${{ steps.version.outputs.tag_name }}"
+          if [ -z "$(git tag --list "$tag")" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$tag"
+            git push origin "$tag"
+          else
+            echo "Release tag $tag already points to the validated source commit; reusing it."
+          fi
+
+      - name: Publish to PyPI with Trusted Publisher
+        if: inputs.create_tag && inputs.publish_to_pypi && steps.pypi.outputs.publish_required == 'true' && env.PYPI_PUBLISH_MODE == 'trusted'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Publish to PyPI with API token
+        if: inputs.create_tag && inputs.publish_to_pypi && steps.pypi.outputs.publish_required == 'true' && env.PYPI_PUBLISH_MODE == 'token' && env.PYPI_API_TOKEN != ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ env.PYPI_API_TOKEN }}
+
+      - name: Verify public PyPI identity
+        if: inputs.create_tag && inputs.publish_to_pypi
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if python scripts/check_pypi_identity.py \
+              --dist dist \
+              --package vllm-nnrp-adapter \
+              --version "${{ steps.version.outputs.package_version }}" \
+              --require-published; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              echo "Published distributions did not become available with matching hashes."
+              exit 1
+            fi
+            sleep 15
+          done
+
       - name: Publish GitHub release
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_tag && inputs.publish_github_release)
+        if: inputs.create_tag && inputs.publish_github_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag_name }}
           name: ${{ steps.version.outputs.release_name }}
           files: dist/*
-
-      - name: Publish to PyPI with Trusted Publisher
-        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_tag && inputs.publish_to_pypi)) && env.PYPI_PUBLISH_MODE == 'trusted'
-        uses: pypa/gh-action-pypi-publish@release/v1
-
-      - name: Publish to PyPI with API token
-        if: (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_tag && inputs.publish_to_pypi)) && env.PYPI_PUBLISH_MODE == 'token' && env.PYPI_API_TOKEN != ''
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ env.PYPI_API_TOKEN }}
