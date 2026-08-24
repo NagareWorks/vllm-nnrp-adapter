@@ -25,7 +25,7 @@
 ## Packaging And Workflows
 
 - [x] Build wheel and sdist with the Preview4 `nnrp-py` dependency and updated vLLM range.
-- [ ] Verify wheel contents, `py.typed`, metadata, README, license, entrypoints, and clean install.
+- [x] Verify wheel contents, `py.typed`, metadata, README, license, entrypoints, and clean install.
 - [ ] Keep vLLM optional for normal installation and CI.
 - [ ] Add explicit workflow inputs for the three GPU smoke versions and evidence destination.
 - [ ] Make release reruns idempotent and keep publication opt-in.
