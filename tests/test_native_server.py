@@ -413,8 +413,16 @@ class MultiOperationFakeSession:
         operations: list[FakeOperation],
         *,
         operation_accepted: Callable[[], None],
+        connection_identity: tuple[int, int] = (10_001, 1),
+        session_identity: tuple[int, int] = (20_001, 1),
     ) -> None:
         self.active_transport_name = "ipc"
+        self.server = SimpleNamespace(
+            handle=SimpleNamespace(id=connection_identity[0], generation=connection_identity[1])
+        )
+        self.handle = SimpleNamespace(
+            handle=SimpleNamespace(id=session_identity[0], generation=session_identity[1])
+        )
         self._pending = list(operations)
         self._operation_accepted = operation_accepted
         self.partial_results: list[tuple[PartialResultMetadata, bytes]] = []
@@ -784,6 +792,7 @@ async def test_unnegotiated_backend_failure_does_not_emit_recovery_controls() ->
     observation = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        active_profile_id=0,
         backend_family="OverloadedBackend",
     )
     session = FakeSession(operation, asyncio.Event())
@@ -934,6 +943,7 @@ async def test_output_credit_blocks_backend_pull_until_peer_grants_window() -> N
     observation = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        active_profile_id=0,
         backend_family="StreamingBackend",
         backend_binding=None,
         vllm_version=None,
@@ -1168,6 +1178,7 @@ async def test_terminal_send_cancellation_preserves_completed_operation_state() 
     observation = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="tcp",
+        active_profile_id=0,
         backend_family="StreamingBackend",
         backend_binding=None,
         vllm_version=None,
@@ -1212,6 +1223,7 @@ async def test_priority_update_reaches_backend_admission_without_request_body_po
     observation = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        active_profile_id=0,
         backend_family="PriorityAwareStreamingBackend",
         backend_binding=None,
         vllm_version=None,
@@ -1512,6 +1524,7 @@ def test_trace_context_correlates_session_and_active_operation_frames() -> None:
     observation = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        active_profile_id=0,
         clock_ns=lambda: 0,
     )
     backend_trace = _BackendTraceContextSlot()
@@ -1954,8 +1967,18 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
         operation.on_terminal = operation_completed
 
     sessions = [
-        MultiOperationFakeSession(operations[:2], operation_accepted=lambda: None),
-        MultiOperationFakeSession(operations[2:], operation_accepted=lambda: None),
+        MultiOperationFakeSession(
+            operations[:2],
+            operation_accepted=lambda: None,
+            connection_identity=(10_101, 11),
+            session_identity=(20_101, 21),
+        ),
+        MultiOperationFakeSession(
+            operations[2:],
+            operation_accepted=lambda: None,
+            connection_identity=(10_102, 12),
+            session_identity=(20_102, 22),
+        ),
     ]
     server_context = FakeServerContext(MultiSessionFakeServer(sessions))
     monkeypatch.setattr(
@@ -1994,6 +2017,7 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
             ]
         assert session.closed is True
     assert all(len(operation.terminal_results) == 1 for operation in operations)
+    assert all(operation.terminal_results[0][0].active_profile_id == 0 for operation in operations)
     observation_records = [
         json.loads(record.getMessage().removeprefix("nnrp_operation_observation "))
         for record in caplog.records
@@ -2003,10 +2027,17 @@ async def test_native_server_runs_sessions_and_operations_concurrently_with_per_
     assert {record["operation_id"] for record in observation_records} == {1, 2, 3, 4}
     for observation in observation_records:
         operation_id = observation["operation_id"]
+        session_index = 1 if operation_id <= 2 else 2
+        assert observation["connection_id"] == 10_100 + session_index
+        assert observation["connection_generation"] == 10 + session_index
+        assert observation["session_handle_id"] == 20_100 + session_index
+        assert observation["session_generation"] == 20 + session_index
+        assert observation["session_id"] == 1
         assert observation["frame_id"] == operation_id + 100
         assert observation["route_id"] == operation_id + 1_000
         assert observation["view_id"] == operation_id + 2_000
         assert observation["trace_id"] == operation_id + 3_000
+        assert observation["profile_id"] == 0
         assert observation["model_id"] == f"model-{operation_id}"
         assert observation["profile_operation"] == "chat.completions.create"
         assert observation["backend_family"] == "InterleavingBackend"

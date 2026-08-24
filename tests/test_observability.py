@@ -59,6 +59,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
     tracker = _OperationObservationTracker.from_operation(
         operation,
         selected_transport="ipc",
+        active_profile_id=0,
         backend_family="VllmBackend",
         backend_binding="current-0.26",
         vllm_version="0.26.0",
@@ -145,7 +146,7 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.identity.route_id == 27
     assert observation.identity.view_id == 37
     assert observation.identity.trace_id == 47
-    assert observation.identity.profile_id == int(InputProfile.UNSPECIFIED)
+    assert observation.identity.profile_id == 0
     assert observation.model_id == "test-model"
     assert observation.profile_operation == "chat.completions.create"
     assert observation.backend_family == "VllmBackend"
@@ -218,6 +219,7 @@ def test_operation_observation_records_trace_context_without_attribute_contents(
     tracker = _OperationObservationTracker.from_operation(
         _operation(),
         selected_transport="ipc",
+        active_profile_id=0,
         clock_ns=lambda: 0,
     )
 
@@ -246,6 +248,7 @@ def test_operation_observation_records_trace_context_without_attribute_contents(
         tracker = _OperationObservationTracker.from_operation(
             _operation(),
             selected_transport="ipc",
+            active_profile_id=0,
             clock_ns=lambda: 0,
         )
         tracker.record_trace_context(TraceContextMetadata(1, 2, 0, 0, 0, 1), b"")
@@ -256,6 +259,7 @@ def test_operation_observation_keeps_unavailable_values_absent() -> None:
     tracker = _OperationObservationTracker.from_operation(
         _operation(),
         selected_transport="websocket",
+        active_profile_id=0,
         clock_ns=lambda: next(ticks),
     )
     tracker.record_request({"body": {"model": 1}})

@@ -13,7 +13,7 @@
 - [x] Poll wire and lifecycle events through `poll_event` or the coarse `poll_events` batch surface.
 - [x] Run blocking native calls on a bounded adapter-owned worker path so the vLLM event loop remains
   responsive.
-- [ ] Preserve connection, session, operation, frame, route, view, trace, and active-profile identity
+- [x] Preserve connection, session, operation, frame, route, view, trace, and active-profile identity
   through the complete request lifetime.
 
 ## Operation State

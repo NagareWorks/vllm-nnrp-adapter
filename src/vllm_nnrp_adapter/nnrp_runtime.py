@@ -541,6 +541,7 @@ async def _serve_session(
             observation = _OperationObservationTracker.from_operation(
                 operation,
                 selected_transport=session.active_transport_name,
+                active_profile_id=_OPENAI_COMPATIBLE_PROFILE_ID,
                 backend_family=backend_family,
                 backend_binding=backend_binding,
                 vllm_version=vllm_version,
@@ -1258,7 +1259,7 @@ def _terminal_metadata(
         result_flags=ResultFlags(0),
         section_count=0,
         tile_count=0,
-        active_profile_id=int(operation.submit.metadata.value.input_profile),
+        active_profile_id=_OPENAI_COMPATIBLE_PROFILE_ID,
         reserved0=0,
         inference_ms=0,
         queue_ms=0,
