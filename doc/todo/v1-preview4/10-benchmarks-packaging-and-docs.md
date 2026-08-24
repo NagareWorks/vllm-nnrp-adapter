@@ -34,7 +34,7 @@
 ## Documentation
 
 - [x] Update README and usage examples from `serve-tcp` to provider-neutral native server startup.
-- [ ] Document application endpoints, provider routes, security, single-provider binding, and
+- [x] Document application endpoints, provider routes, security, single-provider binding, and
   multi-provider server binding behavior.
 - [ ] Document cancellation, abort, deadlines, priorities, budgets, progress, pressure, capability
   costs, route hints, traces, drops, recovery, objects, and cache behavior.

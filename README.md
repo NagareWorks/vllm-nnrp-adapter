@@ -119,6 +119,12 @@ The adapter does not implement carriers or package native provider artifacts. In
 transport distributions own TCP, QUIC, IPC, and WebSocket listeners; the adapter passes typed
 routes and policy to the native server role.
 
+The public endpoint remains `nnrp://` or `nnrps://`; provider-local `unix://`, `npipe://`, `ws://`,
+and `wss://` locators stay inside provider routes. Auto and Prefer policies atomically bind every
+eligible installed provider, while Force binds one provider. QUIC and native WSS require route-local
+DER certificate and PKCS#8 private-key material. The complete binding and security rules are in the
+[usage guide](doc/usage.md#provider-routes-and-binding-policy).
+
 Observability defaults to structured JSON logs. The optional `prometheus` extra exposes a collector
 that registers into an existing Prometheus registry; the adapter never binds a `/metrics` server by
 default. See [doc/usage.md](doc/usage.md#observability).

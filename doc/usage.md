@@ -123,6 +123,56 @@ provider registry can pass its `NativeTransportBinding` sequence through
 `NnrpServerConfig(transports=...)`; that explicit sequence is forwarded unchanged to
 `listen_native_server`.
 
+### Provider Routes And Binding Policy
+
+Each route is keyed by one canonical provider name: `tcp`, `quic`, `ipc`, or `websocket`. TCP and
+QUIC can derive a bind authority from the application endpoint when their route locator is omitted.
+IPC and WebSocket require an explicit provider-local locator. Use `unix:///path` for Unix-domain IPC,
+`npipe://name` for Windows named pipes, and `ws://` or `wss://` for WebSocket.
+
+`AUTO` and `PREFER_*` create one logical server by atomically binding every installed provider that
+is allowed, resolved, platform-compatible, and security-compatible. A preference changes
+deterministic ordering; it does not suppress the other eligible listeners. `FORCE_*` restricts the
+logical server to one provider. If any listener required by the selected policy fails, startup rolls
+back the complete listener set and the adapter does not publish readiness.
+
+Omitting a route does not disable an installed provider. For an in-process host that needs an
+authoritative provider registry, pass exactly the bindings it owns:
+
+```python
+from nnrp import TransportPolicy, load_native_transport_binding
+
+config = NnrpServerConfig(
+    endpoint="nnrp://runtime.example/vllm",
+    provider_routes={
+        "tcp": NativeServerProviderRoute(provider_endpoint="tcp://0.0.0.0:7766"),
+    },
+    transports=(load_native_transport_binding("tcp"),),
+    transport_policy=TransportPolicy.FORCE_TCP,
+)
+```
+
+### Route Security
+
+Security material is route-local. The server object contains DER certificate bytes and PKCS#8 DER
+private-key bytes. QUIC always requires it. Native `wss://` requires it, while `ws://` and IPC reject
+it. Supplying it to TCP enables the provider's TLS mode. An `nnrps://` application endpoint admits
+only carriers that satisfy authenticated encryption; plain TCP, IPC, and `ws://` remain in provider
+diagnostics but are not opened.
+
+```bash
+vllm-nnrp-adapter serve \
+  --backend my_vllm_app.serving:make_backend \
+  --endpoint nnrps://runtime.example/vllm \
+  --provider-route quic=quic://0.0.0.0:7767 \
+  --provider-certificate quic=/run/nnrp/server.der \
+  --provider-private-key quic=/run/nnrp/server-key.der \
+  --provider-route websocket=wss://0.0.0.0:7768/nnrp \
+  --provider-certificate websocket=/run/nnrp/server.der \
+  --provider-private-key websocket=/run/nnrp/server-key.der \
+  --transport-policy prefer_quic
+```
+
 The native role receives operation bodies directly. Ordered non-terminal profile events are sent as
 `PARTIAL_RESULT`; exactly one `response.completed`, `response.error`, or `response.cancelled` event
 completes the operation through terminal `RESULT_PUSH`.
