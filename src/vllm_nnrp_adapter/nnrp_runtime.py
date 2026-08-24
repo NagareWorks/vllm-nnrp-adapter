@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from types import MappingProxyType
 from typing import Any, TypeVar
 
@@ -67,7 +68,7 @@ from .observability import (
 )
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
-from .pressure import OutboundCreditController
+from .pressure import AppliedPressureState, OutboundCreditController
 from .profile import build_cancelled_event
 from .runtime_control import (
     OperationControlSlot,
@@ -257,9 +258,9 @@ class _RecoveryReporter:
         *,
         diagnostic: bytes,
         source_role: RuntimeRole,
-    ) -> None:
+    ) -> RetryAfterMetadata | None:
         if not self.enabled:
-            return
+            return None
         async with self._lock:
             self.control_sequence += 1
             control_sequence = self.control_sequence
@@ -280,20 +281,18 @@ class _RecoveryReporter:
                 ),
                 diagnostic,
             )
-            await self.native.call(
-                self.session.send_retry_after,
-                RetryAfterMetadata(
-                    scope_id=operation.operation_id,
-                    control_sequence=control_sequence,
-                    retry_after_ms=self.retry_after_ms,
-                    jitter_ms=0,
-                    reason_code=0,
-                    source_role=source_role,
-                    flags=0x02,
-                    diagnostic_bytes=len(diagnostic),
-                ),
-                diagnostic,
+            retry = RetryAfterMetadata(
+                scope_id=operation.operation_id,
+                control_sequence=control_sequence,
+                retry_after_ms=self.retry_after_ms,
+                jitter_ms=0,
+                reason_code=0,
+                source_role=source_role,
+                flags=0x02,
+                diagnostic_bytes=len(diagnostic),
             )
+            await self.native.call(self.session.send_retry_after, retry, diagnostic)
+            return retry
 
 
 async def serve(
@@ -395,6 +394,7 @@ async def _serve_session(
         int,
         tuple[OperationRecord, _OperationObservationTracker, _BackendTraceContextSlot],
     ] = {}
+    observations_by_operation: dict[int, _OperationObservationTracker] = {}
     session_trace_context: tuple[TraceContextMetadata, bytes] | None = None
     credit_backpressure_negotiated = False
     output_credits = OutboundCreditController()
@@ -476,7 +476,25 @@ async def _serve_session(
                                 "BACKPRESSURE and CREDIT_UPDATE require negotiated "
                                 "control.credit_backpressure"
                             )
-                        await _apply_output_pressure(runtime_event, output_credits=output_credits)
+                        pressure = await _apply_output_pressure(
+                            runtime_event,
+                            output_credits=output_credits,
+                        )
+                        if pressure.scope_kind == "operation":
+                            observation = observations_by_operation.get(pressure.scope_id)
+                            if observation is not None:
+                                observation.record_pressure(
+                                    pressure.metadata,
+                                    scope_kind=pressure.scope_kind,
+                                    scope_id=pressure.scope_id,
+                                )
+                        else:
+                            for observation in observations_by_operation.values():
+                                observation.record_pressure(
+                                    pressure.metadata,
+                                    scope_kind=pressure.scope_kind,
+                                    scope_id=pressure.scope_id,
+                                )
                         counters.applied_control_events += 1
                         continue
                     await _handle_runtime_control(
@@ -537,6 +555,7 @@ async def _serve_session(
                 None if session_trace_context is None else session_trace_context[0]
             )
             observations_by_frame[operation.frame_id] = (record, observation, backend_trace)
+            observations_by_operation[operation.operation_id] = observation
             pending_supersede = controls.pending_supersede(operation.operation_id)
             if pending_supersede is not None:
                 try:
@@ -560,6 +579,13 @@ async def _serve_session(
             )
             control.bind(task)
             operations.add(task)
+            task.add_done_callback(
+                partial(
+                    _forget_operation_observation,
+                    observations_by_operation,
+                    operation.operation_id,
+                )
+            )
             await admission_window.update(len(operations))
     except asyncio.CancelledError:
         await controls.terminate_all(
@@ -631,14 +657,14 @@ async def _apply_output_pressure(
     event: NativeRuntimeEvent,
     *,
     output_credits: OutboundCreditController,
-) -> None:
+) -> AppliedPressureState:
     if event.metadata.kind is not RuntimeEventMetadataKind.PRESSURE or not isinstance(
         event.metadata.value, PressureMetadata
     ):
         raise ValueError("BACKPRESSURE and CREDIT_UPDATE require PressureMetadata")
     if event.tail.kind is not RuntimeEventTailKind.NONE:
         raise ValueError("BACKPRESSURE and CREDIT_UPDATE cannot carry a body")
-    await output_credits.apply(event.header.message_type, event.metadata.value)
+    return await output_credits.apply(event.header.message_type, event.metadata.value)
 
 
 def _decode_capability_offer(event: NativeRuntimeEvent) -> tuple[CapabilityMetadata, tuple[str, ...]]:
@@ -813,11 +839,13 @@ async def _serve_operation(
                 body = _encode_event(event)
                 recovery_diagnostic = _recoverable_event_diagnostic(event)
                 if recovery is not None and recovery_diagnostic is not None:
-                    await recovery.report(
+                    retry = await recovery.report(
                         operation,
                         diagnostic=recovery_diagnostic,
                         source_role=RuntimeRole.RUNTIME,
                     )
+                    if retry is not None:
+                        observation.record_retry_hint(retry)
                 observation.record_event(event, body_bytes=len(body))
                 if _is_terminal_event(event):
                     await progress.emit(OperationProgressStage.FINALIZING)
@@ -1297,6 +1325,14 @@ def _retire_completed_tasks(tasks: set[asyncio.Task[None]]) -> None:
         if task.done():
             tasks.remove(task)
             task.result()
+
+
+def _forget_operation_observation(
+    observations: dict[int, _OperationObservationTracker],
+    operation_id: int,
+    _task: asyncio.Task[None],
+) -> None:
+    observations.pop(operation_id, None)
 
 
 async def _finish_tasks(tasks: set[asyncio.Task[None]], *, cancel: bool) -> None:

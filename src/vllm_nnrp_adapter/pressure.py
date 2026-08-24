@@ -23,6 +23,13 @@ class _CreditReservation:
     scopes: tuple[tuple[str, int, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class AppliedPressureState:
+    scope_kind: str
+    scope_id: int
+    metadata: PressureMetadata
+
+
 class OutboundCreditController:
     """Applies peer-advertised frame credits before backend output is pulled."""
 
@@ -34,7 +41,11 @@ class OutboundCreditController:
         self._next_generation = 1
         self._closed = False
 
-    async def apply(self, message_type: MessageType, metadata: PressureMetadata) -> None:
+    async def apply(
+        self,
+        message_type: MessageType,
+        metadata: PressureMetadata,
+    ) -> AppliedPressureState:
         scope_kind, scope_id = _pressure_scope(metadata)
         if message_type is MessageType.CREDIT_UPDATE:
             remaining = metadata.credit_window
@@ -69,6 +80,7 @@ class OutboundCreditController:
             else:
                 self._operations[scope_id] = scope
             self._condition.notify_all()
+        return AppliedPressureState(scope_kind=scope_kind, scope_id=scope_id, metadata=metadata)
 
     async def reserve(self, operation_id: int) -> _CreditReservation:
         async with self._condition:

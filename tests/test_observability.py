@@ -10,7 +10,9 @@ import pytest
 from nnrp.core import FrameSubmitMetadata, InputProfile, MessageType, PayloadKind
 from nnrp.runtime import (
     NativeRuntimeEvent,
+    PressureMetadata,
     ResultDropReasonCode,
+    RetryAfterMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
@@ -106,6 +108,30 @@ def test_operation_observation_is_immutable_complete_and_structured(
         drop_reason=ResultDropReasonCode.PEER_CANCELLED,
     )
     tracker.record_backend_abort(True)
+    tracker.record_retry_hint(
+        RetryAfterMetadata(
+            scope_id=7,
+            control_sequence=9,
+            retry_after_ms=40,
+            jitter_ms=0,
+            reason_code=3,
+            source_role=RuntimeRole.RUNTIME,
+            flags=0x02,
+            diagnostic_bytes=0,
+        )
+    )
+    tracker.record_pressure(
+        PressureMetadata(
+            scope_id=7,
+            credit_window=0,
+            pressure_level=3,
+            pressure_reason=5,
+            retry_after_ms=25,
+            flags=0x02,
+        ),
+        scope_kind="operation",
+        scope_id=7,
+    )
     observation = tracker.finish(OperationState.DROPPED)
 
     assert observation.identity.selected_transport == "ipc"
@@ -143,6 +169,15 @@ def test_operation_observation_is_immutable_complete_and_structured(
     assert observation.backend_abort_accepted is True
     assert observation.drop_reason == "peer_cancelled"
     assert observation.terminal_outcome == "dropped"
+    assert observation.retry_after_ms == 40
+    assert observation.retry_reason_code == 3
+    assert observation.retry_source == "runtime"
+    assert observation.pressure_scope == "operation"
+    assert observation.pressure_scope_id == 7
+    assert observation.pressure_credit_window == 0
+    assert observation.pressure_level == 3
+    assert observation.pressure_reason == 5
+    assert observation.pressure_retry_after_ms == 25
     assert observation.stage_transitions == (
         OperationStageTransition(0x0001, "queued", 1.0),
         OperationStageTransition(0x0003, "input_received", 2.0),
@@ -173,6 +208,10 @@ def test_operation_observation_is_immutable_complete_and_structured(
     }
     assert payload["backend_abort_accepted"] is True
     assert payload["terminal_outcome"] == "dropped"
+    assert payload["retry_after_ms"] == 40
+    assert payload["retry_source"] == "runtime"
+    assert payload["pressure_scope"] == "operation"
+    assert payload["pressure_level"] == 3
 
 
 def test_operation_observation_records_trace_context_without_attribute_contents() -> None:

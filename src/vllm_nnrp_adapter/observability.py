@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from nnrp import NativeRuntimeServerOperation, NativeTransportEndpoint  # type: ignore[import-untyped]
 from nnrp.core import FrameSubmitMetadata  # type: ignore[import-untyped]
-from nnrp.runtime import TraceContextMetadata  # type: ignore[import-untyped]
+from nnrp.runtime import PressureMetadata, RetryAfterMetadata, TraceContextMetadata  # type: ignore[import-untyped]
 
 from .operation_progress import OperationProgressStage
 from .operation_state import OperationState
@@ -137,6 +137,15 @@ class OperationObservation:
     drop_reason: str | None
     terminal_outcome: str
     stage_transitions: tuple[OperationStageTransition, ...]
+    retry_after_ms: int | None = None
+    retry_reason_code: int | None = None
+    retry_source: str | None = None
+    pressure_scope: str | None = None
+    pressure_scope_id: int | None = None
+    pressure_credit_window: int | None = None
+    pressure_level: int | None = None
+    pressure_reason: int | None = None
+    pressure_retry_after_ms: int | None = None
     trace_span_id: int | None = None
     trace_parent_span_id: int | None = None
     trace_stage_code: int | None = None
@@ -180,6 +189,15 @@ class OperationObservation:
             "backend_abort_accepted": self.backend_abort_accepted,
             "drop_reason": self.drop_reason,
             "terminal_outcome": self.terminal_outcome,
+            "retry_after_ms": self.retry_after_ms,
+            "retry_reason_code": self.retry_reason_code,
+            "retry_source": self.retry_source,
+            "pressure_scope": self.pressure_scope,
+            "pressure_scope_id": self.pressure_scope_id,
+            "pressure_credit_window": self.pressure_credit_window,
+            "pressure_level": self.pressure_level,
+            "pressure_reason": self.pressure_reason,
+            "pressure_retry_after_ms": self.pressure_retry_after_ms,
             "trace_span_id": self.trace_span_id,
             "trace_parent_span_id": self.trace_parent_span_id,
             "trace_stage_code": self.trace_stage_code,
@@ -224,6 +242,15 @@ class _OperationObservationTracker:
     _cancellation_reason_code: int | None = field(default=None, repr=False)
     _backend_abort_accepted: bool | None = field(default=None, repr=False)
     _drop_reason: str | None = field(default=None, repr=False)
+    _retry_after_ms: int | None = field(default=None, repr=False)
+    _retry_reason_code: int | None = field(default=None, repr=False)
+    _retry_source: str | None = field(default=None, repr=False)
+    _pressure_scope: str | None = field(default=None, repr=False)
+    _pressure_scope_id: int | None = field(default=None, repr=False)
+    _pressure_credit_window: int | None = field(default=None, repr=False)
+    _pressure_level: int | None = field(default=None, repr=False)
+    _pressure_reason: int | None = field(default=None, repr=False)
+    _pressure_retry_after_ms: int | None = field(default=None, repr=False)
     _trace_span_id: int | None = field(default=None, repr=False)
     _trace_parent_span_id: int | None = field(default=None, repr=False)
     _trace_stage_code: int | None = field(default=None, repr=False)
@@ -330,6 +357,25 @@ class _OperationObservationTracker:
     def record_backend_abort(self, accepted: bool | None) -> None:
         self._backend_abort_accepted = accepted
 
+    def record_retry_hint(self, metadata: RetryAfterMetadata) -> None:
+        self._retry_after_ms = metadata.retry_after_ms
+        self._retry_reason_code = metadata.reason_code
+        self._retry_source = _enum_value(metadata.source_role)
+
+    def record_pressure(
+        self,
+        metadata: PressureMetadata,
+        *,
+        scope_kind: str,
+        scope_id: int,
+    ) -> None:
+        self._pressure_scope = scope_kind
+        self._pressure_scope_id = scope_id
+        self._pressure_credit_window = metadata.credit_window
+        self._pressure_level = metadata.pressure_level
+        self._pressure_reason = metadata.pressure_reason
+        self._pressure_retry_after_ms = metadata.retry_after_ms
+
     def record_trace_context(self, metadata: TraceContextMetadata, attributes: bytes) -> None:
         if metadata.body_bytes != len(attributes):
             raise ValueError("TRACE_CONTEXT body_bytes does not match the trace attribute body")
@@ -370,6 +416,15 @@ class _OperationObservationTracker:
             backend_abort_accepted=self._backend_abort_accepted,
             drop_reason=self._drop_reason,
             terminal_outcome=terminal_state.value,
+            retry_after_ms=self._retry_after_ms,
+            retry_reason_code=self._retry_reason_code,
+            retry_source=self._retry_source,
+            pressure_scope=self._pressure_scope,
+            pressure_scope_id=self._pressure_scope_id,
+            pressure_credit_window=self._pressure_credit_window,
+            pressure_level=self._pressure_level,
+            pressure_reason=self._pressure_reason,
+            pressure_retry_after_ms=self._pressure_retry_after_ms,
             trace_span_id=self._trace_span_id,
             trace_parent_span_id=self._trace_parent_span_id,
             trace_stage_code=self._trace_stage_code,

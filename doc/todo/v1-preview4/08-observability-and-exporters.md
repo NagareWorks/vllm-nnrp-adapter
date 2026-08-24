@@ -8,7 +8,7 @@
   session, operation, frame, route, view, trace, and profile identities.
 - [x] Record queue delay, admission latency, preprocessing latency, time to first event, inter-event
   latency, terminal latency, output event count, token usage, and bytes where available.
-- [ ] Record cancellation source, backend abort acceptance, error family, drop reason, retry hint,
+- [x] Record cancellation source, backend abort acceptance, error family, drop reason, retry hint,
   pressure state, and terminal outcome.
 - [x] Derive stage transitions from the same record used for `TRACE_CONTEXT` and `PROGRESS`.
 

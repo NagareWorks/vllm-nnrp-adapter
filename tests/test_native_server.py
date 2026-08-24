@@ -701,7 +701,9 @@ async def test_recovery_reporter_emits_correlated_error_and_retry_after_only_whe
 @pytest.mark.asyncio
 async def test_negotiated_transient_backend_rejection_emits_recovery_controls(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _capture_observations(caplog)
     stop_event = asyncio.Event()
     operation = FakeOperation(
         operation_id=72,
@@ -748,6 +750,10 @@ async def test_negotiated_transient_backend_rejection_emits_recovery_controls(
     metadata, body = operation.terminal_results[0]
     assert metadata.status_code == 503
     assert _decode_terminal_profile_body(metadata, body)["error"]["code"] == "scheduler_rejected"
+    observation = _observation_records(caplog)[0]
+    assert observation["retry_after_ms"] == 10
+    assert observation["retry_reason_code"] == 0
+    assert observation["retry_source"] == "runtime"
 
 
 @pytest.mark.asyncio
@@ -969,12 +975,18 @@ async def test_output_credit_blocks_backend_pull_until_peer_grants_window() -> N
 @pytest.mark.asyncio
 async def test_output_credit_uses_effective_connection_session_and_operation_window() -> None:
     credits = OutboundCreditController()
-    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=2, flags=0x1))
-    await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=1))
-    await credits.apply(
+    connection = await credits.apply(
+        MessageType.CREDIT_UPDATE,
+        _pressure_metadata(credit_window=2, flags=0x1),
+    )
+    session = await credits.apply(MessageType.CREDIT_UPDATE, _pressure_metadata(credit_window=1))
+    operation = await credits.apply(
         MessageType.CREDIT_UPDATE,
         _pressure_metadata(scope_id=91, credit_window=1, flags=0x2),
     )
+    assert (connection.scope_kind, connection.scope_id) == ("connection", 0)
+    assert (session.scope_kind, session.scope_id) == ("session", 0)
+    assert (operation.scope_kind, operation.scope_id) == ("operation", 91)
 
     await credits.reserve(91)
     blocked = asyncio.create_task(credits.reserve(91))
@@ -1048,6 +1060,74 @@ async def test_output_credit_rejects_invalid_frames_and_closes_waiters() -> None
     await credits.close()
     with pytest.raises(asyncio.CancelledError):
         await blocked
+
+
+@pytest.mark.asyncio
+async def test_operation_observation_records_effective_output_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=95,
+        frame_id=195,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=95),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(runtime=_capability_event("control.credit_backpressure")),
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_pressure_event(
+                    MessageType.BACKPRESSURE,
+                    scope_id=95,
+                    credit_window=0,
+                    pressure_level=3,
+                    pressure_reason=7,
+                    retry_after_ms=25,
+                    flags=0x02,
+                ),
+                wait_for_backend=True,
+            ),
+            FakeServerEvent(
+                runtime=_control_event(MessageType.CANCEL, operation_id=95, sequence=1),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+
+    await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    observation = _observation_records(caplog)[0]
+    assert observation["pressure_scope"] == "operation"
+    assert observation["pressure_scope_id"] == 95
+    assert observation["pressure_credit_window"] == 0
+    assert observation["pressure_level"] == 3
+    assert observation["pressure_reason"] == 7
+    assert observation["pressure_retry_after_ms"] == 25
 
 
 @pytest.mark.asyncio
@@ -1365,6 +1445,33 @@ def _pressure_metadata(
         pressure_reason=pressure_reason,
         retry_after_ms=retry_after_ms,
         flags=flags,
+    )
+
+
+def _pressure_event(
+    message_type: MessageType,
+    *,
+    scope_id: int = 0,
+    credit_window: int,
+    pressure_level: int = 0,
+    pressure_reason: int = 0,
+    retry_after_ms: int = 0,
+    flags: int = 0,
+) -> NativeRuntimeEvent:
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=message_type, session_id=1),
+        RuntimeEventMetadata(
+            RuntimeEventMetadataKind.PRESSURE,
+            _pressure_metadata(
+                scope_id=scope_id,
+                credit_window=credit_window,
+                pressure_level=pressure_level,
+                pressure_reason=pressure_reason,
+                retry_after_ms=retry_after_ms,
+                flags=flags,
+            ),
+        ),
+        RuntimeEventTail.none(),
     )
 
 
