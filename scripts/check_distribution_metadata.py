@@ -65,9 +65,10 @@ def _validate_clean_install(wheel: Path, identity: DistributionIdentity) -> None
                 str(python),
                 "-c",
                 (
-                    "import importlib.metadata; import vllm_nnrp_adapter; "
+                    "import importlib.metadata; import importlib.util; import vllm_nnrp_adapter; "
                     "assert importlib.metadata.version('vllm-nnrp-adapter') == "
-                    f"{identity.version!r}"
+                    f"{identity.version!r}; "
+                    "assert importlib.util.find_spec('vllm') is None"
                 ),
             ],
             check=True,

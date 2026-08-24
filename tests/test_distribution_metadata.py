@@ -85,6 +85,23 @@ def test_distribution_metadata_rejects_missing_vllm_extra() -> None:
         validate_metadata_text(metadata, artifact="adapter.whl")
 
 
+def test_distribution_metadata_rejects_unconditional_vllm_dependency() -> None:
+    metadata = _metadata().replace(
+        "\n\n# vLLM NNRP adapter",
+        "\nRequires-Dist: vllm>=0.18.0,<0.27\n\n# vLLM NNRP adapter",
+    )
+
+    with pytest.raises(DistributionMetadataError, match="frozen vLLM extra range"):
+        validate_metadata_text(metadata, artifact="adapter.whl")
+
+
+def test_distribution_metadata_rejects_wrong_vllm_marker() -> None:
+    metadata = _metadata().replace('extra == "vllm"', 'python_version >= "3.11"')
+
+    with pytest.raises(DistributionMetadataError, match="frozen vLLM extra range"):
+        validate_metadata_text(metadata, artifact="adapter.whl")
+
+
 @pytest.mark.parametrize(
     ("removed_text", "message"),
     [

@@ -67,11 +67,13 @@ def validate_metadata_text(metadata_text: str, *, artifact: str) -> Distribution
     if nnrp_requirement is None or nnrp_requirement.specifier != NNRP_PY_RANGE:
         raise DistributionMetadataError(f"{artifact} does not carry the frozen nnrp-py range {NNRP_PY_RANGE}")
 
-    vllm_requirement = next(
-        (item for item in requirements if item.name == "vllm" and item.marker and "extra" in str(item.marker)),
-        None,
-    )
-    if vllm_requirement is None or vllm_requirement.specifier != VLLM_RANGE:
+    vllm_requirements = [item for item in requirements if item.name == "vllm"]
+    if (
+        len(vllm_requirements) != 1
+        or vllm_requirements[0].specifier != VLLM_RANGE
+        or vllm_requirements[0].marker is None
+        or str(vllm_requirements[0].marker) != 'extra == "vllm"'
+    ):
         raise DistributionMetadataError(f"{artifact} does not carry the frozen vLLM extra range {VLLM_RANGE}")
 
     return DistributionIdentity(name=name, version=version)
