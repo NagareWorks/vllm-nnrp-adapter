@@ -7,6 +7,9 @@
 - [x] Measure profile validation and event mapping without vLLM to isolate adapter overhead.
 - [ ] Measure native submit-to-admission, backend chunk-to-result, control-frame handling, and
   cancellation-to-abort latency.
+  Adapter-side priority, deadline, cancellation dispatch, and registry cleanup are measured after
+  native event delivery; native poll-to-admission and backend result-push boundaries remain required
+  before this item is complete.
 - [ ] Measure queue pressure, backpressure response, credit recovery, stale-result suppression, and
   object-reference overhead.
 - [ ] Re-run the 4K, 8K, 16K, and 20K prompt matrix at concurrency 1, 2, and 4.

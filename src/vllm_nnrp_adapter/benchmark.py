@@ -12,6 +12,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nnrp.core import MessageType  # type: ignore[import-untyped]
+from nnrp.runtime import (  # type: ignore[import-untyped]
+    ControlRequestMetadata,
+    NativeRuntimeEvent,
+    RuntimeEventMetadata,
+    RuntimeEventMetadataKind,
+    RuntimeEventTail,
+    RuntimeFrameHeader,
+    RuntimeRole,
+    SchedulingMetadata,
+)
+
 from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter, map_openai_stream_chunk
 from .conformance import load_backend_async
 from .profile import (
@@ -19,6 +31,13 @@ from .profile import (
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
     OpenAiNnrpCapabilityDocument,
     validate_request,
+)
+from .runtime_control import (
+    RuntimeControlDisposition,
+    RuntimeControlRegistry,
+    decode_deadline_update,
+    decode_operation_control,
+    decode_priority_update,
 )
 
 
@@ -166,9 +185,11 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         raise ValueError("warmup must be non-negative")
 
     adapter = OpenAiNnrpAdapter(backend)
+    runtime_control_scenarios = await _measure_runtime_control_processing(config)
     scenarios = [
         _measure_profile_validation(config),
         _measure_profile_event_mapping(config),
+        *runtime_control_scenarios,
         await _measure_non_streaming_roundtrip(adapter, config),
         await _measure_streaming_event_latency(adapter, config),
         await _measure_cancellation_latency(adapter, config),
@@ -183,6 +204,163 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
+
+
+async def _measure_runtime_control_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
+    priority_events = [
+        _priority_control_event(sequence=index + 1) for index in range(config.warmup + config.iterations)
+    ]
+    deadline_events = [
+        _deadline_control_event(sequence=index + 1) for index in range(config.warmup + config.iterations)
+    ]
+
+    priority_registry = RuntimeControlRegistry()
+    priority_registry.register(1)
+    for event in priority_events[: config.warmup]:
+        _apply_priority_control_event(priority_registry, event)
+    priority_samples: list[float] = []
+    for event in priority_events[config.warmup :]:
+        started = time.perf_counter_ns()
+        _apply_priority_control_event(priority_registry, event)
+        priority_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+    await priority_registry.clear()
+
+    deadline_registry = RuntimeControlRegistry()
+    deadline_registry.register(1)
+    for event in deadline_events[: config.warmup]:
+        await _apply_deadline_control_event(deadline_registry, event)
+    deadline_samples: list[float] = []
+    for event in deadline_events[config.warmup :]:
+        started = time.perf_counter_ns()
+        await _apply_deadline_control_event(deadline_registry, event)
+        deadline_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+    await deadline_registry.clear()
+
+    for _ in range(config.warmup):
+        await _measure_cancel_control_once()
+    cancel_samples: list[float] = []
+    cleanup_samples: list[float] = []
+    for _ in range(config.iterations):
+        cancel_us, cleanup_us = await _measure_cancel_control_once()
+        cancel_samples.append(cancel_us)
+        cleanup_samples.append(cleanup_us)
+
+    return [
+        _latency_scenario(
+            "runtime_control.priority_after_native_delivery",
+            priority_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "runtime_control.deadline_after_native_delivery",
+            deadline_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "runtime_control.cancel_dispatch_after_native_delivery",
+            cancel_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "runtime_control.cancelled_registry_cleanup",
+            cleanup_samples,
+            event_count=config.iterations,
+        ),
+    ]
+
+
+def _apply_priority_control_event(registry: RuntimeControlRegistry, event: NativeRuntimeEvent) -> None:
+    update = decode_priority_update(event)
+    if update is None:
+        raise RuntimeError("benchmark priority event did not decode")
+    disposition = registry.apply_priority(update, terminal=False)
+    if disposition is not RuntimeControlDisposition.APPLIED:
+        raise RuntimeError(f"benchmark priority update was not applied: {disposition}")
+
+
+async def _apply_deadline_control_event(registry: RuntimeControlRegistry, event: NativeRuntimeEvent) -> None:
+    update = decode_deadline_update(event)
+    if update is None:
+        raise RuntimeError("benchmark deadline event did not decode")
+    disposition = await registry.apply_deadline(update, terminal=False)
+    if disposition is not RuntimeControlDisposition.APPLIED:
+        raise RuntimeError(f"benchmark deadline update was not applied: {disposition}")
+
+
+async def _measure_cancel_control_once() -> tuple[float, float]:
+    registry = RuntimeControlRegistry()
+    slot = registry.register(1)
+    task = asyncio.create_task(_wait_for_cancel())
+    slot.bind(task)
+    await asyncio.sleep(0)
+
+    event = _cancel_control_event()
+    started = time.perf_counter_ns()
+    request = decode_operation_control(event)
+    if request is None:
+        raise RuntimeError("benchmark cancel event did not decode")
+    disposition = await registry.apply(request, terminal=False)
+    cancel_us = _elapsed_us(started, time.perf_counter_ns())
+    if disposition is not RuntimeControlDisposition.APPLIED:
+        raise RuntimeError(f"benchmark cancel was not applied: {disposition}")
+
+    cleanup_started = time.perf_counter_ns()
+    await asyncio.gather(task, return_exceptions=True)
+    await registry.clear()
+    cleanup_us = _elapsed_us(cleanup_started, time.perf_counter_ns())
+    return cancel_us, cleanup_us
+
+
+async def _wait_for_cancel() -> None:
+    await asyncio.Event().wait()
+
+
+def _priority_control_event(*, sequence: int) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=1,
+        control_sequence=sequence,
+        priority_class=2,
+        priority_delta=-1,
+        deadline_unix_ms=0,
+        flags=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.PRIORITY_UPDATE),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
+        RuntimeEventTail.none(),
+    )
+
+
+def _deadline_control_event(*, sequence: int) -> NativeRuntimeEvent:
+    metadata = SchedulingMetadata(
+        operation_id=1,
+        control_sequence=sequence,
+        priority_class=0,
+        priority_delta=0,
+        deadline_unix_ms=int(time.time() * 1_000) + 60_000,
+        flags=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.DEADLINE),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.SCHEDULING, metadata),
+        RuntimeEventTail.none(),
+    )
+
+
+def _cancel_control_event() -> NativeRuntimeEvent:
+    metadata = ControlRequestMetadata(
+        operation_id=1,
+        control_sequence=1,
+        reason_code=0,
+        source_role=RuntimeRole.CLIENT,
+        flags=0,
+        diagnostic_bytes=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.CANCEL),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.CONTROL_REQUEST, metadata),
+        RuntimeEventTail.none(),
+    )
 
 
 def _measure_profile_validation(config: BenchmarkConfig) -> dict[str, Any]:

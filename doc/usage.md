@@ -266,7 +266,11 @@ vllm-nnrp-adapter run-benchmark \
   --warmup 20
 ```
 
-The report includes non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency. Mock reports and HTTP-relay reports are smoke checks, not release-readiness evidence for the NNRP transport path.
+The report includes profile validation, profile-event mapping, adapter-side runtime-control handling after native event
+delivery, non-streaming roundtrip latency, streaming event latency and throughput, and cancellation latency. The
+runtime-control scenarios cover typed priority/deadline decoding and application, cancellation dispatch, and registry
+cleanup; they do not include carrier or FFI delivery time. Mock reports and HTTP-relay reports are smoke checks, not
+release-readiness evidence for the NNRP transport path.
 
 Run the release-readiness comparison matrix with the engine-direct NNRP path and, when an OpenAI HTTP endpoint is available, the HTTP SSE baseline:
 

@@ -55,6 +55,10 @@ async def test_benchmark_reports_core_latency_scenarios(monkeypatch: pytest.Monk
     assert scenario_names == {
         "profile.validation",
         "profile.event_mapping",
+        "runtime_control.priority_after_native_delivery",
+        "runtime_control.deadline_after_native_delivery",
+        "runtime_control.cancel_dispatch_after_native_delivery",
+        "runtime_control.cancelled_registry_cleanup",
         "chat.non_streaming.roundtrip",
         "chat.streaming.event_latency",
         "chat.streaming.cancellation_latency",
