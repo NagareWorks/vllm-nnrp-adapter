@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -341,6 +341,73 @@ def test_prometheus_sink_registers_bounded_metrics_in_existing_registry() -> Non
     assert "test-model" not in metrics
     assert "trace_id" not in metrics
     assert "operation_id" not in metrics
+
+
+def test_structured_log_and_prometheus_metrics_share_terminal_observation_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observation = replace(
+        _public_observation(),
+        cancellation_kind="abort",
+        drop_reason="peer_cancelled",
+        terminal_outcome="dropped",
+    )
+    registry = CollectorRegistry()
+    caplog.set_level(logging.INFO, logger="vllm_nnrp_adapter.operation")
+
+    _emit_operation_observation(
+        observation,
+        (StructuredLogObservationSink(), PrometheusObservationSink(registry)),
+    )
+
+    payload = json.loads(
+        caplog.records[-1].getMessage().removeprefix("nnrp_operation_observation ")
+    )
+    metrics = generate_latest(registry).decode("utf-8")
+    labels = 'operation="chat_completions_create",outcome="dropped",transport="ipc"'
+
+    assert payload["terminal_outcome"] == "dropped"
+    assert f"vllm_nnrp_adapter_operations_total{{{labels}}} 1.0" in metrics
+    for stage, field in (
+        ("queue", "queue_delay_ms"),
+        ("admission", "admission_latency_ms"),
+        ("preprocessing", "preprocessing_latency_ms"),
+        ("first_event", "first_event_latency_ms"),
+        ("terminal", "terminal_latency_ms"),
+    ):
+        latency_labels = (
+            'operation="chat_completions_create",outcome="dropped",'
+            f'stage="{stage}",transport="ipc"'
+        )
+        assert (
+            "vllm_nnrp_adapter_operation_latency_seconds_sum"
+            f"{{{latency_labels}}} {payload[field] / 1_000}"
+        ) in metrics
+    event_labels = 'operation="chat_completions_create",transport="ipc"'
+    assert (
+        f"vllm_nnrp_adapter_output_events_total{{{event_labels}}} "
+        f"{float(payload['output_event_count'])}"
+    ) in metrics
+    assert (
+        f"vllm_nnrp_adapter_output_bytes_total{{{event_labels}}} "
+        f"{float(payload['output_bytes'])}"
+    ) in metrics
+    for kind, field in (
+        ("prompt", "prompt_tokens"),
+        ("completion", "completion_tokens"),
+        ("total", "total_tokens"),
+    ):
+        assert (
+            f'vllm_nnrp_adapter_tokens_total{{kind="{kind}",{event_labels}}} '
+            f"{float(payload[field])}"
+        ) in metrics
+    assert payload["cancellation_kind"] == "abort"
+    assert 'vllm_nnrp_adapter_cancellations_total{kind="abort",transport="ipc"} 1.0' in metrics
+    assert payload["drop_reason"] == "peer_cancelled"
+    assert (
+        'vllm_nnrp_adapter_result_drops_total{reason="peer_cancelled",transport="ipc"} 1.0'
+        in metrics
+    )
 
 
 def test_observation_sink_failure_isolated_from_following_sinks(

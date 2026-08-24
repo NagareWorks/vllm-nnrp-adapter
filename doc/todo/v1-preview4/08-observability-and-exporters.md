@@ -20,7 +20,7 @@
 - [x] Keep standalone metrics serving behind an explicit deployment command and port.
 - [x] Use stable metric names and bounded labels; never put request ids, prompts, generated text, or
   arbitrary model metadata in labels.
-- [ ] Keep diagnostic and metrics values consistent by deriving both from the same terminal record.
+- [x] Keep diagnostic and metrics values consistent by deriving both from the same terminal record.
 
 ## Validation
 
