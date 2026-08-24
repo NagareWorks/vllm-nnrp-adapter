@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 
 from nnrp import (  # type: ignore[import-untyped]
     PREVIEW4_CAPABILITY_TOKENS,
+    NativeInvalidStateError,
     NativeRuntimeServerOperation,
     NativeRuntimeServerSession,
     NativeTransportBinding,
@@ -72,7 +73,6 @@ from .observability import (
 from .operation_progress import OperationProgressReporter, OperationProgressStage
 from .operation_state import OperationRecord, OperationRegistry, OperationState, OperationStateError
 from .pressure import AppliedPressureState, OutboundCreditController
-from .profile import build_cancelled_event
 from .runtime_control import (
     OperationControlSlot,
     RuntimeControlDisposition,
@@ -389,6 +389,10 @@ async def _serve(
                 session = await server.accept(NativeServerAcceptOptions(timeout_ms=config.accept_timeout_ms))
             except NativeWouldBlockError:
                 continue
+            except NativeInvalidStateError as error:
+                if error.status.detail_code != 105:
+                    raise
+                break
             counters.accepted_sessions += 1
             task = asyncio.create_task(
                 _serve_session(adapter, session, config=config, shutdown=shutdown, native=native, counters=counters)
@@ -425,6 +429,7 @@ async def _serve_session(
     observations_by_operation: dict[int, _OperationObservationTracker] = {}
     session_trace_context: tuple[TraceContextMetadata, bytes] | None = None
     credit_backpressure_negotiated = False
+    progress_partial_negotiated = False
     output_credits = OutboundCreditController()
     admission_window = _AdmissionWindowReporter(
         session=session,
@@ -453,6 +458,10 @@ async def _serve_session(
                 )
             except NativeWouldBlockError:
                 continue
+            except NativeInvalidStateError as error:
+                if error.status.detail_code != 105:
+                    raise
+                break
             if not events:
                 continue
             event = events[0]
@@ -494,6 +503,8 @@ async def _serve_session(
                             )
                         if "control.recoverable_error" in accepted_capabilities:
                             recovery.enable()
+                        if "control.progress_partial" in accepted_capabilities:
+                            progress_partial_negotiated = True
                         continue
                     if runtime_event.header.message_type in {
                         MessageType.BACKPRESSURE,
@@ -604,6 +615,9 @@ async def _serve_session(
                     backend_trace=backend_trace,
                     output_credits=output_credits,
                     recovery=recovery,
+                    emit_progress=progress_partial_negotiated,
+                    session=session,
+                    native=native,
                 )
             )
             control.bind(task)
@@ -825,10 +839,17 @@ async def _serve_operation(
     backend_trace: _BackendTraceContextSlot | None = None,
     output_credits: OutboundCreditController | None = None,
     recovery: _RecoveryReporter | None = None,
+    emit_progress: bool = True,
+    session: NativeRuntimeServerSession | None = None,
+    native: _NativeCallExecutor | None = None,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
-    progress = OperationProgressReporter(operation, observer=observation.record_progress_stage)
+    progress = OperationProgressReporter(
+        operation,
+        observer=observation.record_progress_stage,
+        enabled=emit_progress,
+    )
     try:
         try:
             await progress.emit(OperationProgressStage.QUEUED)
@@ -901,70 +922,37 @@ async def _serve_operation(
                 )
                 counters.partial_results += 1
         except asyncio.CancelledError:
-            control_request = control.terminal_request
-            if record.is_terminal:
-                if control_request is not None:
-                    observation.record_control(
-                        control_request,
-                        drop_reason=ResultDropReasonCode.TRANSPORT_CLOSED,
-                    )
-                return
-            if control_request is None:
-                if not record.is_terminal:
-                    record.terminate(OperationState.CANCELLED)
+            if not await _finalize_cancelled_operation(
+                operation,
+                record=record,
+                control=control,
+                observation=observation,
+                result_sequence=result_sequence,
+                counters=counters,
+                session=session,
+                native=native,
+            ):
                 raise
-            if control_request.kind is RuntimeControlKind.CANCEL:
-                event = build_cancelled_event("peer_cancelled")
-                record.terminate(OperationState.CANCELLED)
-                await progress.emit(OperationProgressStage.DROPPED)
-                observation.record_event(event, body_bytes=len(_encode_event(event)))
-                fallback_drop = await _send_cancelled_outcome(
-                    operation,
-                    event,
-                    control_request=control_request,
-                    result_sequence=result_sequence,
-                    counters=counters,
-                )
-                observation.record_control(control_request, drop_reason=fallback_drop)
-            elif control_request.kind in {
-                RuntimeControlKind.ABORT,
-                RuntimeControlKind.SERVER_SHUTDOWN,
-                RuntimeControlKind.DEADLINE_EXPIRED,
-                RuntimeControlKind.SUPERSEDE,
-            }:
-                record.terminate(OperationState.DROPPED)
-                diagnostic = control_request.diagnostic or {
-                    RuntimeControlKind.ABORT: b"peer_abort",
-                    RuntimeControlKind.SERVER_SHUTDOWN: b"server_shutdown",
-                    RuntimeControlKind.DEADLINE_EXPIRED: b"deadline_expired",
-                    RuntimeControlKind.SUPERSEDE: b"superseded",
-                }[control_request.kind]
-                drop_reason = {
-                    RuntimeControlKind.ABORT: ResultDropReasonCode.PEER_CANCELLED,
-                    RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
-                    RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
-                    RuntimeControlKind.SUPERSEDE: ResultDropReasonCode.SUPERSEDED,
-                }[control_request.kind]
-                observation.record_control(control_request, drop_reason=drop_reason)
-                await progress.emit(OperationProgressStage.DROPPED)
-                await operation.send_result_drop(
-                    ResultDropReasonMetadata(
-                        operation_id=operation.operation_id,
-                        result_sequence=max(1, result_sequence + 1),
-                        drop_reason_code=drop_reason,
-                        source_role=RuntimeRole.RUNTIME,
-                        flags=0,
-                        diagnostic_bytes=len(diagnostic),
-                    ),
-                    diagnostic,
-                )
-                counters.result_drops += 1
-                counters.terminal_results += 1
-            else:
-                record.terminate(OperationState.DROPPED)
-                observation.record_control(control_request)
-            terminal_sent = True
             return
+        except NativeInvalidStateError as error:
+            if error.status.detail_code != 105:
+                raise
+            try:
+                await control.wait_for_terminal_request()
+            except asyncio.CancelledError:
+                pass
+            if await _finalize_cancelled_operation(
+                operation,
+                record=record,
+                control=control,
+                observation=observation,
+                result_sequence=result_sequence,
+                counters=counters,
+                session=session,
+                native=native,
+            ):
+                return
+            raise
         except Exception as error:
             observation.record_exception(error)
             if terminal_sent:
@@ -1109,23 +1097,92 @@ async def _send_unsupported_priority_update(
 
 async def _send_cancelled_outcome(
     operation: NativeRuntimeServerOperation,
-    event: Mapping[str, Any],
     *,
     control_request: RuntimeControlRequest,
     result_sequence: int,
     counters: _ServeCounters,
-) -> ResultDropReasonCode | None:
-    fallback_drop = None
-    try:
-        metadata, body = _terminal_reply(operation, event)
-        await operation.send_result(metadata, body)
-    except Exception:
-        diagnostic = control_request.diagnostic or b"peer_cancelled"
+) -> ResultDropReasonCode:
+    diagnostic = control_request.diagnostic or b"peer_cancelled"
+    await operation.send_result_drop(
+        ResultDropReasonMetadata(
+            operation_id=operation.operation_id,
+            result_sequence=max(1, result_sequence + 1),
+            drop_reason_code=ResultDropReasonCode.PEER_CANCELLED,
+            source_role=RuntimeRole.RUNTIME,
+            flags=0,
+            diagnostic_bytes=len(diagnostic),
+        ),
+        diagnostic,
+    )
+    counters.result_drops += 1
+    counters.terminal_results += 1
+    return ResultDropReasonCode.PEER_CANCELLED
+
+
+async def _finalize_cancelled_operation(
+    operation: NativeRuntimeServerOperation,
+    *,
+    record: OperationRecord,
+    control: OperationControlSlot,
+    observation: _OperationObservationTracker,
+    result_sequence: int,
+    counters: _ServeCounters,
+    session: NativeRuntimeServerSession | None,
+    native: _NativeCallExecutor | None,
+) -> bool:
+    control_request = control.terminal_request
+    if record.is_terminal:
+        if control_request is not None:
+            observation.record_control(
+                control_request,
+                drop_reason=ResultDropReasonCode.TRANSPORT_CLOSED,
+            )
+        return True
+    if control_request is None:
+        record.terminate(OperationState.CANCELLED)
+        return False
+    if control_request.kind in {
+        RuntimeControlKind.CANCEL,
+        RuntimeControlKind.ABORT,
+        RuntimeControlKind.DEADLINE_EXPIRED,
+        RuntimeControlKind.SUPERSEDE,
+    }:
+        await _send_terminal_trace_context(operation, session=session, native=native)
+    if control_request.kind is RuntimeControlKind.CANCEL:
+        record.terminate(OperationState.CANCELLED)
+        drop_reason = await _send_cancelled_outcome(
+            operation,
+            control_request=control_request,
+            result_sequence=result_sequence,
+            counters=counters,
+        )
+        observation.record_control(control_request, drop_reason=drop_reason)
+        return True
+    if control_request.kind in {
+        RuntimeControlKind.ABORT,
+        RuntimeControlKind.SERVER_SHUTDOWN,
+        RuntimeControlKind.DEADLINE_EXPIRED,
+        RuntimeControlKind.SUPERSEDE,
+    }:
+        record.terminate(OperationState.DROPPED)
+        diagnostic = control_request.diagnostic or {
+            RuntimeControlKind.ABORT: b"peer_abort",
+            RuntimeControlKind.SERVER_SHUTDOWN: b"server_shutdown",
+            RuntimeControlKind.DEADLINE_EXPIRED: b"deadline_expired",
+            RuntimeControlKind.SUPERSEDE: b"superseded",
+        }[control_request.kind]
+        drop_reason = {
+            RuntimeControlKind.ABORT: ResultDropReasonCode.PEER_CANCELLED,
+            RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
+            RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
+            RuntimeControlKind.SUPERSEDE: ResultDropReasonCode.SUPERSEDED,
+        }[control_request.kind]
+        observation.record_control(control_request, drop_reason=drop_reason)
         await operation.send_result_drop(
             ResultDropReasonMetadata(
                 operation_id=operation.operation_id,
                 result_sequence=max(1, result_sequence + 1),
-                drop_reason_code=ResultDropReasonCode.PEER_CANCELLED,
+                drop_reason_code=drop_reason,
                 source_role=RuntimeRole.RUNTIME,
                 flags=0,
                 diagnostic_bytes=len(diagnostic),
@@ -1133,9 +1190,30 @@ async def _send_cancelled_outcome(
             diagnostic,
         )
         counters.result_drops += 1
-        fallback_drop = ResultDropReasonCode.PEER_CANCELLED
-    counters.terminal_results += 1
-    return fallback_drop
+        counters.terminal_results += 1
+        return True
+    record.terminate(OperationState.DROPPED)
+    observation.record_control(control_request)
+    return True
+
+
+async def _send_terminal_trace_context(
+    operation: NativeRuntimeServerOperation,
+    *,
+    session: NativeRuntimeServerSession | None,
+    native: _NativeCallExecutor | None,
+) -> None:
+    if session is None or native is None:
+        return
+    metadata = TraceContextMetadata(
+        trace_id=operation.submit.header.trace_id or operation.operation_id,
+        span_id=operation.frame_id or 1,
+        parent_span_id=0,
+        stage_code=0,
+        flags=0,
+        body_bytes=0,
+    )
+    await native.call(session.send_trace_context, metadata, b"", operation_id=None)
 
 
 def _decode_request(metadata: object, body: bytes) -> dict[str, Any]:
@@ -1353,7 +1431,10 @@ def _retire_completed_tasks(tasks: set[asyncio.Task[None]]) -> None:
     for task in tuple(tasks):
         if task.done():
             tasks.remove(task)
-            task.result()
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
 
 
 def _forget_operation_observation(

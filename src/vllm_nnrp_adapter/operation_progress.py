@@ -26,9 +26,11 @@ class OperationProgressReporter:
         operation: NativeRuntimeServerOperation,
         *,
         observer: Callable[[OperationProgressStage], None] | None = None,
+        enabled: bool = True,
     ) -> None:
         self._operation = operation
         self._observer = observer
+        self._enabled = enabled
         self._sequence = 0
         self._last_stage: OperationProgressStage | None = None
 
@@ -40,16 +42,17 @@ class OperationProgressReporter:
         if stage is self._last_stage:
             return
         self._sequence += 1
-        await self._operation.send_progress(
-            ProgressMetadata(
-                operation_id=self._operation.operation_id,
-                progress_sequence=self._sequence,
-                stage_code=int(stage),
-                percent_x100=percent_x100,
-                object_id=0,
-                body_bytes=0,
+        if self._enabled:
+            await self._operation.send_progress(
+                ProgressMetadata(
+                    operation_id=self._operation.operation_id,
+                    progress_sequence=self._sequence,
+                    stage_code=int(stage),
+                    percent_x100=percent_x100,
+                    object_id=0,
+                    body_bytes=0,
+                )
             )
-        )
         self._last_stage = stage
         if self._observer is not None:
             self._observer(stage)

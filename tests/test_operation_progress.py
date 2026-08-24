@@ -34,3 +34,21 @@ async def test_progress_reporter_emits_monotonic_frozen_stages_and_skips_duplica
         ProgressMetadata(44, 2, 0x0005, 2500, 0, 0),
     ]
     assert observed == [OperationProgressStage.QUEUED, OperationProgressStage.EXECUTING]
+
+
+@pytest.mark.asyncio
+async def test_disabled_progress_reporter_preserves_internal_observation_without_wire_frames() -> None:
+    operation = ProgressOperation(45)
+    observed: list[OperationProgressStage] = []
+    reporter = OperationProgressReporter(  # type: ignore[arg-type]
+        operation,
+        observer=observed.append,
+        enabled=False,
+    )
+
+    await reporter.emit(OperationProgressStage.QUEUED)
+    await reporter.emit(OperationProgressStage.EXECUTING, percent_x100=5000)
+
+    assert reporter.last_stage is OperationProgressStage.EXECUTING
+    assert operation.events == []
+    assert observed == [OperationProgressStage.QUEUED, OperationProgressStage.EXECUTING]

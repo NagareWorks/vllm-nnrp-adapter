@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import cast
 
@@ -78,6 +78,11 @@ class OperationControlSlot:
     priority_update: RuntimePriorityUpdate | None = None
     backend_dispatched: bool = False
     _deadline_task: asyncio.Task[None] | None = None
+    _terminal_request_ready: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        init=False,
+        repr=False,
+    )
 
     def bind(self, task: asyncio.Task[None]) -> None:
         if self.task is not None:
@@ -99,6 +104,7 @@ class OperationControlSlot:
         if task is None:
             raise RuntimeError(f"operation {self.operation_id} does not have a bound task")
         await asyncio.sleep(0)
+        self._terminal_request_ready.set()
         task.cancel()
         return RuntimeControlDisposition.APPLIED
 
@@ -115,6 +121,7 @@ class OperationControlSlot:
         if self.terminal_request is not None:
             return RuntimeControlDisposition.STALE
         self.terminal_request = request
+        self._terminal_request_ready.set()
         await self._cancel_deadline()
         task = self.task
         if task is None:
@@ -165,6 +172,13 @@ class OperationControlSlot:
     async def complete(self) -> None:
         await self._cancel_deadline()
 
+    async def wait_for_terminal_request(self) -> RuntimeControlRequest:
+        await self._terminal_request_ready.wait()
+        request = self.terminal_request
+        if request is None:
+            raise RuntimeError(f"operation {self.operation_id} has no terminal request")
+        return request
+
     def _schedule_deadline(self) -> None:
         if self.task is None or self.deadline_update is None:
             return
@@ -184,6 +198,7 @@ class OperationControlSlot:
             flags=update.flags,
             diagnostic=b"deadline_expired",
         )
+        self._terminal_request_ready.set()
         self.task.cancel()
 
     async def _cancel_deadline(self) -> None:

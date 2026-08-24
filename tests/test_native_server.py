@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from nnrp import (
+    NativeInvalidStateError,
     NativeTransportBinding,
     NativeTransportEndpoint,
     NativeTransportProvider,
@@ -41,7 +42,7 @@ from nnrp.core import (
     unpack_typed_payload_frames,
     validate_result_push_body,
 )
-from nnrp.native import FFI_STATUS_WOULD_BLOCK, NativeStatus
+from nnrp.native import FFI_STATUS_INVALID_STATE, FFI_STATUS_WOULD_BLOCK, NativeStatus
 from nnrp.runtime import (
     CapabilityMetadata,
     ControlRequestMetadata,
@@ -76,6 +77,7 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _NativeCallExecutor,
     _OperationObservationTracker,
     _RecoveryReporter,
+    _retire_completed_tasks,
     _serve,
     _serve_operation,
     _ServeCounters,
@@ -297,6 +299,7 @@ class FakeOperation:
     on_terminal: Callable[[], None] | None = None
     fail_next_terminal_result: bool = False
     cancel_next_terminal_result: bool = False
+    fail_next_progress_invalid_state: bool = False
     partial_send_gate: asyncio.Event | None = None
     partial_send_observer: Callable[[bool], None] | None = None
 
@@ -337,6 +340,12 @@ class FakeOperation:
                 self.partial_send_observer(False)
 
     async def send_progress(self, metadata: ProgressMetadata, body: bytes = b"") -> None:
+        if self.fail_next_progress_invalid_state:
+            self.fail_next_progress_invalid_state = False
+            raise NativeInvalidStateError(
+                NativeStatus(FFI_STATUS_INVALID_STATE, detail_code=105),
+                "native runtime operation is already terminal",
+            )
         self.progress_results.append((metadata, body))
 
     async def send_result_drop(self, metadata: ResultDropReasonMetadata, diagnostic: bytes = b"") -> None:
@@ -362,22 +371,35 @@ class FakeServerEvent:
 
 
 class FakeSession:
-    def __init__(self, operation: FakeOperation, stop_event: asyncio.Event) -> None:
+    def __init__(
+        self,
+        operation: FakeOperation,
+        stop_event: asyncio.Event,
+        *,
+        negotiate_progress: bool = False,
+    ) -> None:
         self.active_transport_name = "ipc"
         self._operation = operation
         self._stop_event = stop_event
         self._delivered = False
+        self._negotiate_progress = negotiate_progress
+        self._progress_negotiation_delivered = False
         self.partial_results = operation.partial_results
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
         self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
         self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
+        self.capability_negotiations: list[tuple[CapabilityMetadata, bytes]] = []
+        self.trace_contexts: list[tuple[TraceContextMetadata, bytes, int | None]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
         self._operation.native_thread_ids.append(threading.get_ident())
         assert timeout_ms == 10
         assert max_events == 1
+        if self._negotiate_progress and not self._progress_negotiation_delivered:
+            self._progress_negotiation_delivered = True
+            return (FakeServerEvent(runtime=_capability_event("control.progress_partial")),)
         if not self._delivered:
             self._delivered = True
             return (FakeServerEvent(submit=self._operation),)
@@ -408,6 +430,42 @@ class FakeSession:
     ) -> None:
         self.retry_after_updates.append((metadata, diagnostic))
 
+    def negotiate_capabilities(self, metadata: CapabilityMetadata, body: bytes = b"") -> None:
+        self.capability_negotiations.append((metadata, body))
+
+    def send_trace_context(
+        self,
+        metadata: TraceContextMetadata,
+        body: bytes = b"",
+        *,
+        operation_id: int | None = None,
+    ) -> None:
+        self.trace_contexts.append((metadata, body, operation_id))
+
+
+class ClosingFakeSession(FakeSession):
+    def __init__(
+        self,
+        operation: FakeOperation,
+        stop_event: asyncio.Event,
+        *,
+        detail_code: int,
+    ) -> None:
+        super().__init__(operation, stop_event)
+        self._detail_code = detail_code
+
+    def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
+        assert timeout_ms == 10
+        assert max_events == 1
+        raise NativeInvalidStateError(
+            NativeStatus(FFI_STATUS_INVALID_STATE, detail_code=self._detail_code),
+            "native runtime session closed",
+        )
+
+    def close(self) -> None:
+        super().close()
+        self._stop_event.set()
+
 
 class MultiOperationFakeSession:
     def __init__(
@@ -432,6 +490,7 @@ class MultiOperationFakeSession:
             operation.partial_results = self.partial_results
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
+        self.trace_contexts: list[tuple[TraceContextMetadata, bytes, int | None]] = []
         self.recoverable_errors: list[tuple[RecoverableErrorMetadata, bytes]] = []
         self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
         self.closed = False
@@ -493,6 +552,7 @@ class ScriptedEventSession:
         self.retry_after_updates: list[tuple[RetryAfterMetadata, bytes]] = []
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
+        self.trace_contexts: list[tuple[TraceContextMetadata, bytes, int | None]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -536,6 +596,15 @@ class ScriptedEventSession:
     def degrade_profile(self, metadata: CapabilityMetadata, body: bytes = b"") -> None:
         self.profile_degradations.append((metadata, body))
 
+    def send_trace_context(
+        self,
+        metadata: TraceContextMetadata,
+        body: bytes = b"",
+        *,
+        operation_id: int | None = None,
+    ) -> None:
+        self.trace_contexts.append((metadata, body, operation_id))
+
 
 class FakeServer:
     def __init__(
@@ -571,6 +640,20 @@ class MultiSessionFakeServer:
             self.accepted_count += 1
             return self._pending.pop(0)
         raise NativeWouldBlockError(NativeStatus(FFI_STATUS_WOULD_BLOCK))
+
+
+class ClosingFakeServer:
+    def __init__(self, *, detail_code: int) -> None:
+        self.bound_provider_endpoints: dict[str, NativeTransportEndpoint] = {}
+        self._detail_code = detail_code
+
+    async def accept(self, options: NativeServerAcceptOptions | None = None) -> Any:
+        assert options is not None
+        assert options.timeout_ms == 10
+        raise NativeInvalidStateError(
+            NativeStatus(FFI_STATUS_INVALID_STATE, detail_code=self._detail_code),
+            "native runtime server closed",
+        )
 
 
 class FakeServerContext:
@@ -628,6 +711,134 @@ def _listen_with_context(server_context: FakeServerContext) -> Callable[..., Fak
         return server_context
 
     return listen
+
+
+@pytest.mark.asyncio
+async def test_native_server_accept_treats_transport_closed_as_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_context = FakeServerContext(ClosingFakeServer(detail_code=105))  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=1,
+        ),
+    )
+
+    assert statistics.accepted_sessions == 0
+    assert statistics.accepted_operations == 0
+    assert server_context.exited is True
+
+
+@pytest.mark.asyncio
+async def test_native_server_accept_propagates_other_invalid_state_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_context = FakeServerContext(ClosingFakeServer(detail_code=106))  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    with pytest.raises(NativeInvalidStateError) as error:
+        await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=1,
+            ),
+        )
+
+    assert error.value.status.detail_code == 106
+    assert server_context.exited is True
+
+
+@pytest.mark.asyncio
+async def test_native_session_poll_treats_transport_closed_as_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=69,
+        frame_id=17,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=69),
+        terminal_results=[],
+    )
+    session = ClosingFakeSession(operation, stop_event, detail_code=105)
+    server_context = FakeServerContext(FakeServer(session))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=1,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_sessions == 1
+    assert statistics.accepted_operations == 0
+    assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_session_poll_propagates_other_invalid_state_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=70,
+        frame_id=18,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=70),
+        terminal_results=[],
+    )
+    session = ClosingFakeSession(operation, stop_event, detail_code=106)
+    server_context = FakeServerContext(FakeServer(session))
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    with pytest.raises(NativeInvalidStateError) as error:
+        await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=1,
+            ),
+            stop_event=stop_event,
+        )
+
+    assert error.value.status.detail_code == 106
+    assert session.closed is True
 
 
 @pytest.mark.asyncio
@@ -832,7 +1043,7 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         metadata=_submit_metadata(operation_id=71),
         terminal_results=[],
     )
-    session = FakeSession(operation, stop_event)
+    session = FakeSession(operation, stop_event, negotiate_progress=True)
     server_context = FakeServerContext(
         FakeServer(
             session,
@@ -1588,6 +1799,90 @@ def test_trace_context_maps_to_frozen_w3c_header(
 
 
 @pytest.mark.asyncio
+async def test_retire_completed_tasks_consumes_expected_operation_cancellation() -> None:
+    task = asyncio.create_task(asyncio.sleep(60))
+    tasks = {task}
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    _retire_completed_tasks(tasks)
+
+    assert tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_retire_completed_tasks_still_propagates_operation_failures() -> None:
+    async def fail() -> None:
+        raise RuntimeError("operation failed")
+
+    task = asyncio.create_task(fail())
+    tasks = {task}
+    await asyncio.wait({task})
+
+    with pytest.raises(RuntimeError, match="operation failed"):
+        _retire_completed_tasks(tasks)
+
+    assert tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_native_terminal_race_waits_for_control_before_emitting_drop_reason() -> None:
+    operation = FakeOperation(
+        operation_id=67,
+        frame_id=167,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=67),
+        terminal_results=[],
+        fail_next_progress_invalid_state=True,
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-67")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="ipc",
+        active_profile_id=0,
+        backend_family="StreamingBackend",
+    )
+    counters = _ServeCounters()
+    task = asyncio.create_task(
+        _serve_operation(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            operation,  # type: ignore[arg-type]
+            record=record,
+            control=control,
+            observation=observation,
+            observation_sinks=(),
+            counters=counters,
+        )
+    )
+    control.bind(task)
+    await asyncio.sleep(0)
+
+    disposition = await control.apply(
+        RuntimeControlRequest(
+            kind=RuntimeControlKind.CANCEL,
+            operation_id=operation.operation_id,
+            control_sequence=1,
+            reason_code=3,
+            source_role=RuntimeRole.CLIENT,
+            flags=0,
+            diagnostic=b"peer_cancelled",
+        ),
+        terminal=False,
+    )
+    await task
+
+    assert disposition is RuntimeControlDisposition.APPLIED
+    assert operation.terminal_results == []
+    assert len(operation.result_drops) == 1
+    assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
+    assert counters.terminal_results == 1
+    assert counters.result_drops == 1
+
+
+@pytest.mark.asyncio
 async def test_operation_trace_can_replace_session_default_before_backend_dispatch() -> None:
     backend = TraceAwareStreamingBackend()
     adapter = OpenAiNnrpAdapter(backend)
@@ -2015,7 +2310,7 @@ async def test_invalid_submit_body_produces_one_terminal_error(
     metadata, body = operation.terminal_results[0]
     assert metadata.status_code == 500
     assert _decode_terminal_profile_body(metadata, body)["error"]["code"] == "invalid_submit_body"
-    assert [metadata.stage_code for metadata, _body in operation.progress_results] == [0x0001, 0x0003, 0x0008, 0x000B]
+    assert operation.progress_results == []
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "failed"
     assert observation["error_family"] == "invalid_request_error"
@@ -2389,12 +2684,11 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
     assert duplicate_event["error"]["code"] == "duplicate_operation_id"
 
 
-@pytest.mark.parametrize(("message_type", "expect_drop"), [(MessageType.CANCEL, False), (MessageType.ABORT, True)])
+@pytest.mark.parametrize("message_type", [MessageType.CANCEL, MessageType.ABORT])
 @pytest.mark.asyncio
 async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     monkeypatch: pytest.MonkeyPatch,
     message_type: MessageType,
-    expect_drop: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     _capture_observations(caplog)
@@ -2439,25 +2733,26 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     assert backend.closed.is_set()
     assert backend.close_calls == 1
     assert [json.loads(body)["delta"] for _metadata, body in operation.partial_results] == ["first"]
-    if expect_drop:
-        assert operation.terminal_results == []
-        assert len(operation.result_drops) == 1
-        assert operation.result_drops[0][0].operation_id == 101
-    else:
-        assert operation.result_drops == []
-        assert len(operation.terminal_results) == 1
-        assert _decode_terminal_profile_body(*operation.terminal_results[0]) == {
-            "reason": "peer_cancelled",
-            "type": "response.cancelled",
-        }
-    assert operation.progress_results[-1][0].stage_code == 0x000A
+    assert operation.terminal_results == []
+    assert len(operation.result_drops) == 1
+    assert operation.result_drops[0][0].operation_id == 101
+    assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
+    assert len(session.trace_contexts) == 1
+    trace_metadata, trace_body, trace_operation_id = session.trace_contexts[0]
+    assert trace_metadata.trace_id == operation.submit.header.trace_id
+    assert trace_metadata.span_id == 201
+    assert trace_body == b""
+    assert trace_operation_id is None
+    assert all(metadata.stage_code != 0x000A for metadata, _body in operation.progress_results)
     observation = _observation_records(caplog)[0]
-    assert observation["terminal_outcome"] == ("dropped" if expect_drop else "cancelled")
+    assert observation["terminal_outcome"] == (
+        "dropped" if message_type is MessageType.ABORT else "cancelled"
+    )
     assert observation["cancellation_kind"] == message_type.name.lower()
     assert observation["cancellation_source"] == "client"
     assert observation["cancellation_reason_code"] == 3
     assert observation["backend_abort_accepted"] is True
-    assert observation["drop_reason"] == ("peer_cancelled" if expect_drop else None)
+    assert observation["drop_reason"] == "peer_cancelled"
 
 
 @pytest.mark.asyncio
@@ -2576,7 +2871,7 @@ async def test_live_priority_update_uses_explicit_backend_hook(
 
 
 @pytest.mark.asyncio
-async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cannot_be_delivered(
+async def test_native_cancel_sends_typed_drop_reason(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2590,7 +2885,6 @@ async def test_native_cancel_falls_back_to_typed_drop_when_profile_terminal_cann
         metadata=_submit_metadata(operation_id=107),
         terminal_results=[],
         on_terminal=stop_event.set,
-        fail_next_terminal_result=True,
     )
     session = ScriptedEventSession(
         [
@@ -2690,7 +2984,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     assert backend.close_calls == 1
     assert len(operation.result_drops) == 1
     assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.TRANSPORT_CLOSED
-    assert operation.progress_results[-1][0].stage_code == 0x000A
+    assert all(metadata.stage_code != 0x000A for metadata, _body in operation.progress_results)
     assert session.closed is True
     assert server_context.exited is True
     observation = _observation_records(caplog)[0]
@@ -2936,7 +3230,7 @@ async def test_native_deadline_update_stops_backend_and_drops_late_output(
     drop_metadata, diagnostic = operation.result_drops[0]
     assert drop_metadata.drop_reason_code is ResultDropReasonCode.DEADLINE_EXPIRED
     assert diagnostic == b"deadline_expired"
-    assert operation.progress_results[-1][0].stage_code == 0x000A
+    assert all(metadata.stage_code != 0x000A for metadata, _body in operation.progress_results)
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "dropped"
     assert observation["cancellation_kind"] == "deadline_expired"
