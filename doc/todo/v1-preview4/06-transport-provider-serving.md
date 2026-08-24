@@ -20,7 +20,7 @@
 - [x] Treat unavailable bindings as diagnostics and never bind them.
 - [x] Keep `unix://`, `npipe://`, `ws://`, and `wss://` locators inside provider routes while public
   application endpoints remain `nnrp://` or `nnrps://`.
-- [ ] Fail the logical server atomically when mandatory provider listeners cannot be established.
+- [x] Fail the logical server atomically when mandatory provider listeners cannot be established.
 
 ## Security And Validation
 

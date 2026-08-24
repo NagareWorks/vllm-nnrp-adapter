@@ -75,6 +75,7 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _NativeCallExecutor,
     _OperationObservationTracker,
     _RecoveryReporter,
+    _serve,
     _serve_operation,
     _ServeCounters,
     _w3c_trace_headers,
@@ -1811,6 +1812,62 @@ async def test_listener_failure_remains_a_server_failure_without_profile_termina
             config=NnrpServerConfig(endpoint="nnrp://runtime.local/vllm"),
         )
 
+    assert _startup_observation_records(caplog) == []
+    assert _observation_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_provider_listener_failure_keeps_logical_server_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    captured_options: list[NativeServerBootstrapOptions] = []
+    ready_endpoints: list[Mapping[str, NativeTransportEndpoint]] = []
+    executors: list[_NativeCallExecutor] = []
+
+    class TrackingNativeCallExecutor(_NativeCallExecutor):
+        def __init__(self, max_workers: int) -> None:
+            super().__init__(max_workers)
+            self.closed = False
+            executors.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    def fail_logical_listener(
+        options: NativeServerBootstrapOptions,
+        *,
+        transports: object = None,
+    ) -> FailingServerContext:
+        assert transports is None
+        captured_options.append(options)
+        return FailingServerContext()
+
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime._NativeCallExecutor", TrackingNativeCallExecutor)
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.listen_native_server", fail_logical_listener)
+
+    routes = {
+        "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
+        "ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm"),
+    }
+    with pytest.raises(OSError, match="listener failed before admission"):
+        await _serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                provider_routes=routes,
+            ),
+            stop_event=None,
+            on_ready=ready_endpoints.append,
+        )
+
+    assert len(captured_options) == 1
+    assert captured_options[0].provider_routes == routes
+    assert ready_endpoints == []
+    assert len(executors) == 1
+    assert executors[0].closed is True
     assert _startup_observation_records(caplog) == []
     assert _observation_records(caplog) == []
 
