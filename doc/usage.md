@@ -289,7 +289,40 @@ The first recorded release-readiness baseline is
 It should be treated as the current NNRP direct-path baseline. HTTP/SSE-to-NNRP relay data is useful only as smoke
 evidence and should not be used to justify the optimized runtime path.
 
-## Request Envelope
+## Level 1 JSON And Typed-Control Boundary
+
+The `openai-compatible/1` Level 1 profile uses JSON only for the application request and profile
+events. NNRP session, scheduling, cancellation, flow-control, observability, object, and cache
+semantics remain protocol messages with typed binary metadata. They are not extension fields in an
+OpenAI request body.
+
+| Phase | NNRP message | Body representation |
+| --- | --- | --- |
+| Request | `FRAME_SUBMIT` | Exactly one 24-byte typed-payload descriptor followed by one UTF-8 JSON `STRUCTURED_EVENT` payload. The descriptor uses `profile_id=0`, `schema_id=0`, `schema_version=0`, and `stream_semantics=SNAPSHOT`; the submit metadata uses `payload_kind_bitmap=0x10` and `payload_frame_count=1`. |
+| Streaming event | `PARTIAL_RESULT` | One raw UTF-8 JSON event object. It has no data-plane prelude, typed-payload descriptor, event concatenation, or SSE delimiter. |
+| Terminal profile event | `RESULT_PUSH` | Exactly one typed `STRUCTURED_EVENT` snapshot with the same descriptor as the request. This carries `response.completed`, `response.error`, or `response.cancelled`. |
+| Empty success | `RESULT_PUSH` | Zero payload frames and an empty body. |
+| Runtime coordination | Dedicated Preview4 control messages | Typed metadata and, where defined by NNRP, a binary body or diagnostic tail. These messages never become profile JSON fields. |
+
+The adapter currently applies typed `CANCEL`, `ABORT`, `SUPERSEDE`, `DEADLINE`, `EXPIRE_AT`, and
+`PRIORITY_UPDATE` operation controls. It also handles typed capability negotiation, trace context,
+backpressure, and credit updates. Progress, recoverable errors, retry hints, and result-drop reasons
+are emitted through their dedicated NNRP messages. Runtime objects and cache references stay on the
+typed runtime-object and cache-reference paths; the Level 1 JSON envelope is not a fallback encoding
+for them.
+
+### Request Envelope
+
+The top-level object accepts only the following fields. Unknown fields are rejected rather than
+silently forwarded.
+
+| Field | Requirement | Meaning |
+| --- | --- | --- |
+| `schema_version` | Required | Must equal `openai-compatible/1`. |
+| `operation` | Required | Must equal `chat.completions.create` for Level 1. |
+| `request_id` | Optional | Caller correlation id; the adapter derives one from native operation identity when omitted. |
+| `body` | Required | OpenAI-compatible chat-completions request object. |
+| `nnrp` | Optional | Adapter policy object; accepts only `timeout_ms` and `diagnostics`. |
 
 ```json
 {
@@ -314,6 +347,7 @@ evidence and should not be used to justify the optimized runtime path.
 
 `timeout_ms` bounds backend await and stream-next latency. `diagnostics` emits a
 `response.diagnostics` event. Cancellation is not an envelope policy: native callers send the
-frozen `CANCEL` or `ABORT` control frame, while direct Python callers cancel or close their async
-iterator. Runtime control, object, and cache metadata stays in typed NNRP frames rather than JSON
-request fields.
+frozen `CANCEL` or `ABORT` control message, while direct Python callers cancel or close their async
+iterator. Fields such as deadlines, priorities, route hints, trace context, object descriptors, or
+cache references are invalid at the envelope top level and must use their frozen typed protocol
+messages.
