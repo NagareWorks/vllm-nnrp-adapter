@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 import tarfile
 import zipfile
 from collections.abc import Iterable
@@ -31,6 +33,7 @@ SDIST_REQUIRED_SUFFIXES = (
     "/src/vllm_nnrp_adapter/__init__.py",
     "/src/vllm_nnrp_adapter/py.typed",
 )
+PYTHON_FENCE_PATTERN = re.compile(r"```(?:python|py)[^\n]*\n(.*?)```", re.DOTALL)
 
 
 class DistributionMetadataError(RuntimeError):
@@ -113,6 +116,40 @@ def validate_distribution(path: Path) -> DistributionIdentity:
         raise DistributionMetadataError(f"unsupported distribution artifact: {path.name}")
 
     return validate_metadata_text(metadata_text, artifact=path.name)
+
+
+def documented_public_symbols(paths: Iterable[Path]) -> frozenset[str]:
+    symbols: set[str] = set()
+    for path in paths:
+        if not path.is_file():
+            raise DistributionMetadataError(f"documented API source does not exist: {path}")
+        for block_index, match in enumerate(PYTHON_FENCE_PATTERN.finditer(path.read_text(encoding="utf-8")), 1):
+            try:
+                tree = ast.parse(match.group(1), filename=f"{path}#python-{block_index}")
+            except SyntaxError as error:
+                raise DistributionMetadataError(
+                    f"{path} Python example {block_index} is not valid syntax"
+                ) from error
+            module_aliases = {"vllm_nnrp_adapter"}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "vllm_nnrp_adapter":
+                    symbols.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Import):
+                    module_aliases.update(
+                        alias.asname or alias.name
+                        for alias in node.names
+                        if alias.name == "vllm_nnrp_adapter"
+                    )
+            symbols.update(
+                node.attr
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in module_aliases
+            )
+    if not symbols:
+        raise DistributionMetadataError("documentation does not import any public adapter symbols")
+    return frozenset(symbols)
 
 
 def _validate_archive_names(names: Iterable[str], *, artifact: str) -> None:

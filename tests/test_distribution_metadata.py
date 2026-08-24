@@ -9,6 +9,7 @@ import pytest
 
 from vllm_nnrp_adapter.distribution_metadata import (
     DistributionMetadataError,
+    documented_public_symbols,
     validate_distribution,
     validate_metadata_text,
 )
@@ -204,3 +205,49 @@ def test_validate_sdist_rejects_missing_required_files(tmp_path, missing_file: s
 
     with pytest.raises(DistributionMetadataError, match="missing required files"):
         validate_distribution(artifact)
+
+
+def test_documented_public_symbols_collects_adapter_imports(tmp_path: Path) -> None:
+    document = tmp_path / "usage.md"
+    document.write_text(
+        """# Usage
+
+```python
+from vllm_nnrp_adapter import (
+    NnrpServerConfig,
+    OpenAiNnrpAdapter as Adapter,
+)
+
+import vllm_nnrp_adapter as adapter_package
+
+adapter_package.create_vllm_backend
+```
+
+```bash
+from vllm_nnrp_adapter import NotPython
+```
+""",
+        encoding="utf-8",
+    )
+
+    assert documented_public_symbols((document,)) == frozenset(
+        {"NnrpServerConfig", "OpenAiNnrpAdapter", "create_vllm_backend"}
+    )
+
+
+def test_documented_public_symbols_rejects_invalid_python_example(tmp_path: Path) -> None:
+    document = tmp_path / "usage.md"
+    document.write_text("```python\nfrom vllm_nnrp_adapter import\n```\n", encoding="utf-8")
+
+    with pytest.raises(DistributionMetadataError, match="not valid syntax"):
+        documented_public_symbols((document,))
+
+
+def test_documented_public_symbols_rejects_missing_or_empty_sources(tmp_path: Path) -> None:
+    with pytest.raises(DistributionMetadataError, match="does not exist"):
+        documented_public_symbols((tmp_path / "missing.md",))
+
+    document = tmp_path / "usage.md"
+    document.write_text("# No imports\n", encoding="utf-8")
+    with pytest.raises(DistributionMetadataError, match="does not import"):
+        documented_public_symbols((document,))

@@ -10,8 +10,12 @@ from pathlib import Path
 from vllm_nnrp_adapter.distribution_metadata import (
     DistributionIdentity,
     DistributionMetadataError,
+    documented_public_symbols,
     validate_distribution,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DOCUMENTATION_PATHS = (PROJECT_ROOT / "README.md", PROJECT_ROOT / "doc" / "usage.md")
 
 
 def main() -> int:
@@ -35,11 +39,20 @@ def main() -> int:
     if len(identities) != 1:
         raise DistributionMetadataError("wheel and sdist project identities do not match")
 
-    _validate_clean_install(wheels[0], identities.pop())
+    _validate_clean_install(
+        wheels[0],
+        identities.pop(),
+        documented_symbols=documented_public_symbols(DOCUMENTATION_PATHS),
+    )
     return 0
 
 
-def _validate_clean_install(wheel: Path, identity: DistributionIdentity) -> None:
+def _validate_clean_install(
+    wheel: Path,
+    identity: DistributionIdentity,
+    *,
+    documented_symbols: frozenset[str],
+) -> None:
     wheel = wheel.resolve()
     with tempfile.TemporaryDirectory(prefix=".install-check-", dir=wheel.parent) as temporary_directory:
         environment = Path(temporary_directory) / "venv"
@@ -68,7 +81,11 @@ def _validate_clean_install(wheel: Path, identity: DistributionIdentity) -> None
                     "import importlib.metadata; import importlib.util; import vllm_nnrp_adapter; "
                     "assert importlib.metadata.version('vllm-nnrp-adapter') == "
                     f"{identity.version!r}; "
-                    "assert importlib.util.find_spec('vllm') is None"
+                    "assert importlib.util.find_spec('vllm') is None; "
+                    f"symbols = {tuple(sorted(documented_symbols))!r}; "
+                    "missing = [name for name in symbols if name not in vllm_nnrp_adapter.__all__ "
+                    "or not hasattr(vllm_nnrp_adapter, name)]; "
+                    "assert not missing, missing"
                 ),
             ],
             check=True,

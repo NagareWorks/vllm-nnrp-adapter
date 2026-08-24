@@ -41,5 +41,5 @@
 - [ ] Document the exact Level 1 JSON boundary and the typed binary runtime-control boundary.
 - [ ] Update the English and Chinese `nnrp-doc` vLLM design pages to distinguish the
   `0.18.0..<0.27` installation band from the tested compatibility anchors.
-- [ ] Verify every documented adapter symbol against the installed package.
+- [x] Verify every documented adapter symbol against the installed package.
 - [ ] Record evidence for every advertised compatibility anchor and every unsupported capability.
