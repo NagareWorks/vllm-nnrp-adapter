@@ -15,10 +15,12 @@ from nnrp import (  # type: ignore[import-untyped]
     NativeRuntimeServerSession,
     NativeTransportBinding,
     NativeTransportEndpoint,
+    NativeTransportServerSecurity,
     NativeWouldBlockError,
     PayloadKind,
     StreamSemantics,
     TransportPolicy,
+    parse_native_transport_endpoint,
 )
 from nnrp.core import (  # type: ignore[import-untyped]
     ErrorCode,
@@ -85,6 +87,7 @@ _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "resp
 _CAPABILITY_FLAG_HARD_REQUIREMENT = 0x0000_0001
 _CAPABILITY_FLAG_DOWNGRADE_ALLOWED = 0x0000_0002
 _OPENAI_COMPATIBLE_PROFILE_ID = 0
+_PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
 _SUPPORTED_RUNTIME_CAPABILITIES = frozenset(
     {
         "control.cancel_abort",
@@ -134,6 +137,7 @@ class NnrpServerConfig:
         routes = MappingProxyType(dict(self.provider_routes))
         if any(not isinstance(route, NativeServerProviderRoute) for route in routes.values()):
             raise TypeError("provider_routes values must be NativeServerProviderRoute")
+        _validate_server_provider_routes(routes)
         transports = None if self.transports is None else tuple(self.transports)
         if transports is not None and any(not isinstance(binding, NativeTransportBinding) for binding in transports):
             raise TypeError("transports values must be NativeTransportBinding")
@@ -145,6 +149,44 @@ class NnrpServerConfig:
         object.__setattr__(self, "provider_routes", routes)
         object.__setattr__(self, "transports", transports)
         object.__setattr__(self, "observation_sinks", observation_sinks)
+
+
+def _validate_server_provider_routes(routes: Mapping[str, NativeServerProviderRoute]) -> None:
+    unknown_names = set(routes) - _PROVIDER_NAMES
+    if unknown_names:
+        names = ", ".join(sorted(unknown_names))
+        raise ValueError(f"provider_routes contains unsupported transport names: {names}")
+
+    for transport_name, route in routes.items():
+        endpoint = route.provider_endpoint
+        if endpoint is not None and not isinstance(endpoint, (str, NativeTransportEndpoint)):
+            raise TypeError("provider route endpoint must be str, NativeTransportEndpoint, or None")
+        if route.security is not None and not isinstance(route.security, NativeTransportServerSecurity):
+            raise TypeError("provider route security must be NativeTransportServerSecurity or None")
+        resolved = None
+        if endpoint is not None:
+            resolved = (
+                endpoint
+                if isinstance(endpoint, NativeTransportEndpoint)
+                else parse_native_transport_endpoint(endpoint)
+            )
+            if resolved.transport_name != transport_name:
+                raise ValueError(
+                    f"{transport_name} provider route cannot use {resolved.transport_name} carrier endpoint"
+                )
+
+        if transport_name in {"ipc", "websocket"} and resolved is None:
+            raise ValueError(f"{transport_name} provider route requires an explicit provider endpoint")
+        if transport_name == "quic" and route.security is None:
+            raise ValueError("quic provider route requires server security material")
+        if transport_name == "ipc" and route.security is not None:
+            raise ValueError("ipc provider route must not carry server security material")
+        if transport_name == "websocket":
+            assert resolved is not None
+            if resolved.secure and route.security is None:
+                raise ValueError("wss provider route requires server security material")
+            if not resolved.secure and route.security is not None:
+                raise ValueError("ws provider route must not carry server security material")
 
 
 @dataclass(frozen=True, slots=True)

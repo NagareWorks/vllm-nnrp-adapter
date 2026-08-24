@@ -21,6 +21,7 @@ from nnrp import (
     NativeTransportProviderLimits,
     NativeTransportProviderMetadata,
     NativeTransportSelectionError,
+    NativeTransportServerSecurity,
     NativeWouldBlockError,
     StreamSemantics,
     TransportId,
@@ -1772,6 +1773,77 @@ def test_server_config_rejects_invalid_observation_sink() -> None:
         NnrpServerConfig(
             endpoint="nnrp://runtime.local/vllm",
             observation_sinks=[object()],  # type: ignore[list-item]
+        )
+
+
+@pytest.mark.parametrize(
+    ("transport_name", "provider_endpoint", "message"),
+    [
+        ("udp", "tcp://127.0.0.1:7766", "unsupported transport names"),
+        ("tcp", "ws://127.0.0.1:7766/nnrp", "cannot use websocket carrier endpoint"),
+        ("ipc", None, "requires an explicit provider endpoint"),
+        ("websocket", None, "requires an explicit provider endpoint"),
+    ],
+)
+def test_server_config_rejects_invalid_provider_route_identity(
+    transport_name: str,
+    provider_endpoint: str | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            provider_routes={transport_name: NativeServerProviderRoute(provider_endpoint=provider_endpoint)},
+        )
+
+
+@pytest.mark.parametrize(
+    ("route", "message"),
+    [
+        (NativeServerProviderRoute(provider_endpoint=object()), "provider route endpoint"),  # type: ignore[arg-type]
+        (NativeServerProviderRoute(security=object()), "provider route security"),  # type: ignore[arg-type]
+    ],
+)
+def test_server_config_rejects_invalid_provider_route_values(
+    route: NativeServerProviderRoute,
+    message: str,
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            provider_routes={"tcp": route},
+        )
+
+
+@pytest.mark.parametrize(
+    ("transport_name", "provider_endpoint", "security", "message"),
+    [
+        ("quic", "quic://127.0.0.1:7767", None, "quic provider route requires"),
+        ("websocket", "wss://127.0.0.1:7768/nnrp", None, "wss provider route requires"),
+        ("websocket", "ws://127.0.0.1:7768/nnrp", "server", "ws provider route must not"),
+        ("ipc", "npipe://nnrp-vllm", "server", "ipc provider route must not"),
+    ],
+)
+def test_server_config_enforces_route_local_security(
+    transport_name: str,
+    provider_endpoint: str,
+    security: str | None,
+    message: str,
+) -> None:
+    server_security = (
+        NativeTransportServerSecurity(certificate_der=b"certificate", private_key_pkcs8_der=b"private-key")
+        if security is not None
+        else None
+    )
+    with pytest.raises(ValueError, match=message):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            provider_routes={
+                transport_name: NativeServerProviderRoute(
+                    provider_endpoint=provider_endpoint,
+                    security=server_security,
+                )
+            },
         )
 
 
