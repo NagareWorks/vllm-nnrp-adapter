@@ -59,6 +59,7 @@ from nnrp.server import (  # type: ignore[import-untyped]
 )
 
 from .adapter import OpenAiNnrpAdapter
+from .capability_ledger import supported_runtime_capabilities
 from .nnrp_contract import validate_nnrp_runtime_contract
 from .observability import (
     ObservationSink,
@@ -88,21 +89,6 @@ _CAPABILITY_FLAG_HARD_REQUIREMENT = 0x0000_0001
 _CAPABILITY_FLAG_DOWNGRADE_ALLOWED = 0x0000_0002
 _OPENAI_COMPATIBLE_PROFILE_ID = 0
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
-_SUPPORTED_RUNTIME_CAPABILITIES = frozenset(
-    {
-        "control.cancel_abort",
-        "control.supersede",
-        "control.deadline_expire",
-        "control.progress_partial",
-        "control.credit_backpressure",
-        "control.capability_costs",
-        "control.trace_context",
-        "control.result_drop_reason",
-        "control.degrade_profile",
-        "control.recoverable_error",
-        "payload.typed",
-    }
-)
 _T = TypeVar("_T")
 
 
@@ -668,9 +654,9 @@ async def _handle_capability_negotiation(
     counters: _ServeCounters,
 ) -> tuple[str, ...]:
     metadata, requested = _decode_capability_offer(event)
-    supported = set(_SUPPORTED_RUNTIME_CAPABILITIES)
-    if adapter._supports_runtime_priority():
-        supported.add("control.priority_update")
+    supported = supported_runtime_capabilities(
+        supports_runtime_priority=adapter._supports_runtime_priority()
+    )
     accepted = tuple(token for token in requested if token in supported)
     accepted_body = _encode_capability_tokens(accepted)
     response = CapabilityMetadata(

@@ -40,7 +40,7 @@
 - [ ] Treat native serving, direct vLLM binding, partial results, cancellation, abort, deadlines,
   backpressure, credits, traces, drop diagnostics, and independent wire E2E as the core delivery
   loop.
-- [ ] Advertise priority updates, route hints, runtime objects, and cache references only when the
+- [x] Advertise priority updates, route hints, runtime objects, and cache references only when the
   adapter can name and test the concrete vLLM mechanism that applies them.
 - [ ] Keep KV-cache identity integration, standalone metrics serving, and backend-specific scheduler
   extensions optional until each has an implemented mechanism and independent evidence.

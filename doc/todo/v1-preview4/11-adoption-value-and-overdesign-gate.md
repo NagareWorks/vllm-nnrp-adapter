@@ -55,7 +55,7 @@
 
 - [ ] Maintain a ledger mapping every advertised capability to its NNRP surface, concrete vLLM
   mechanism, observable effect, benchmark scenario, metric, threshold, and evidence artifact.
-- [ ] Remove a capability from advertisements when its vLLM mechanism is absent, emulated only by a
+- [x] Remove a capability from advertisements when its vLLM mechanism is absent, emulated only by a
   mock, or unable to produce the documented effect.
 - [ ] Keep optional or experimental capabilities out of mandatory release gates until their ledger
   entries are complete.
