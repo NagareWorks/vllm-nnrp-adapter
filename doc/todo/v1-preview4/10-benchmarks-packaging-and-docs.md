@@ -19,7 +19,7 @@
   usernames, tokens, or machine ids.
 - [x] Randomize or interleave compared runs, report sample counts and confidence intervals, and keep
   the benchmark input manifest beside each result.
-- [ ] State plainly that model-dominated chat parity validates compatibility; it is not the primary
+- [x] State plainly that model-dominated chat parity validates compatibility; it is not the primary
   heavy-transport performance claim.
 
 ## Packaging And Workflows

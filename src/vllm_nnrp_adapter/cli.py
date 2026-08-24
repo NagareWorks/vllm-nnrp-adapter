@@ -79,6 +79,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     benchmark.add_argument("--max-completion-tokens", type=int, default=128)
     benchmark.add_argument("--http-url", help="OpenAI-compatible HTTP chat completions URL for SSE comparison.")
     benchmark.add_argument("--http-api-key", help="Bearer token for the HTTP comparison endpoint.")
+    benchmark.add_argument(
+        "--markdown-output",
+        type=Path,
+        help="Write a generated combined comparison table beside the raw JSON evidence.",
+    )
 
     server = subcommands.add_parser(
         "serve",
@@ -150,12 +155,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             http_url=args.http_url,
             http_api_key=args.http_api_key,
         )
-        runner = run_comparison_benchmark_sync if args.comparison else run_benchmark_sync
-        runner(
-            args.output,
-            args.backend,
-            benchmark_config,
-        )
+        if args.comparison:
+            run_comparison_benchmark_sync(
+                args.output,
+                args.backend,
+                benchmark_config,
+                args.markdown_output,
+            )
+        else:
+            if args.markdown_output is not None:
+                parser.error("--markdown-output requires --comparison")
+            run_benchmark_sync(args.output, args.backend, benchmark_config)
         return 0
     if args.command == "serve":
         try:

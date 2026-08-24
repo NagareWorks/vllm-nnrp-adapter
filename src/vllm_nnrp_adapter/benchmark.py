@@ -38,9 +38,19 @@ def run_benchmark_sync(output_path: Path, backend_spec: str, config: BenchmarkCo
     return asyncio.run(run_benchmark_file_with_backend_spec(output_path, backend_spec=backend_spec, config=config))
 
 
-def run_comparison_benchmark_sync(output_path: Path, backend_spec: str, config: BenchmarkConfig) -> dict[str, Any]:
+def run_comparison_benchmark_sync(
+    output_path: Path,
+    backend_spec: str,
+    config: BenchmarkConfig,
+    markdown_output_path: Path | None = None,
+) -> dict[str, Any]:
     return asyncio.run(
-        run_comparison_benchmark_file_with_backend_spec(output_path, backend_spec=backend_spec, config=config)
+        run_comparison_benchmark_file_with_backend_spec(
+            output_path,
+            backend_spec=backend_spec,
+            config=config,
+            markdown_output_path=markdown_output_path,
+        )
     )
 
 
@@ -59,9 +69,15 @@ async def run_comparison_benchmark_file_with_backend_spec(
     *,
     backend_spec: str,
     config: BenchmarkConfig,
+    markdown_output_path: Path | None = None,
 ) -> dict[str, Any]:
     backend = await load_backend_async(backend_spec)
-    return await run_comparison_benchmark_file(output_path, backend=backend, config=config)
+    return await run_comparison_benchmark_file(
+        output_path,
+        backend=backend,
+        config=config,
+        markdown_output_path=markdown_output_path,
+    )
 
 
 async def run_benchmark_file(
@@ -81,11 +97,66 @@ async def run_comparison_benchmark_file(
     *,
     backend: ChatCompletionBackend,
     config: BenchmarkConfig,
+    markdown_output_path: Path | None = None,
 ) -> dict[str, Any]:
     report = await run_in_process_comparison_benchmark(backend=backend, config=config)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    if markdown_output_path is not None:
+        markdown_output_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_output_path.write_text(
+            render_comparison_markdown(report, raw_report_name=output_path.name),
+            encoding="utf-8",
+        )
     return report
+
+
+def render_comparison_markdown(report: Mapping[str, Any], *, raw_report_name: str) -> str:
+    if report.get("benchmark_kind") != "in_process_comparison":
+        raise ValueError("comparison markdown requires an in_process_comparison report")
+    scenarios = report.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError("comparison report must contain scenarios")
+
+    lines = [
+        "# OpenAI NNRP And HTTP/SSE Comparison",
+        "",
+        f"Raw evidence: `{raw_report_name}`",
+        "",
+        "| Prompt tokens | Concurrency | Path | Success / error | TTFT p50 | TPOT p50 | RTT p50 | "
+        "Cancel p50 | Requests/s | Output tokens/s |",
+        "| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for scenario in sorted(scenarios, key=_comparison_scenario_sort_key):
+        lines.append(
+            "| {prompt} | {concurrency} | `{path}` | {success} / {error} | {ttft} | {tpot} | "
+            "{rtt} | {cancel} | {requests} | {tokens} |".format(
+                prompt=_required_int(scenario, "prompt_tokens"),
+                concurrency=_required_int(scenario, "concurrency"),
+                path=_required_str(scenario, "path"),
+                success=_required_int(scenario, "success_count"),
+                error=_required_int(scenario, "error_count"),
+                ttft=_format_milliseconds(scenario.get("ttft_p50_us")),
+                tpot=_format_milliseconds(scenario.get("tpot_p50_us")),
+                rtt=_format_milliseconds(scenario.get("rtt_p50_us")),
+                cancel=_format_milliseconds(scenario.get("cancellation_p50_us")),
+                requests=_format_rate(scenario.get("requests_per_sec")),
+                tokens=_format_rate(scenario.get("output_tokens_per_sec")),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "Parity in model-dominated chat workloads validates NNRP compatibility with the selected vLLM binding. "
+            "It is not the adapter's primary performance or adoption claim. Operational-control and heavy-payload "
+            "experiments must be evaluated separately with their own raw evidence.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConfig) -> dict[str, Any]:
@@ -770,6 +841,42 @@ def _mean_confidence_interval(samples: list[float]) -> dict[str, float | int] | 
         "lower_us": max(0.0, mean - margin),
         "upper_us": mean + margin,
     }
+
+
+def _comparison_scenario_sort_key(scenario: object) -> tuple[int, int, str]:
+    if not isinstance(scenario, Mapping):
+        raise ValueError("comparison scenarios must be objects")
+    return (
+        _required_int(scenario, "prompt_tokens"),
+        _required_int(scenario, "concurrency"),
+        _required_str(scenario, "path"),
+    )
+
+
+def _required_int(value: Mapping[str, Any], key: str) -> int:
+    item = value.get(key)
+    if not isinstance(item, int) or isinstance(item, bool):
+        raise ValueError(f"comparison scenario {key} must be an integer")
+    return item
+
+
+def _required_str(value: Mapping[str, Any], key: str) -> str:
+    item = value.get(key)
+    if not isinstance(item, str) or not item:
+        raise ValueError(f"comparison scenario {key} must be a non-empty string")
+    return item
+
+
+def _format_milliseconds(value: object) -> str:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return "n/a"
+    return f"{value / 1_000:.2f} ms"
+
+
+def _format_rate(value: object) -> str:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return "n/a"
+    return f"{value:.2f}"
 
 
 def _elapsed_us(started_ns: int, finished_ns: int) -> float:

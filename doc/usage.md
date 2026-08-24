@@ -274,6 +274,7 @@ Run the release-readiness comparison matrix with the engine-direct NNRP path and
 vllm-nnrp-adapter run-benchmark \
   --comparison \
   --output artifacts/openai-nnrp-comparison.json \
+  --markdown-output artifacts/openai-nnrp-comparison.md \
   --backend module.path:make_backend \
   --model example-model \
   --prompt-tokens 4096,8192,16384,20480 \
@@ -282,7 +283,11 @@ vllm-nnrp-adapter run-benchmark \
   --http-url http://127.0.0.1:8000/v1/chat/completions
 ```
 
-The comparison report records TTFT, TPOT, RTT, output-token throughput, request throughput, error rate, and sampled error families for each prompt-size/concurrency pair. The NNRP path uses the in-process engine-direct adapter path; the HTTP path consumes OpenAI-compatible SSE chunks from the configured endpoint.
+The JSON report retains the workload manifest, raw samples, confidence intervals, TTFT, TPOT, RTT, cancellation latency,
+output-token throughput, request throughput, and error rate for each prompt-size/concurrency pair. `--markdown-output`
+generates the combined comparison table from that same report so published numbers cannot drift from the raw evidence. The
+NNRP path uses the in-process engine-direct adapter path; the HTTP path consumes OpenAI-compatible SSE chunks from the
+configured endpoint. Model-dominated chat parity is compatibility evidence, not the adapter's primary performance claim.
 
 The first recorded release-readiness baseline is
 [openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).

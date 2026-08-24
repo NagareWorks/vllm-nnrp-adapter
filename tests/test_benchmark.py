@@ -18,6 +18,7 @@ from vllm_nnrp_adapter.benchmark import (
     _run_http_sse_request_sync,
     _successful_sample,
     estimate_token_count,
+    render_comparison_markdown,
     run_benchmark,
     run_comparison_benchmark_file,
     run_comparison_benchmark_file_with_backend_spec,
@@ -173,6 +174,7 @@ async def test_comparison_benchmark_can_include_http_sse(monkeypatch: pytest.Mon
 
 def test_cli_writes_comparison_benchmark_report_file(tmp_path: Path) -> None:
     output = tmp_path / "comparison.json"
+    markdown_output = tmp_path / "comparison.md"
 
     exit_code = main(
         [
@@ -180,6 +182,8 @@ def test_cli_writes_comparison_benchmark_report_file(tmp_path: Path) -> None:
             "--comparison",
             "--output",
             str(output),
+            "--markdown-output",
+            str(markdown_output),
             "--backend",
             "mock",
             "--iterations",
@@ -199,6 +203,23 @@ def test_cli_writes_comparison_benchmark_report_file(tmp_path: Path) -> None:
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["benchmark_kind"] == "in_process_comparison"
     assert [scenario["prompt_tokens"] for scenario in report["scenarios"]] == [4, 8]
+    markdown = markdown_output.read_text(encoding="utf-8")
+    assert "Raw evidence: `comparison.json`" in markdown
+    assert "| 4 | 1 | `nnrp.direct_profile_events` | 1 / 0 |" in markdown
+    assert "not the adapter's primary performance or adoption claim" in markdown
+
+
+def test_cli_rejects_markdown_output_without_comparison(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        main(
+            [
+                "run-benchmark",
+                "--output",
+                str(tmp_path / "benchmark.json"),
+                "--markdown-output",
+                str(tmp_path / "benchmark.md"),
+            ]
+        )
 
 
 @pytest.mark.asyncio
@@ -212,6 +233,21 @@ async def test_comparison_benchmark_file_writes_report(tmp_path: Path) -> None:
     )
 
     assert json.loads(output.read_text(encoding="utf-8")) == report
+
+
+def test_comparison_markdown_rejects_incomplete_reports() -> None:
+    with pytest.raises(ValueError, match="in_process_comparison"):
+        render_comparison_markdown({}, raw_report_name="raw.json")
+    with pytest.raises(ValueError, match="must contain scenarios"):
+        render_comparison_markdown(
+            {"benchmark_kind": "in_process_comparison", "scenarios": []},
+            raw_report_name="raw.json",
+        )
+    with pytest.raises(ValueError, match="prompt_tokens"):
+        render_comparison_markdown(
+            {"benchmark_kind": "in_process_comparison", "scenarios": [{"path": "nnrp"}]},
+            raw_report_name="raw.json",
+        )
 
 
 @pytest.mark.asyncio
