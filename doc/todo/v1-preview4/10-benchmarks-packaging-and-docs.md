@@ -18,7 +18,7 @@
 - [ ] Record TTFT, TPOT, RTT, request throughput, output-token throughput, cancellation latency,
   adapter CPU, allocated bytes, error rate, and late-result count.
 - [ ] Run the release matrix on vLLM `0.18.1`, `0.22.1`, and `0.26.0`.
-- [ ] Keep raw evidence and one combined comparison table under `doc/benchmarks` without host IPs,
+- [x] Keep raw evidence and one combined comparison table under `doc/benchmarks` without host IPs,
   usernames, tokens, or machine ids.
 - [x] Randomize or interleave compared runs, report sample counts and confidence intervals, and keep
   the benchmark input manifest beside each result.

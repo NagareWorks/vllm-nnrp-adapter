@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import statistics
 import time
 import urllib.error
@@ -106,6 +107,7 @@ async def run_benchmark_file(
     config: BenchmarkConfig,
 ) -> dict[str, Any]:
     report = await run_benchmark(backend=backend, config=config)
+    validate_benchmark_evidence(report)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
     return report
@@ -119,6 +121,7 @@ async def run_comparison_benchmark_file(
     markdown_output_path: Path | None = None,
 ) -> dict[str, Any]:
     report = await run_in_process_comparison_benchmark(backend=backend, config=config)
+    validate_benchmark_evidence(report)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(f"{json.dumps(report, indent=2, sort_keys=True)}\n", encoding="utf-8")
     if markdown_output_path is not None:
@@ -131,6 +134,8 @@ async def run_comparison_benchmark_file(
 
 
 def render_comparison_markdown(report: Mapping[str, Any], *, raw_report_name: str) -> str:
+    validate_benchmark_evidence(report)
+    _validate_benchmark_evidence_text(raw_report_name, location="raw_report_name")
     if report.get("benchmark_kind") != "in_process_comparison":
         raise ValueError("comparison markdown requires an in_process_comparison report")
     scenarios = report.get("scenarios")
@@ -176,6 +181,43 @@ def render_comparison_markdown(report: Mapping[str, Any], *, raw_report_name: st
         ]
     )
     return "\n".join(lines)
+
+
+_SENSITIVE_EVIDENCE_PATTERNS = (
+    ("endpoint URL", re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)),
+    ("IPv4 address", re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")),
+    ("Windows user path", re.compile(r"\b[a-z]:\\Users\\[^\\\s]+", re.IGNORECASE)),
+    ("Unix user path", re.compile(r"/(?:home|Users)/[^/\s]+")),
+    ("Bearer token", re.compile(r"\bBearer\s+\S+", re.IGNORECASE)),
+    ("API token", re.compile(r"\b(?:sk|ghp|npm)_[A-Za-z0-9_-]{8,}")),
+    (
+        "machine or request UUID",
+        re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.IGNORECASE),
+    ),
+)
+
+
+def validate_benchmark_evidence(value: object) -> None:
+    _validate_benchmark_evidence_value(value, location="report")
+
+
+def _validate_benchmark_evidence_value(value: object, *, location: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_benchmark_evidence_value(item, location=f"{location}.{key}")
+        return
+    if isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _validate_benchmark_evidence_value(item, location=f"{location}[{index}]")
+        return
+    if isinstance(value, str):
+        _validate_benchmark_evidence_text(value, location=location)
+
+
+def _validate_benchmark_evidence_text(value: str, *, location: str) -> None:
+    for label, pattern in _SENSITIVE_EVIDENCE_PATTERNS:
+        if pattern.search(value):
+            raise ValueError(f"benchmark evidence contains {label} at {location}")
 
 
 async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConfig) -> dict[str, Any]:

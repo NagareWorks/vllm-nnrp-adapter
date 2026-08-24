@@ -20,10 +20,12 @@ from vllm_nnrp_adapter.benchmark import (
     estimate_token_count,
     render_comparison_markdown,
     run_benchmark,
+    run_benchmark_file,
     run_comparison_benchmark_file,
     run_comparison_benchmark_file_with_backend_spec,
     run_in_process_comparison_benchmark,
     synthetic_prompt,
+    validate_benchmark_evidence,
 )
 from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.conformance import MockChatCompletionBackend
@@ -252,6 +254,57 @@ def test_comparison_markdown_rejects_incomplete_reports() -> None:
             {"benchmark_kind": "in_process_comparison", "scenarios": [{"path": "nnrp"}]},
             raw_report_name="raw.json",
         )
+
+
+@pytest.mark.parametrize(
+    "sensitive_value",
+    [
+        "http://benchmark.internal/v1/chat/completions",
+        "10.0.0.12",
+        r"C:\Users\operator\models\fixture",
+        "/home/operator/models/fixture",
+        "Bearer secret-value",
+        "sk_benchmarkSecret",
+        "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    ],
+)
+def test_benchmark_evidence_rejects_environment_identifiers(sensitive_value: str) -> None:
+    with pytest.raises(ValueError, match="benchmark evidence contains"):
+        validate_benchmark_evidence({"nested": [{"value": sensitive_value}]})
+
+
+def test_committed_benchmark_evidence_is_public_safe() -> None:
+    benchmark_directory = Path(__file__).resolve().parents[1] / "doc" / "benchmarks"
+    evidence_paths = sorted(path for path in benchmark_directory.rglob("*") if path.is_file())
+
+    assert evidence_paths
+    for path in evidence_paths:
+        text = path.read_text(encoding="utf-8")
+        if path.suffix == ".json":
+            validate_benchmark_evidence(json.loads(text))
+        else:
+            validate_benchmark_evidence({"document": text})
+
+
+@pytest.mark.asyncio
+async def test_benchmark_file_refuses_sensitive_metadata_before_writing(tmp_path: Path) -> None:
+    class SensitiveMetadataBackend(MockChatCompletionBackend):
+        def benchmark_metadata(self) -> dict[str, object]:
+            return {
+                "vllm_version": "0.26.0",
+                "compatibility_binding": "current",
+                "engine_configuration": {"model_path": r"C:\Users\operator\model"},
+            }
+
+    output = tmp_path / "benchmark.json"
+    with pytest.raises(ValueError, match="Windows user path"):
+        await run_benchmark_file(
+            output,
+            backend=SensitiveMetadataBackend(),
+            config=BenchmarkConfig(iterations=1, warmup=0),
+        )
+
+    assert not output.exists()
 
 
 @pytest.mark.asyncio

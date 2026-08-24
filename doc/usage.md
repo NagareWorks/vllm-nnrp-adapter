@@ -292,6 +292,8 @@ output-token throughput, request throughput, and error rate for each prompt-size
 generates the combined comparison table from that same report so published numbers cannot drift from the raw evidence. The
 NNRP path uses the in-process engine-direct adapter path; the HTTP path consumes OpenAI-compatible SSE chunks from the
 configured endpoint. Model-dominated chat parity is compatibility evidence, not the adapter's primary performance claim.
+Evidence writing rejects endpoint URLs, IP addresses, user-directory paths, bearer/API tokens, and UUID-style machine or
+request identifiers. Use public-safe model aliases and environment labels in reports intended for publication.
 
 The first recorded release-readiness baseline is
 [openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).
