@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter
-from .profile import OPENAI_COMPATIBLE_SCHEMA_VERSION
+from .profile import OPENAI_COMPATIBLE_SCHEMA_VERSION, build_cancelled_event
 
 Terminal = Literal["success", "error", "cancelled"]
 Outcome = Literal["passed", "failed", "skipped"]
@@ -154,7 +154,18 @@ async def _run_case(
     case: Mapping[str, Any],
 ) -> dict[str, Any]:
     request = _case_request(schema_version, case)
-    events = [event async for event in adapter.handle_request(request)]
+    cancel_after_events = _case_cancel_after_events(case)
+    events: list[dict[str, Any]] = []
+    stream = adapter.handle_request(request)
+    try:
+        async for event in stream:
+            events.append(event)
+            if cancel_after_events is not None and len(events) >= cancel_after_events:
+                await stream.aclose()
+                events.append(build_cancelled_event("caller_cancelled"))
+                break
+    finally:
+        await stream.aclose()
     terminal = _terminal_from_events(events)
     expect = _as_mapping(case.get("expect"), "expect")
     expected_terminal = _as_str(expect.get("terminal"), "expect.terminal")
@@ -185,8 +196,22 @@ def _case_request(schema_version: str, case: Mapping[str, Any]) -> dict[str, Any
     }
     nnrp = request.get("nnrp")
     if isinstance(nnrp, Mapping):
-        envelope["nnrp"] = dict(nnrp)
+        policy = {name: nnrp[name] for name in ("timeout_ms", "diagnostics") if name in nnrp}
+        if policy:
+            envelope["nnrp"] = policy
     return envelope
+
+
+def _case_cancel_after_events(case: Mapping[str, Any]) -> int | None:
+    # Cancellation timing belongs to the suite execution plan, not the profile request envelope.
+    request = _as_mapping(case.get("request"), "case.request")
+    nnrp = request.get("nnrp")
+    if not isinstance(nnrp, Mapping) or "cancel_after_events" not in nnrp:
+        return None
+    value = nnrp["cancel_after_events"]
+    if type(value) is not int or value <= 0:
+        raise TypeError("case.request.nnrp.cancel_after_events must be a positive integer")
+    return value
 
 
 def _terminal_from_events(events: list[dict[str, Any]]) -> Terminal:

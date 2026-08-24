@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Any, Protocol, cast, runtime_checkable
@@ -12,7 +12,6 @@ from .profile import (
     VLLM_DIAGNOSTICS_EXTENSION,
     OpenAiNnrpCapabilityDocument,
     OpenAiNnrpError,
-    build_cancelled_event,
     build_completed_event,
     build_diagnostics_event,
     build_error_event,
@@ -95,9 +94,13 @@ class OpenAiNnrpAdapter:
             result = await result
         return result is True
 
-    async def handle_request(self, request: Mapping[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        async for event in self._handle_native_request(request):
-            yield event
+    async def handle_request(self, request: Mapping[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
+        stream = self._handle_native_request(request)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()
 
     async def _handle_native_request(
         self,
@@ -106,7 +109,7 @@ class OpenAiNnrpAdapter:
         backend_abort_observer: Callable[[bool | None], None] | None = None,
         backend_trace_headers_factory: Callable[[], Mapping[str, str] | None] | None = None,
         backend_priority_factory: Callable[[], int | None] | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         try:
             envelope = validate_request(request, self.capabilities)
             if envelope["operation"] != CHAT_COMPLETIONS_CREATE:
@@ -167,19 +170,12 @@ class OpenAiNnrpAdapter:
                 result = await _await_with_timeout(result, timeout_s)
 
             if _is_async_iterator(result):
-                emitted_events = 0
-                cancel_after_events = _cancel_after_events(envelope.get("nnrp"))
                 chunks = cast(AsyncIterator[Mapping[str, Any]], result)
                 close_guard = _AsyncIteratorCloseGuard(chunks, observer=backend_abort_observer)
                 try:
                     async for event in self._map_streaming_chunks(chunks, timeout_s=timeout_s):
                         yield event
-                        emitted_events += 1
-                        if cancel_after_events is not None and emitted_events >= cancel_after_events:
-                            await close_guard.close()
-                            yield build_cancelled_event()
-                            return
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, GeneratorExit):
                     await close_guard.close()
                     raise
                 except TimeoutError as error:
@@ -525,16 +521,6 @@ def _as_mapping(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
     return {"value": value}
-
-
-def _cancel_after_events(policy: object) -> int | None:
-    if not isinstance(policy, Mapping):
-        return None
-
-    value = policy.get("cancel_after_events")
-    if isinstance(value, int) and value >= 0:
-        return value
-    return None
 
 
 def _diagnostics_enabled(

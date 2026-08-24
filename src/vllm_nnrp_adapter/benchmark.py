@@ -269,8 +269,8 @@ async def _measure_cancellation_latency(
     adapter: OpenAiNnrpAdapter,
     config: BenchmarkConfig,
 ) -> dict[str, Any]:
-    request = _chat_request(config.model, stream=True, nnrp={"cancel_after_events": 1})
-    samples = await _measure_request_samples(adapter, request, config)
+    request = _chat_request(config.model, stream=True)
+    samples = await _measure_request_samples(adapter, request, config, cancel_after_events=1)
     return _latency_scenario("chat.streaming.cancellation_latency", samples, event_count=len(samples))
 
 
@@ -278,13 +278,23 @@ async def _measure_request_samples(
     adapter: OpenAiNnrpAdapter,
     request: Mapping[str, Any],
     config: BenchmarkConfig,
+    *,
+    cancel_after_events: int | None = None,
 ) -> list[float]:
     await _warmup(adapter, request, config.warmup)
     samples: list[float] = []
     for _ in range(config.iterations):
         started = time.perf_counter_ns()
-        async for _event in adapter.handle_request(request):
-            pass
+        stream = adapter.handle_request(request)
+        try:
+            emitted_events = 0
+            async for _event in stream:
+                emitted_events += 1
+                if cancel_after_events is not None and emitted_events >= cancel_after_events:
+                    await stream.aclose()
+                    break
+        finally:
+            await stream.aclose()
         samples.append(_elapsed_us(started, time.perf_counter_ns()))
     return samples
 
@@ -401,20 +411,23 @@ async def _run_nnrp_direct_request(
     last_token_ns: int | None = None
     output_tokens = 0
     try:
-        async for event in adapter.handle_request(
-            _long_context_chat_request(config, prompt, cancel_after_first_event=cancel_after_first_event)
-        ):
-            event_type = event.get("type")
-            if event_type == "response.output_text.delta":
-                now = time.perf_counter_ns()
-                if first_token_ns is None:
-                    first_token_ns = now
-                last_token_ns = now
-                output_tokens += max(1, estimate_token_count(str(event.get("delta", ""))))
-            elif event_type == "response.error":
-                return _failed_sample(started, event.get("error"))
-            elif event_type == "response.cancelled":
-                return _successful_sample(started, first_token_ns, last_token_ns, output_tokens)
+        stream = adapter.handle_request(_long_context_chat_request(config, prompt))
+        try:
+            async for event in stream:
+                event_type = event.get("type")
+                if event_type == "response.output_text.delta":
+                    now = time.perf_counter_ns()
+                    if first_token_ns is None:
+                        first_token_ns = now
+                    last_token_ns = now
+                    output_tokens += max(1, estimate_token_count(str(event.get("delta", ""))))
+                    if cancel_after_first_event:
+                        await stream.aclose()
+                        break
+                elif event_type == "response.error":
+                    return _failed_sample(started, event.get("error"))
+        finally:
+            await stream.aclose()
         return _successful_sample(started, first_token_ns, last_token_ns, output_tokens)
     except Exception as error:
         return _failed_sample(started, f"{type(error).__name__}: {error}")
@@ -470,17 +483,12 @@ def _run_http_sse_request_sync(config: BenchmarkConfig, prompt: str, cancel_afte
 def _long_context_chat_request(
     config: BenchmarkConfig,
     prompt: str,
-    *,
-    cancel_after_first_event: bool = False,
 ) -> dict[str, Any]:
-    request: dict[str, Any] = {
+    return {
         "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
         "operation": CHAT_COMPLETIONS_CREATE,
         "body": _openai_chat_body(config, prompt),
     }
-    if cancel_after_first_event:
-        request["nnrp"] = {"cancel_after_events": 1}
-    return request
 
 
 def _openai_chat_body(config: BenchmarkConfig, prompt: str) -> dict[str, Any]:

@@ -428,52 +428,48 @@ async def test_adapter_maps_streaming_chat_chunks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_maps_streaming_cancellation_policy() -> None:
+async def test_direct_caller_can_close_stream_without_profile_cancellation_policy() -> None:
     adapter = OpenAiNnrpAdapter(StreamingBackend())
 
-    events = [
-        event
-        async for event in adapter.handle_request(
-            {
-                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
-                "operation": CHAT_COMPLETIONS_CREATE,
-                "body": {
-                    "model": "llama",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "stream": True,
-                },
-                "nnrp": {"cancel_after_events": 1},
-            }
-        )
-    ]
+    stream = adapter.handle_request(
+        {
+            "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+            "operation": CHAT_COMPLETIONS_CREATE,
+            "body": {
+                "model": "llama",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        }
+    )
+    event = await anext(stream)
+    await stream.aclose()
 
-    assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
+    assert event["type"] == "response.output_text.delta"
 
 
 @pytest.mark.asyncio
-async def test_adapter_closes_stream_when_cancellation_policy_fires() -> None:
+async def test_adapter_closes_backend_stream_when_direct_caller_closes_iterator() -> None:
     backend = ClosableStreamingBackend()
     adapter = OpenAiNnrpAdapter(backend)
 
-    events = [
-        event
-        async for event in adapter.handle_request(
-            {
-                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
-                "operation": CHAT_COMPLETIONS_CREATE,
-                "body": {
-                    "model": "llama",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "stream": True,
-                },
-                "nnrp": {"cancel_after_events": 1},
-            }
-        )
-    ]
+    stream = adapter.handle_request(
+        {
+            "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+            "operation": CHAT_COMPLETIONS_CREATE,
+            "body": {
+                "model": "llama",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        }
+    )
+    event = await anext(stream)
+    await stream.aclose()
 
     assert backend.closed is True
     assert backend.close_calls == 1
-    assert events[-1]["type"] == "response.cancelled"
+    assert event["type"] == "response.output_text.delta"
 
 
 @pytest.mark.asyncio
@@ -606,8 +602,6 @@ async def test_adapter_preserves_openai_body_without_leaking_nnrp_policy() -> No
                 "nnrp": {
                     "timeout_ms": 30_000,
                     "diagnostics": False,
-                    "cache": {"mode": "explicit"},
-                    "transport": {"preference": "ipc"},
                 },
             }
         )
@@ -1138,24 +1132,22 @@ async def test_vllm_backend_engine_direct_cancel_aborts_request_in_each_family(
     adapter = OpenAiNnrpAdapter(backend)
 
     abort_observations: list[bool | None] = []
-    events = [
-        event
-        async for event in adapter._handle_native_request(
-            {
-                "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
-                "operation": CHAT_COMPLETIONS_CREATE,
-                "nnrp": {"cancel_after_events": 1},
-                "body": {
-                    "model": "llama",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "stream": True,
-                },
+    stream = adapter._handle_native_request(
+        {
+            "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+            "operation": CHAT_COMPLETIONS_CREATE,
+            "body": {
+                "model": "llama",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
             },
-            backend_abort_observer=abort_observations.append,
-        )
-    ]
+        },
+        backend_abort_observer=abort_observations.append,
+    )
+    event = await anext(stream)
+    await stream.aclose()
 
-    assert [event["type"] for event in events] == ["response.output_text.delta", "response.cancelled"]
+    assert event["type"] == "response.output_text.delta"
     assert serving_chat.engine_client.aborted == ["chatcmpl-test"]
     assert abort_observations == [True]
 

@@ -2,9 +2,9 @@
 
 ## Typed Payload Boundary
 
-- [ ] Keep the `openai-compatible/1` envelope and profile events JSON because that encoding is part
+- [x] Keep the `openai-compatible/1` envelope and profile events JSON because that encoding is part
   of the frozen profile.
-- [ ] Carry runtime control, object, cache, and diagnostics metadata through typed Preview4 frames,
+- [x] Carry runtime control, object, cache, and diagnostics metadata through typed Preview4 frames,
   never through ad hoc JSON fields inside the OpenAI body.
 - [ ] Decode structured-event submit payloads with bounded size and depth checks.
 - [ ] Preserve opaque, image, audio, video, document, tool-result, and tensor object references

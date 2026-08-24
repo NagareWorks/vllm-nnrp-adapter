@@ -286,9 +286,9 @@ def test_http_sse_sync_reports_missing_url_and_json_errors(monkeypatch: pytest.M
 
 def test_benchmark_helpers_build_expected_shapes() -> None:
     config = BenchmarkConfig(model="model", max_completion_tokens=7)
-    request = _long_context_chat_request(config, "hello", cancel_after_first_event=True)
+    request = _long_context_chat_request(config, "hello")
 
-    assert request["nnrp"] == {"cancel_after_events": 1}
+    assert "nnrp" not in request
     assert request["body"]["max_tokens"] == 7
     assert _openai_chunk_text_deltas({"choices": [{"delta": {"content": "x"}}, {"delta": {}}]}) == ["x"]
     assert _openai_chunk_text_deltas({"choices": "bad"}) == []

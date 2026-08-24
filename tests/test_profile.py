@@ -171,8 +171,6 @@ def test_validate_rejects_invalid_optional_envelope_fields(
         ({"timeout_ms": -1}, "timeout_ms"),
         ({"timeout_ms": True}, "timeout_ms"),
         ({"diagnostics": "yes"}, "diagnostics"),
-        ({"cancel_after_events": -1}, "cancel_after_events"),
-        ({"cancel_after_events": False}, "cancel_after_events"),
     ),
 )
 def test_validate_rejects_invalid_known_nnrp_policy_values(
@@ -190,6 +188,32 @@ def test_validate_rejects_invalid_known_nnrp_policy_values(
         validate_request(envelope, OpenAiNnrpCapabilityDocument.level1())
 
     assert error.value.code == "invalid_nnrp_policy"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_code"),
+    (
+        ("runtime_control", {"type": "cancel"}, "invalid_request_envelope"),
+        ("nnrp", {"cancel_after_events": 1}, "invalid_nnrp_policy"),
+        ("nnrp", {"cache_reference": "cache-1"}, "invalid_nnrp_policy"),
+    ),
+)
+def test_validate_rejects_control_or_cache_metadata_in_profile_envelope(
+    field: str,
+    value: object,
+    expected_code: str,
+) -> None:
+    envelope = {
+        "schema_version": OPENAI_COMPATIBLE_SCHEMA_VERSION,
+        "operation": CHAT_COMPLETIONS_CREATE,
+        "body": {"model": "llama", "messages": [{"role": "user", "content": "hello"}]},
+        field: value,
+    }
+
+    with pytest.raises(OpenAiNnrpError) as error:
+        validate_request(envelope, OpenAiNnrpCapabilityDocument.level1())
+
+    assert error.value.code == expected_code
 
 
 @pytest.mark.parametrize("operation", ("responses.create", "models.list", "embeddings.create"))

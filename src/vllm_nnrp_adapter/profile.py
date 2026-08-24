@@ -24,7 +24,6 @@ class OpenAiNnrpError(Exception):
 class OpenAiNnrpPolicy(TypedDict, total=False):
     timeout_ms: int
     diagnostics: bool
-    cancel_after_events: int
 
 
 class OpenAiNnrpRequest(TypedDict):
@@ -37,6 +36,10 @@ class OpenAiNnrpRequest(TypedDict):
 
 class ProfileEvent(TypedDict):
     type: str
+
+
+_REQUEST_FIELDS = frozenset({"schema_version", "operation", "body", "request_id", "nnrp"})
+_NNRP_POLICY_FIELDS = frozenset({"timeout_ms", "diagnostics"})
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,15 @@ class OpenAiNnrpCapabilityDocument:
 
 
 def validate_request(request: Mapping[str, Any], capabilities: OpenAiNnrpCapabilityDocument) -> OpenAiNnrpRequest:
+    unknown_fields = set(request).difference(_REQUEST_FIELDS)
+    if unknown_fields:
+        joined = ", ".join(sorted(str(field) for field in unknown_fields))
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "invalid_request_envelope",
+            f"Unknown OpenAI NNRP request field(s): {joined}.",
+        )
+
     schema_version = request.get("schema_version")
     if schema_version != OPENAI_COMPATIBLE_SCHEMA_VERSION:
         raise OpenAiNnrpError(
@@ -152,6 +164,15 @@ def _validate_chat_body(body: Mapping[str, Any]) -> None:
 
 
 def _validate_nnrp_policy(policy: Mapping[str, Any]) -> None:
+    unknown_fields = set(policy).difference(_NNRP_POLICY_FIELDS)
+    if unknown_fields:
+        joined = ", ".join(sorted(str(field) for field in unknown_fields))
+        raise OpenAiNnrpError(
+            "invalid_request_error",
+            "invalid_nnrp_policy",
+            f"Unknown nnrp policy field(s): {joined}.",
+        )
+
     timeout_ms = policy.get("timeout_ms")
     if "timeout_ms" in policy and (type(timeout_ms) is not int or timeout_ms < 0):
         raise OpenAiNnrpError(
@@ -167,17 +188,6 @@ def _validate_nnrp_policy(policy: Mapping[str, Any]) -> None:
             "invalid_nnrp_policy",
             "nnrp.diagnostics must be a boolean when provided.",
         )
-
-    cancel_after_events = policy.get("cancel_after_events")
-    if "cancel_after_events" in policy and (
-        type(cancel_after_events) is not int or cancel_after_events < 0
-    ):
-        raise OpenAiNnrpError(
-            "invalid_request_error",
-            "invalid_nnrp_policy",
-            "nnrp.cancel_after_events must be a non-negative integer when provided.",
-        )
-
 
 def build_text_delta_event(
     delta: str,

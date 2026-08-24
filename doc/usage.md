@@ -257,10 +257,13 @@ evidence and should not be used to justify the optimized runtime path.
   },
   "nnrp": {
     "timeout_ms": 30000,
-    "diagnostics": true,
-    "cancel_after_events": 1
+    "diagnostics": true
   }
 }
 ```
 
-`timeout_ms` bounds backend await and stream-next latency. `diagnostics` emits a `response.diagnostics` event. `cancel_after_events` is used by conformance and local testing to model caller-driven cancellation.
+`timeout_ms` bounds backend await and stream-next latency. `diagnostics` emits a
+`response.diagnostics` event. Cancellation is not an envelope policy: native callers send the
+frozen `CANCEL` or `ABORT` control frame, while direct Python callers cancel or close their async
+iterator. Runtime control, object, and cache metadata stays in typed NNRP frames rather than JSON
+request fields.
