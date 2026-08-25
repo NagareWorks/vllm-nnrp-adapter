@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
@@ -182,6 +183,7 @@ def _run_policy_case(
                 ["validate-wire-results", "--plan", str(plan), "--results", str(results)],
                 environment,
             )
+            _validate_wire_result_completeness(plan, results)
         finally:
             _stop_target(target)
     _validate_observation_evidence(
@@ -441,6 +443,60 @@ def _validate_observation_evidence(
             for field in ("cancellation_kind", "cancellation_source", "drop_reason")
         ):
             raise RuntimeError("wire completion observation was reclassified by a late control event")
+
+
+def _validate_wire_result_completeness(plan_path: Path, results_path: Path) -> None:
+    plan = _load_json_object(plan_path)
+    report = _load_json_object(results_path)
+    planned_ids = _scenario_ids(plan.get("scenarios"), field="plan.scenarios")
+    results = report.get("results")
+    if not isinstance(results, list) or not results:
+        raise TypeError("results.results must be a non-empty JSON array")
+
+    result_ids: set[str] = set()
+    for index, result in enumerate(results):
+        if not isinstance(result, Mapping):
+            raise TypeError(f"results.results[{index}] must be a JSON object")
+        scenario_id = result.get("id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise TypeError(f"results.results[{index}].id must be a non-empty string")
+        if scenario_id in result_ids:
+            raise RuntimeError(f"wire results contain duplicate scenario id: {scenario_id}")
+        result_ids.add(scenario_id)
+        outcome = result.get("outcome")
+        if outcome != "passed":
+            raise RuntimeError(f"wire scenario did not pass: {scenario_id} ({outcome})")
+
+    missing = planned_ids.difference(result_ids)
+    unexpected = result_ids.difference(planned_ids)
+    if missing or unexpected:
+        raise RuntimeError(
+            "wire result coverage does not match the selected plan: "
+            f"missing={sorted(missing)!r}, unexpected={sorted(unexpected)!r}"
+        )
+
+
+def _scenario_ids(value: object, *, field: str) -> set[str]:
+    if not isinstance(value, list) or not value:
+        raise TypeError(f"{field} must be a non-empty JSON array")
+    scenario_ids: set[str] = set()
+    for index, scenario in enumerate(value):
+        if not isinstance(scenario, Mapping):
+            raise TypeError(f"{field}[{index}] must be a JSON object")
+        scenario_id = scenario.get("id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise TypeError(f"{field}[{index}].id must be a non-empty string")
+        if scenario_id in scenario_ids:
+            raise RuntimeError(f"wire plan contains duplicate scenario id: {scenario_id}")
+        scenario_ids.add(scenario_id)
+    return scenario_ids
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+    return value
 
 
 def _normalized_operation_outcome(record: dict[str, object]) -> object:

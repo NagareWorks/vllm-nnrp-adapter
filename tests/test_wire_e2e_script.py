@@ -16,9 +16,86 @@ from scripts.run_wire_e2e import (
     _read_websocket_rejection,
     _validate_observation_evidence,
     _validate_websocket_upgrade,
+    _validate_wire_result_completeness,
     _websocket_endpoint,
     _write_self_signed_certificate,
 )
+
+
+def test_wire_result_gate_requires_one_passing_result_per_selected_scenario(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.json"
+    results = tmp_path / "results.json"
+    _write_wire_documents(
+        plan,
+        results,
+        scenario_ids=("wire.one", "wire.two"),
+        result_entries=(
+            {"id": "wire.one", "outcome": "passed"},
+            {"id": "wire.two", "outcome": "passed"},
+        ),
+    )
+
+    _validate_wire_result_completeness(plan, results)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "skipped", None])
+def test_wire_result_gate_rejects_every_non_passing_outcome(tmp_path: Path, outcome: object) -> None:
+    plan = tmp_path / "plan.json"
+    results = tmp_path / "results.json"
+    _write_wire_documents(
+        plan,
+        results,
+        scenario_ids=("wire.mandatory",),
+        result_entries=({"id": "wire.mandatory", "outcome": outcome},),
+    )
+
+    with pytest.raises(RuntimeError, match=r"wire scenario did not pass: wire\.mandatory"):
+        _validate_wire_result_completeness(plan, results)
+
+
+@pytest.mark.parametrize(
+    ("scenario_ids", "result_entries", "message"),
+    (
+        (
+            ("wire.one", "wire.two"),
+            ({"id": "wire.one", "outcome": "passed"},),
+            "missing=\\['wire.two'\\]",
+        ),
+        (
+            ("wire.one",),
+            (
+                {"id": "wire.one", "outcome": "passed"},
+                {"id": "wire.extra", "outcome": "passed"},
+            ),
+            "unexpected=\\['wire.extra'\\]",
+        ),
+        (
+            ("wire.one",),
+            (
+                {"id": "wire.one", "outcome": "passed"},
+                {"id": "wire.one", "outcome": "passed"},
+            ),
+            "duplicate scenario id",
+        ),
+    ),
+)
+def test_wire_result_gate_rejects_missing_unexpected_and_duplicate_results(
+    tmp_path: Path,
+    scenario_ids: tuple[str, ...],
+    result_entries: tuple[dict[str, object], ...],
+    message: str,
+) -> None:
+    plan = tmp_path / "plan.json"
+    results = tmp_path / "results.json"
+    _write_wire_documents(
+        plan,
+        results,
+        scenario_ids=scenario_ids,
+        result_entries=result_entries,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _validate_wire_result_completeness(plan, results)
 
 
 def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_path: Path) -> None:
@@ -281,3 +358,17 @@ def _operation(
             }
         )
     return record
+
+
+def _write_wire_documents(
+    plan: Path,
+    results: Path,
+    *,
+    scenario_ids: tuple[str, ...],
+    result_entries: tuple[dict[str, object], ...],
+) -> None:
+    plan.write_text(
+        json.dumps({"scenarios": [{"id": scenario_id} for scenario_id in scenario_ids]}),
+        encoding="utf-8",
+    )
+    results.write_text(json.dumps({"results": list(result_entries)}), encoding="utf-8")
