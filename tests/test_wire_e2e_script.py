@@ -56,6 +56,26 @@ def test_wire_observation_gate_rejects_cancel_without_an_in_flight_partial(tmp_p
         _validate_observation_evidence(evidence)
 
 
+def test_wire_observation_gate_rejects_cancel_without_backend_abort_acceptance(tmp_path: Path) -> None:
+    evidence = tmp_path / "observations.jsonl"
+    rejected_cancel = _operation(101, "tcp", "cancelled", cancelled=True)
+    rejected_cancel["backend_abort_accepted"] = False
+    records = [
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
+        _operation(901, "tcp", "completed"),
+        _operation(901, "quic", "completed"),
+        _operation(901, "ipc", "completed"),
+        _operation(901, "websocket", "completed"),
+        rejected_cancel,
+        _operation(151, "tcp", "completed"),
+        _operation(101, "ipc", "cancelled", cancelled=True),
+    ]
+    evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="backend abort"):
+        _validate_observation_evidence(evidence)
+
+
 def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metadata(tmp_path: Path) -> None:
     evidence = tmp_path / "observations.jsonl"
     completed_with_disconnect = _operation(901, "tcp", "completed")
@@ -257,6 +277,7 @@ def _operation(
                 "cancellation_kind": "cancel",
                 "cancellation_source": "client",
                 "drop_reason": "peer_cancelled",
+                "backend_abort_accepted": True,
             }
         )
     return record

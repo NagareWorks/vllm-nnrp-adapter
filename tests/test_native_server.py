@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -108,6 +109,8 @@ from vllm_nnrp_adapter.runtime_control import (
     RuntimeControlRequest,
     RuntimePriorityUpdate,
 )
+from vllm_nnrp_adapter.vllm_backend import VllmBackend
+from vllm_nnrp_adapter.vllm_compat import VLLM_COMPATIBILITY_BINDINGS
 
 LOCAL_IPC_ENDPOINT = "npipe://nnrp-vllm" if os.name == "nt" else "unix:///tmp/nnrp-vllm.sock"
 LOCAL_IPC_SCHEME = "npipe" if os.name == "nt" else "unix"
@@ -2981,6 +2984,162 @@ async def test_native_control_stops_backend_and_emits_one_terminal_outcome(
     assert observation["cancellation_reason_code"] == 3
     assert observation["backend_abort_accepted"] is True
     assert observation["drop_reason"] == "peer_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_native_cancel_aborts_vllm_engine_with_derived_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    binding = VLLM_COMPATIBILITY_BINDINGS[0].engine_direct
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.entrypoints.utils",
+        SimpleNamespace(
+            get_max_tokens=lambda _max_model_len, requested, _prompt_len, _defaults, _override: requested
+        ),
+    )
+
+    class DirectRequest:
+        stream = True
+        use_beam_search = False
+        tools = None
+        priority = 0
+        max_tokens = 16
+        max_completion_tokens = None
+        truncate_prompt_tokens = None
+        include_reasoning = True
+
+        def __init__(self, body: Mapping[str, Any]) -> None:
+            self.request_id = body["request_id"]
+
+        def to_sampling_params(
+            self,
+            max_tokens: int,
+            default_sampling_params: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            return {"max_tokens": max_tokens, **default_sampling_params}
+
+    class DirectRequestFactory:
+        engine_direct_binding = binding
+
+        def __call__(self, body: Mapping[str, Any]) -> DirectRequest:
+            return DirectRequest(body)
+
+    class RecordingEngineClient:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.aborted: list[str] = []
+            self._release = asyncio.Event()
+
+        def generate(
+            self,
+            _engine_prompt: object,
+            _sampling_params: object,
+            _request_id: str,
+            **_kwargs: object,
+        ) -> AsyncIterator[object]:
+            async def outputs() -> AsyncIterator[object]:
+                self.started.set()
+                yield SimpleNamespace(
+                    prompt_token_ids=[1, 2, 3],
+                    encoder_prompt_token_ids=None,
+                    outputs=[
+                        SimpleNamespace(
+                            index=0,
+                            text="first",
+                            token_ids=[10],
+                            finish_reason=None,
+                            stop_reason=None,
+                        )
+                    ],
+                    finished=False,
+                )
+                await self._release.wait()
+
+            return outputs()
+
+        async def abort(self, request_id: str) -> None:
+            self.aborted.append(request_id)
+
+    class DirectServingChat:
+        model_config = SimpleNamespace(max_model_len=1_024)
+        default_sampling_params = {"temperature": 0.2}
+        override_max_tokens = None
+        reasoning_parser_cls = None
+        tool_parser = None
+        use_harmony = False
+        renderer = SimpleNamespace(tokenizer=object())
+        models = SimpleNamespace(model_name=lambda _adapter: "mock-model")
+
+        def __init__(self) -> None:
+            self.engine_client = RecordingEngineClient()
+
+        async def render_chat_request(
+            self,
+            _request: DirectRequest,
+        ) -> tuple[list[dict[str, str]], list[dict[str, list[int]]]]:
+            return ([{"role": "user", "content": "hello"}], [{"prompt_token_ids": [1, 2, 3]}])
+
+        def _extract_prompt_components(self, _engine_prompt: object) -> object:
+            return object()
+
+        def _extract_prompt_len(self, engine_prompt: Mapping[str, list[int]]) -> int:
+            return len(engine_prompt["prompt_token_ids"])
+
+        def create_chat_completion(self, _request: object) -> Mapping[str, Any]:
+            raise AssertionError("streaming request must use the engine-direct path")
+
+    stop_event = asyncio.Event()
+    serving_chat = DirectServingChat()
+    backend = VllmBackend(serving_chat, request_factory=DirectRequestFactory())
+    operation = FakeOperation(
+        operation_id=101,
+        frame_id=201,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=101),
+        terminal_results=[],
+    )
+    operation.on_terminal = stop_event.set
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(
+                runtime=_control_event(MessageType.CANCEL, operation_id=101, sequence=1),
+                wait_for_backend=True,
+            ),
+        ],
+        operation=operation,
+        backend_started=serving_chat.engine_client.started,
+        stop_event=stop_event,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.accepted_operations == 1
+    assert statistics.terminal_results == 1
+    assert serving_chat.engine_client.aborted == ["chatcmpl-nnrp-101-201"]
+    assert operation.terminal_results == []
+    assert operation.result_drops[0][0].drop_reason_code is ResultDropReasonCode.PEER_CANCELLED
+    observation = _observation_records(caplog)[0]
+    assert observation["backend_abort_accepted"] is True
+    assert observation["terminal_outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio

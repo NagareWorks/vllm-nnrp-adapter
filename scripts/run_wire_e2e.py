@@ -415,8 +415,12 @@ def _validate_observation_evidence(
                 record.get("cancellation_kind") != "cancel"
                 or record.get("cancellation_source") != "client"
                 or record.get("drop_reason") != "peer_cancelled"
+                or "backend_abort_accepted" not in record
+                or record.get("backend_abort_accepted") is False
             ):
-                raise RuntimeError("wire cancellation observation did not preserve control and drop evidence")
+                raise RuntimeError(
+                    "wire cancellation observation did not preserve control, backend abort status, and drop evidence"
+                )
             if not isinstance(record.get("output_event_count"), int) or record["output_event_count"] < 1:
                 raise RuntimeError("wire cancellation observation did not preserve its in-flight partial result")
         elif terminal_outcome == "dropped":

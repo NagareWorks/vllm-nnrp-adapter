@@ -30,5 +30,5 @@
 - [x] Run normal CI without importing vLLM or requiring a GPU.
 - [ ] Run lower-bound `0.18.1`, transition `0.22.1`, and current `0.26.0` GPU smoke against the same
   Level 1 request/event assertions.
-- [ ] Exercise cancellation through a real NNRP control frame and verify the vLLM engine abort id.
+- [x] Exercise cancellation through a real NNRP control frame and verify the vLLM engine abort id.
 - [ ] Make every release gate fail on skipped mandatory behavior; mock-only passes are insufficient.
