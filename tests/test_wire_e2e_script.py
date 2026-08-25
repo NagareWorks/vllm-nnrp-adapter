@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from collections import Counter
 from pathlib import Path
 
@@ -9,7 +10,14 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import DNSName, IPAddress
 
-from scripts.run_wire_e2e import _validate_observation_evidence, _write_self_signed_certificate
+from scripts.run_wire_e2e import (
+    _masked_websocket_text_frame,
+    _read_websocket_rejection,
+    _validate_observation_evidence,
+    _validate_websocket_upgrade,
+    _websocket_endpoint,
+    _write_self_signed_certificate,
+)
 
 
 def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_path: Path) -> None:
@@ -136,6 +144,51 @@ def test_wire_certificate_is_self_signed_for_local_quic_endpoint(tmp_path: Path)
     assert subject_alt_name.get_values_for_type(DNSName) == ["localhost"]
     assert [str(value) for value in subject_alt_name.get_values_for_type(IPAddress)] == ["127.0.0.1"]
     assert private_key.key_size == 2048
+
+
+def test_websocket_text_probe_uses_a_masked_text_frame() -> None:
+    payload = b"not-nnrp"
+
+    frame = _masked_websocket_text_frame(payload)
+
+    assert frame[0] == 0x81
+    assert frame[1] == 0x80 | len(payload)
+    mask = frame[2:6]
+    assert bytes(value ^ mask[index % 4] for index, value in enumerate(frame[6:])) == payload
+
+
+def test_websocket_upgrade_and_manifest_endpoint_validation(tmp_path: Path) -> None:
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    response = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+    )
+    manifest = tmp_path / "target.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "wire_conformance": {
+                    "transports": [{"name": "websocket", "endpoint": "ws://127.0.0.1:7768/nnrp"}]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _validate_websocket_upgrade(response, key)
+
+    assert _websocket_endpoint(manifest) == "ws://127.0.0.1:7768/nnrp"
+    with pytest.raises(RuntimeError, match="invalid Sec-WebSocket-Accept"):
+        _validate_websocket_upgrade(response.replace(b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", b"invalid"), key)
+
+
+def test_websocket_text_probe_requires_a_close_outcome() -> None:
+    with socket.socket() as connection:
+        assert _read_websocket_rejection(connection, b"\x88\x00") == "close-frame"
+        with pytest.raises(RuntimeError, match="opcode 2"):
+            _read_websocket_rejection(connection, b"\x82\x00")
 
 
 def test_wire_observation_gate_accepts_force_tcp_provider_evidence(tmp_path: Path) -> None:

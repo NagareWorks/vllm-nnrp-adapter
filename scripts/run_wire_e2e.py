@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import ipaddress
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -118,6 +122,12 @@ def _run_policy_case(
         )
         try:
             _wait_for_ready(target, target_manifest)
+            if "websocket" in providers:
+                rejection = _assert_websocket_text_rejected(_websocket_endpoint(target_manifest))
+                (artifacts / "websocket-text-rejection.json").write_text(
+                    json.dumps(rejection, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
             _run_runner(
                 conformance_root,
                 [
@@ -157,6 +167,97 @@ def _run_policy_case(
         expected_policy=transport_policy,
         expected_providers=frozenset(providers),
     )
+
+
+def _websocket_endpoint(target_manifest: Path) -> str:
+    target = json.loads(target_manifest.read_text(encoding="utf-8"))
+    transports = target.get("wire_conformance", {}).get("transports", [])
+    endpoints = [item.get("endpoint") for item in transports if item.get("name") == "websocket"]
+    if len(endpoints) != 1 or not isinstance(endpoints[0], str):
+        raise RuntimeError("wire target manifest does not contain exactly one WebSocket endpoint")
+    return endpoints[0]
+
+
+def _assert_websocket_text_rejected(endpoint: str) -> dict[str, object]:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme != "ws" or parsed.hostname is None or parsed.port is None:
+        raise RuntimeError("text-frame E2E requires a plain ws:// loopback endpoint")
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    host_header = parsed.hostname if parsed.port == 80 else f"{parsed.hostname}:{parsed.port}"
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
+        connection.settimeout(5)
+        connection.sendall(request)
+        response, remainder = _read_http_upgrade_response(connection)
+        _validate_websocket_upgrade(response, key)
+        connection.sendall(_masked_websocket_text_frame(b"not-nnrp"))
+        rejection = _read_websocket_rejection(connection, remainder)
+    return {"endpoint": endpoint, "handshake_status": 101, "rejection": rejection}
+
+
+def _read_http_upgrade_response(connection: socket.socket) -> tuple[bytes, bytes]:
+    response = bytearray()
+    while b"\r\n\r\n" not in response:
+        chunk = connection.recv(4_096)
+        if not chunk:
+            raise RuntimeError("WebSocket carrier closed before completing the HTTP upgrade")
+        response.extend(chunk)
+        if len(response) > 65_536:
+            raise RuntimeError("WebSocket HTTP upgrade response exceeded 64 KiB")
+    header, remainder = bytes(response).split(b"\r\n\r\n", 1)
+    return header, remainder
+
+
+def _validate_websocket_upgrade(response: bytes, key: str) -> None:
+    lines = response.decode("ascii").split("\r\n")
+    if not lines or not lines[0].startswith("HTTP/1.1 101 "):
+        raise RuntimeError(f"WebSocket carrier rejected the HTTP upgrade: {lines[0] if lines else ''}")
+    headers = {
+        name.strip().lower(): value.strip()
+        for line in lines[1:]
+        if ":" in line
+        for name, value in (line.split(":", 1),)
+    }
+    expected_accept = base64.b64encode(
+        hashlib.sha1(f"{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11".encode("ascii")).digest()
+    ).decode("ascii")
+    if headers.get("sec-websocket-accept") != expected_accept:
+        raise RuntimeError("WebSocket carrier returned an invalid Sec-WebSocket-Accept value")
+
+
+def _masked_websocket_text_frame(payload: bytes) -> bytes:
+    if len(payload) >= 126:
+        raise ValueError("text-frame E2E payload must use the compact WebSocket length encoding")
+    mask = os.urandom(4)
+    masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+    return bytes((0x81, 0x80 | len(payload))) + mask + masked
+
+
+def _read_websocket_rejection(connection: socket.socket, remainder: bytes) -> str:
+    data = remainder
+    try:
+        while not data:
+            chunk = connection.recv(4_096)
+            if not chunk:
+                return "connection-closed"
+            data += chunk
+    except (ConnectionResetError, ConnectionAbortedError):
+        return "connection-reset"
+    except TimeoutError as error:
+        raise RuntimeError("WebSocket carrier left a text-frame connection open") from error
+    if data[0] & 0x0F != 0x08:
+        raise RuntimeError(f"WebSocket carrier replied to a text frame with opcode {data[0] & 0x0F}")
+    return "close-frame"
 
 
 def _wait_for_ready(target: subprocess.Popen[str], target_manifest: Path) -> None:
