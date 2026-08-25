@@ -6,7 +6,7 @@
   of the frozen profile.
 - [x] Carry runtime control, object, cache, and diagnostics metadata through typed Preview4 frames,
   never through ad hoc JSON fields inside the OpenAI body.
-- [ ] Decode structured-event submit payloads with bounded size and depth checks.
+- [x] Decode structured-event submit payloads with bounded size and depth checks.
 - [ ] Preserve opaque, image, audio, video, document, tool-result, and tensor object references
   without base64-expanding them into the request envelope.
 - [ ] Reject a request that references an unavailable, expired, or incompatible object before vLLM

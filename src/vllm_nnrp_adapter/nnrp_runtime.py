@@ -92,6 +92,8 @@ _CAPABILITY_FLAG_HARD_REQUIREMENT = 0x0000_0001
 _CAPABILITY_FLAG_DOWNGRADE_ALLOWED = 0x0000_0002
 _OPENAI_COMPATIBLE_PROFILE_ID = 0
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
+_MAX_STRUCTURED_EVENT_BYTES = 32 * 1024 * 1024
+_MAX_STRUCTURED_EVENT_DEPTH = 64
 _T = TypeVar("_T")
 
 
@@ -1292,13 +1294,50 @@ def _decode_request(metadata: object, body: bytes) -> dict[str, Any]:
         or int(frame.stream_semantics) != int(StreamSemantics.SNAPSHOT)
     ):
         raise ValueError("OpenAI profile submit descriptor does not match the frozen wire mapping")
-    try:
-        value = json.loads(frame.payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("native FRAME_SUBMIT body must contain a UTF-8 OpenAI profile request") from error
+    value = _decode_structured_event(frame.payload)
     if not isinstance(value, dict):
         raise ValueError("native FRAME_SUBMIT body must contain an OpenAI profile request object")
     return value
+
+
+def _decode_structured_event(
+    payload: bytes,
+    *,
+    max_bytes: int = _MAX_STRUCTURED_EVENT_BYTES,
+    max_depth: int = _MAX_STRUCTURED_EVENT_DEPTH,
+) -> object:
+    if max_bytes <= 0 or max_depth <= 0:
+        raise ValueError("structured-event decoder limits must be positive")
+    if len(payload) > max_bytes:
+        raise ValueError(f"structured-event payload exceeds the {max_bytes}-byte adapter limit")
+    _validate_json_depth(payload, max_depth=max_depth)
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("native FRAME_SUBMIT body must contain a UTF-8 OpenAI profile request") from error
+
+
+def _validate_json_depth(payload: bytes, *, max_depth: int) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in payload:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in {0x5B, 0x7B}:
+            depth += 1
+            if depth > max_depth:
+                raise ValueError(f"structured-event payload exceeds the {max_depth}-level nesting limit")
+        elif byte in {0x5D, 0x7D}:
+            depth -= 1
 
 
 def _encode_event(event: Mapping[str, Any]) -> bytes:

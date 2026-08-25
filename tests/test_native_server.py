@@ -86,6 +86,8 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _AdmissionWindowReporter,
     _apply_trace_context,
     _BackendTraceContextSlot,
+    _decode_request,
+    _decode_structured_event,
     _finalize_cancelled_operation,
     _native_handle_identity,
     _NativeCallExecutor,
@@ -109,6 +111,42 @@ from vllm_nnrp_adapter.runtime_control import (
 
 LOCAL_IPC_ENDPOINT = "npipe://nnrp-vllm" if os.name == "nt" else "unix:///tmp/nnrp-vllm.sock"
 LOCAL_IPC_SCHEME = "npipe" if os.name == "nt" else "unix"
+
+
+def test_structured_event_decoder_enforces_byte_and_depth_limits_before_json_decode() -> None:
+    assert _decode_structured_event(b'{"body":{"messages":[]}}', max_bytes=64, max_depth=3) == {
+        "body": {"messages": []}
+    }
+    assert _decode_structured_event(b'{"text":"[{\\\"nested\\\":true}]"}', max_depth=1)["text"] == (
+        '[{"nested":true}]'
+    )
+
+    with pytest.raises(ValueError, match="8-byte adapter limit"):
+        _decode_structured_event(b'{"body":{}}', max_bytes=8)
+    with pytest.raises(ValueError, match="2-level nesting limit"):
+        _decode_structured_event(b'{"body":{"messages":[]}}', max_depth=2)
+    with pytest.raises(ValueError, match="limits must be positive"):
+        _decode_structured_event(b"{}", max_depth=0)
+
+
+def test_structured_event_decoder_normalizes_invalid_utf8_json_and_extreme_nesting() -> None:
+    with pytest.raises(ValueError, match="UTF-8 OpenAI profile request"):
+        _decode_structured_event(b"\xff")
+    with pytest.raises(ValueError, match="UTF-8 OpenAI profile request"):
+        _decode_structured_event(b'{"body":]')
+    with pytest.raises(ValueError, match="64-level nesting limit"):
+        _decode_structured_event(b"[" * 65 + b"]" * 65)
+
+
+def test_native_submit_decode_applies_structured_event_depth_limit() -> None:
+    nested: object = "leaf"
+    for _ in range(65):
+        nested = [nested]
+    request = _chat_request()
+    request["body"]["metadata"] = nested
+
+    with pytest.raises(ValueError, match="64-level nesting limit"):
+        _decode_request(_submit_metadata(operation_id=1), _typed_profile_body(request))
 
 
 class StreamingBackend:
