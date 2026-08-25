@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from scripts.run_wire_e2e import _validate_observation_evidence, _write_self_sig
 def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_path: Path) -> None:
     evidence = tmp_path / "observations.jsonl"
     records = [
-        {"record_type": "server_startup"},
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
         _operation(901, "tcp", "completed"),
         _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
@@ -31,7 +32,7 @@ def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_
 def test_wire_observation_gate_rejects_cancel_without_an_in_flight_partial(tmp_path: Path) -> None:
     evidence = tmp_path / "observations.jsonl"
     records = [
-        {"record_type": "server_startup"},
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
         _operation(901, "tcp", "completed"),
         _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
@@ -57,7 +58,7 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
         }
     )
     records = [
-        {"record_type": "server_startup"},
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
         completed_with_disconnect,
         _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
@@ -72,6 +73,58 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
         _validate_observation_evidence(evidence)
 
 
+def test_wire_observation_gate_accepts_verified_terminal_delivery_disconnect_race(tmp_path: Path) -> None:
+    evidence = tmp_path / "observations.jsonl"
+    websocket_delivery = _operation(901, "websocket", "dropped")
+    websocket_delivery.update(
+        {
+            "cancellation_kind": "peer_disconnect",
+            "cancellation_source": "client",
+            "drop_reason": None,
+            "stage_transitions": [{"stage_name": "executing"}, {"stage_name": "completed"}],
+        }
+    )
+    records = [
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
+        _operation(901, "tcp", "completed"),
+        _operation(901, "quic", "completed"),
+        _operation(901, "ipc", "completed"),
+        websocket_delivery,
+        _operation(101, "tcp", "cancelled", cancelled=True),
+        _operation(151, "tcp", "completed"),
+        _operation(101, "ipc", "cancelled", cancelled=True),
+    ]
+    evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    _validate_observation_evidence(evidence)
+
+
+def test_wire_observation_gate_rejects_disconnect_race_without_completed_stage(tmp_path: Path) -> None:
+    evidence = tmp_path / "observations.jsonl"
+    websocket_delivery = _operation(901, "websocket", "dropped")
+    websocket_delivery.update(
+        {
+            "cancellation_kind": "peer_disconnect",
+            "cancellation_source": "client",
+            "drop_reason": None,
+        }
+    )
+    records = [
+        _startup("auto", "tcp", "quic", "ipc", "websocket"),
+        _operation(901, "tcp", "completed"),
+        _operation(901, "quic", "completed"),
+        _operation(901, "ipc", "completed"),
+        websocket_delivery,
+        _operation(101, "tcp", "cancelled", cancelled=True),
+        _operation(151, "tcp", "completed"),
+        _operation(101, "ipc", "cancelled", cancelled=True),
+    ]
+    evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="completed-stage disconnect evidence"):
+        _validate_observation_evidence(evidence)
+
+
 def test_wire_certificate_is_self_signed_for_local_quic_endpoint(tmp_path: Path) -> None:
     certificate_path, private_key_path = _write_self_signed_certificate(tmp_path / "certs")
 
@@ -83,6 +136,39 @@ def test_wire_certificate_is_self_signed_for_local_quic_endpoint(tmp_path: Path)
     assert subject_alt_name.get_values_for_type(DNSName) == ["localhost"]
     assert [str(value) for value in subject_alt_name.get_values_for_type(IPAddress)] == ["127.0.0.1"]
     assert private_key.key_size == 2048
+
+
+def test_wire_observation_gate_accepts_force_tcp_provider_evidence(tmp_path: Path) -> None:
+    evidence = tmp_path / "observations.jsonl"
+    records = [
+        _startup("force_tcp", "tcp"),
+        _operation(901, "tcp", "completed"),
+        _operation(101, "tcp", "cancelled", cancelled=True),
+        _operation(151, "tcp", "completed"),
+    ]
+    evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    _validate_observation_evidence(
+        evidence,
+        expected_operations=Counter(
+            {
+                (901, "tcp", "completed"): 1,
+                (101, "tcp", "cancelled"): 1,
+                (151, "tcp", "completed"): 1,
+            }
+        ),
+        expected_policy="force_tcp",
+        expected_providers=frozenset({"tcp"}),
+    )
+
+
+def _startup(policy: str, *providers: str) -> dict[str, object]:
+    return {
+        "record_type": "server_startup",
+        "transport_policy": policy,
+        "eligible_providers": list(providers),
+        "bound_provider_endpoints": {provider: f"{provider}://bound" for provider in providers},
+    }
 
 
 def _operation(

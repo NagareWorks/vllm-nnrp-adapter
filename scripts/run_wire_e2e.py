@@ -16,6 +16,26 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+_ALL_PROVIDERS = ("tcp", "quic", "ipc", "websocket")
+_ALL_OPERATIONS = Counter(
+    {
+        (901, "tcp", "completed"): 1,
+        (901, "quic", "completed"): 1,
+        (901, "ipc", "completed"): 1,
+        (901, "websocket", "completed"): 1,
+        (101, "tcp", "cancelled"): 1,
+        (151, "tcp", "completed"): 1,
+        (101, "ipc", "cancelled"): 1,
+    }
+)
+_FORCE_TCP_OPERATIONS = Counter(
+    {
+        (901, "tcp", "completed"): 1,
+        (101, "tcp", "cancelled"): 1,
+        (151, "tcp", "completed"): 1,
+    }
+)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the adapter against the independent NNRP wire suite.")
@@ -25,6 +45,38 @@ def main() -> int:
 
     conformance_root = args.conformance_root.resolve()
     artifacts = args.artifact_directory.resolve()
+    _run_policy_case(
+        conformance_root,
+        artifacts,
+        transport_policy="auto",
+        providers=_ALL_PROVIDERS,
+        expected_operations=_ALL_OPERATIONS,
+    )
+    _run_policy_case(
+        conformance_root,
+        artifacts / "policies" / "prefer-quic",
+        transport_policy="prefer_quic",
+        providers=_ALL_PROVIDERS,
+        expected_operations=_ALL_OPERATIONS,
+    )
+    _run_policy_case(
+        conformance_root,
+        artifacts / "policies" / "force-tcp",
+        transport_policy="force_tcp",
+        providers=("tcp",),
+        expected_operations=_FORCE_TCP_OPERATIONS,
+    )
+    return 0
+
+
+def _run_policy_case(
+    conformance_root: Path,
+    artifacts: Path,
+    *,
+    transport_policy: str,
+    providers: tuple[str, ...],
+    expected_operations: Counter[tuple[int, str, str]],
+) -> None:
     artifacts.mkdir(parents=True, exist_ok=True)
     target_manifest = artifacts / "target.json"
     plan = artifacts / "plan.json"
@@ -51,7 +103,11 @@ def main() -> int:
         str(certificate_path),
         "--wire-private-key",
         str(private_key_path),
+        "--transport-policy",
+        transport_policy,
     ]
+    for provider in providers:
+        target_command.extend(("--provider", provider))
     with target_log.open("w", encoding="utf-8") as log:
         target = subprocess.Popen(
             target_command,
@@ -95,8 +151,12 @@ def main() -> int:
             )
         finally:
             _stop_target(target)
-    _validate_observation_evidence(observation_evidence)
-    return 0
+    _validate_observation_evidence(
+        observation_evidence,
+        expected_operations=expected_operations,
+        expected_policy=transport_policy,
+        expected_providers=frozenset(providers),
+    )
 
 
 def _wait_for_ready(target: subprocess.Popen[str], target_manifest: Path) -> None:
@@ -140,27 +200,34 @@ def _stop_target(target: subprocess.Popen[str]) -> None:
         target.wait(timeout=10)
 
 
-def _validate_observation_evidence(path: Path) -> None:
+def _validate_observation_evidence(
+    path: Path,
+    *,
+    expected_operations: Counter[tuple[int, str, str]] = _ALL_OPERATIONS,
+    expected_policy: str = "auto",
+    expected_providers: frozenset[str] = frozenset(_ALL_PROVIDERS),
+) -> None:
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
     startup_records = [record for record in records if record.get("record_type") == "server_startup"]
     operation_records = [record for record in records if record.get("record_type") == "operation"]
     if len(startup_records) != 1:
         raise RuntimeError(f"wire target emitted {len(startup_records)} startup observation records")
-    if len(operation_records) != 7:
+    if len(operation_records) != sum(expected_operations.values()):
         raise RuntimeError(f"wire target emitted {len(operation_records)} operation observation records")
-    expected_operations = Counter(
-        {
-            (901, "tcp", "completed"): 1,
-            (901, "quic", "completed"): 1,
-            (901, "ipc", "completed"): 1,
-            (901, "websocket", "completed"): 1,
-            (101, "tcp", "cancelled"): 1,
-            (151, "tcp", "completed"): 1,
-            (101, "ipc", "cancelled"): 1,
-        }
-    )
+    startup = startup_records[0]
+    if startup.get("transport_policy") != expected_policy:
+        raise RuntimeError("wire target startup observation carries the wrong transport policy")
+    if set(startup.get("eligible_providers", ())) != expected_providers:
+        raise RuntimeError("wire target startup observation carries the wrong eligible provider set")
+    bound_providers = startup.get("bound_provider_endpoints")
+    if not isinstance(bound_providers, dict) or set(bound_providers) != expected_providers:
+        raise RuntimeError("wire target startup observation carries the wrong bound provider set")
     observed_operations = Counter(
-        (record.get("operation_id"), record.get("selected_transport"), record.get("terminal_outcome"))
+        (
+            record.get("operation_id"),
+            record.get("selected_transport"),
+            _normalized_operation_outcome(record),
+        )
         for record in operation_records
     )
     if observed_operations != expected_operations:
@@ -173,7 +240,8 @@ def _validate_observation_evidence(path: Path) -> None:
             raise RuntimeError("wire observation did not preserve operation identity")
         if not isinstance(record.get("stage_transitions"), list) or not record["stage_transitions"]:
             raise RuntimeError("wire observation did not preserve the PROGRESS stage timeline")
-        if record.get("terminal_outcome") == "cancelled":
+        terminal_outcome = record.get("terminal_outcome")
+        if terminal_outcome == "cancelled":
             if (
                 record.get("cancellation_kind") != "cancel"
                 or record.get("cancellation_source") != "client"
@@ -182,11 +250,35 @@ def _validate_observation_evidence(path: Path) -> None:
                 raise RuntimeError("wire cancellation observation did not preserve control and drop evidence")
             if not isinstance(record.get("output_event_count"), int) or record["output_event_count"] < 1:
                 raise RuntimeError("wire cancellation observation did not preserve its in-flight partial result")
+        elif terminal_outcome == "dropped":
+            if (
+                record.get("operation_id") != 901
+                or record.get("cancellation_kind") != "peer_disconnect"
+                or record.get("cancellation_source") != "client"
+                or record.get("drop_reason") is not None
+                or not any(
+                    transition.get("stage_name") == "completed"
+                    for transition in record["stage_transitions"]
+                    if isinstance(transition, dict)
+                )
+            ):
+                raise RuntimeError("wire terminal-delivery race lacks completed-stage disconnect evidence")
         elif any(
             record.get(field) is not None
             for field in ("cancellation_kind", "cancellation_source", "drop_reason")
         ):
             raise RuntimeError("wire completion observation was reclassified by a late control event")
+
+
+def _normalized_operation_outcome(record: dict[str, object]) -> object:
+    if (
+        record.get("operation_id") == 901
+        and record.get("terminal_outcome") == "dropped"
+        and record.get("cancellation_kind") == "peer_disconnect"
+        and record.get("cancellation_source") == "client"
+    ):
+        return "completed"
+    return record.get("terminal_outcome")
 
 
 def _write_self_signed_certificate(directory: Path) -> tuple[Path, Path]:

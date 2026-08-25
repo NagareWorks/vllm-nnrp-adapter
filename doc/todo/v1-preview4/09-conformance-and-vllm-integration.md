@@ -19,9 +19,9 @@
   deltas, and cache references.
 - [x] Assert that streaming profile events use ordered `PARTIAL_RESULT` frames and that exactly one
   terminal `RESULT_PUSH` or typed drop/error outcome closes each operation.
-- [ ] Run installed-provider scenarios for TCP, QUIC, IPC, and WebSocket.
+- [x] Run installed-provider scenarios for TCP, QUIC, IPC, and WebSocket.
 - [ ] Validate missing, reordered, duplicate, unexpected, late-after-terminal, and malformed frames.
-- [ ] Require protocol-visible carrier evidence rather than adapter self-report.
+- [x] Require protocol-visible carrier evidence rather than adapter self-report.
 
 ## CI And GPU Integration
 

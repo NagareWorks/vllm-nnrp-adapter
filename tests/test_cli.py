@@ -229,6 +229,7 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
     ) -> None:
         assert adapter._backend is backend
         assert config.endpoint == "nnrp://wire-target.local/vllm"
+        assert config.transport_policy is TransportPolicy.AUTO
         assert config.provider_routes["tcp"].provider_endpoint == "tcp://127.0.0.1:0"
         assert config.provider_routes["quic"].provider_endpoint == "quic://127.0.0.1:0"
         assert config.provider_routes["quic"].security is not None
@@ -318,3 +319,28 @@ def test_wire_evidence_sink_writes_machine_readable_records(tmp_path: Path) -> N
 def test_wire_target_endpoint_requires_every_bound_provider() -> None:
     with pytest.raises(RuntimeError, match="bound websocket endpoint"):
         cli._wire_target_endpoint({}, "websocket", attribute="uri")
+
+
+def test_wire_target_provider_selection_is_canonical_and_rejects_invalid_sets(tmp_path: Path) -> None:
+    routes = cli._wire_target_provider_routes(
+        tmp_path / "target.json",
+        certificate_der=b"certificate",
+        private_key_pkcs8_der=b"private-key",
+        provider_names=("websocket", "tcp"),
+    )
+
+    assert tuple(routes) == ("tcp", "websocket")
+    with pytest.raises(ValueError, match="at least one provider"):
+        cli._wire_target_provider_routes(
+            tmp_path / "target.json",
+            certificate_der=b"certificate",
+            private_key_pkcs8_der=b"private-key",
+            provider_names=(),
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        cli._wire_target_provider_routes(
+            tmp_path / "target.json",
+            certificate_der=b"certificate",
+            private_key_pkcs8_der=b"private-key",
+            provider_names=("tcp", "tcp"),
+        )

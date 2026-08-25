@@ -28,6 +28,6 @@
 - [x] Require QUIC and WSS security material according to the frozen endpoint contract.
 - [ ] Reject WebSocket text messages; accept only NNRP binary runtime frames.
 - [x] Test single-provider TCP, QUIC, IPC, and WebSocket startup and active-session exchange.
-- [ ] Test multi-provider auto, prefer, and force binding policy with real provider evidence.
+- [x] Test multi-provider auto, prefer, and force binding policy with real provider evidence.
 - [ ] Test missing artifacts, incompatible platform routes, listener rollback, handshake rejection,
   and active-provider diagnostics.

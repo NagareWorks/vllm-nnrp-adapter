@@ -29,6 +29,7 @@ from .observability import (
 )
 
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
+_WIRE_PROVIDER_ORDER = ("tcp", "quic", "ipc", "websocket")
 _TRANSPORT_POLICIES = {policy.name.lower(): policy for policy in TransportPolicy}
 
 
@@ -139,6 +140,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     wire_target.add_argument("--observation-output", type=Path)
     wire_target.add_argument("--wire-certificate", type=Path, required=True)
     wire_target.add_argument("--wire-private-key", type=Path, required=True)
+    wire_target.add_argument(
+        "--provider",
+        action="append",
+        choices=_WIRE_PROVIDER_ORDER,
+        dest="providers",
+        help="Limit the internal conformance target to a provider. Repeat to select multiple providers.",
+    )
+    wire_target.add_argument(
+        "--transport-policy",
+        choices=sorted(_TRANSPORT_POLICIES),
+        default="auto",
+    )
     wire_target.add_argument("--backend", default="mock")
     wire_target.add_argument("--suite-version", default="0.1.0")
 
@@ -202,6 +215,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     observation_output=args.observation_output,
                     certificate_der=args.wire_certificate.read_bytes(),
                     private_key_pkcs8_der=args.wire_private_key.read_bytes(),
+                    provider_names=tuple(args.providers or _WIRE_PROVIDER_ORDER),
+                    transport_policy=_TRANSPORT_POLICIES[args.transport_policy],
                 )
             )
         except KeyboardInterrupt:
@@ -267,6 +282,8 @@ async def _serve_wire_target(
     observation_output: Path | None = None,
     certificate_der: bytes,
     private_key_pkcs8_der: bytes,
+    provider_names: Sequence[str] = _WIRE_PROVIDER_ORDER,
+    transport_policy: TransportPolicy = TransportPolicy.AUTO,
 ) -> None:
     backend = await load_backend_async(backend_spec)
     if isinstance(backend, MockChatCompletionBackend):
@@ -275,6 +292,7 @@ async def _serve_wire_target(
         ready_output,
         certificate_der=certificate_der,
         private_key_pkcs8_der=private_key_pkcs8_der,
+        provider_names=provider_names,
     )
     observation_sinks: tuple[ObservationSink, ...] = (StructuredLogObservationSink(),)
     if observation_output is not None:
@@ -283,6 +301,7 @@ async def _serve_wire_target(
         endpoint="nnrp://wire-target.local/vllm",
         provider_routes=provider_routes,
         transports=tuple(load_native_transport_binding(name) for name in provider_routes),
+        transport_policy=transport_policy,
         accept_timeout_ms=1_000,
         max_active_sessions=1,
         max_operations_per_session=1,
@@ -292,10 +311,6 @@ async def _serve_wire_target(
     ready = asyncio.get_running_loop().create_future()
 
     def publish_ready(bound_endpoints: Mapping[str, object]) -> None:
-        tcp = _wire_target_endpoint(bound_endpoints, "tcp", attribute="address")
-        quic = _wire_target_endpoint(bound_endpoints, "quic", attribute="address")
-        ipc = _wire_target_endpoint(bound_endpoints, "ipc", attribute="uri")
-        websocket = _wire_target_endpoint(bound_endpoints, "websocket", attribute="uri")
         document = {
             "$schema": "https://github.com/NagareWorks/nnrp-conformance/schemas/wire-conformance-target.schema.json",
             "target_name": "vllm-nnrp-adapter",
@@ -304,20 +319,7 @@ async def _serve_wire_target(
             "wire_conformance": {
                 "modes": ["suite_as_client"],
                 "transports": [
-                    {"name": "tcp", "endpoint": tcp, "tls": False},
-                    {
-                        "name": "quic",
-                        "endpoint": quic,
-                        "tls": True,
-                        "security": {
-                            "server_name": "localhost",
-                            "trusted_certificate_der_path": "certs/server.der",
-                            "certificate_der_path": "certs/server.der",
-                            "private_key_pkcs8_der_path": "certs/server-key.der",
-                        },
-                    },
-                    {"name": "ipc", "endpoint": ipc, "tls": False},
-                    {"name": "websocket", "endpoint": websocket, "tls": False},
+                    _wire_target_manifest_transport(bound_endpoints, name) for name in provider_routes
                 ],
                 "host_route_providers": [],
                 "capabilities": [
@@ -383,13 +385,14 @@ def _wire_target_provider_routes(
     *,
     certificate_der: bytes,
     private_key_pkcs8_der: bytes,
+    provider_names: Sequence[str] = _WIRE_PROVIDER_ORDER,
 ) -> Mapping[str, NativeServerProviderRoute]:
     if os.name == "nt":
         ipc_endpoint = f"npipe://nnrp-vllm-wire-{os.getpid()}"
     else:
         socket_path = (ready_output.parent.resolve() / "nnrp-vllm-wire.sock").as_posix()
         ipc_endpoint = f"unix://{socket_path}"
-    return {
+    routes = {
         "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
         "quic": NativeServerProviderRoute(
             provider_endpoint="quic://127.0.0.1:0",
@@ -400,6 +403,32 @@ def _wire_target_provider_routes(
         ),
         "ipc": NativeServerProviderRoute(provider_endpoint=ipc_endpoint),
         "websocket": NativeServerProviderRoute(provider_endpoint="ws://127.0.0.1:0/nnrp"),
+    }
+    selected = tuple(provider_names)
+    if not selected:
+        raise ValueError("wire target requires at least one provider")
+    if len(set(selected)) != len(selected):
+        raise ValueError("wire target providers must be unique")
+    if unknown := set(selected).difference(_PROVIDER_NAMES):
+        raise ValueError(f"wire target contains unsupported providers: {sorted(unknown)!r}")
+    return {name: routes[name] for name in _WIRE_PROVIDER_ORDER if name in selected}
+
+
+def _wire_target_manifest_transport(bound_endpoints: Mapping[str, object], name: str) -> dict[str, object]:
+    attribute = "address" if name in {"tcp", "quic"} else "uri"
+    endpoint = _wire_target_endpoint(bound_endpoints, name, attribute=attribute)
+    if name != "quic":
+        return {"name": name, "endpoint": endpoint, "tls": False}
+    return {
+        "name": "quic",
+        "endpoint": endpoint,
+        "tls": True,
+        "security": {
+            "server_name": "localhost",
+            "trusted_certificate_der_path": "certs/server.der",
+            "certificate_der_path": "certs/server.der",
+            "private_key_pkcs8_der_path": "certs/server-key.der",
+        },
     }
 
 
