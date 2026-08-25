@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
+import tempfile
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -358,6 +360,7 @@ async def _serve_wire_target(
         if not serve_task.done():
             serve_task.cancel()
             await asyncio.gather(serve_task, return_exceptions=True)
+        _remove_wire_target_ipc_socket(provider_routes)
 
 
 class _WireEvidenceSink:
@@ -387,11 +390,7 @@ def _wire_target_provider_routes(
     private_key_pkcs8_der: bytes,
     provider_names: Sequence[str] = _WIRE_PROVIDER_ORDER,
 ) -> Mapping[str, NativeServerProviderRoute]:
-    if os.name == "nt":
-        ipc_endpoint = f"npipe://nnrp-vllm-wire-{os.getpid()}"
-    else:
-        socket_path = (ready_output.parent.resolve() / "nnrp-vllm-wire.sock").as_posix()
-        ipc_endpoint = f"unix://{socket_path}"
+    ipc_endpoint = _wire_target_ipc_endpoint(ready_output)
     routes = {
         "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
         "quic": NativeServerProviderRoute(
@@ -412,6 +411,29 @@ def _wire_target_provider_routes(
     if unknown := set(selected).difference(_PROVIDER_NAMES):
         raise ValueError(f"wire target contains unsupported providers: {sorted(unknown)!r}")
     return {name: routes[name] for name in _WIRE_PROVIDER_ORDER if name in selected}
+
+
+def _wire_target_ipc_endpoint(ready_output: Path, *, platform: str = os.name) -> str:
+    if platform == "nt":
+        return f"npipe://nnrp-vllm-wire-{os.getpid()}"
+    identity = hashlib.sha256(os.fsencode(ready_output.parent.resolve())).hexdigest()[:8]
+    filename = f"nnrp-vllm-{os.getpid()}-{identity}.sock"
+    for directory in (Path(tempfile.gettempdir()), Path("/tmp")):
+        socket_path = directory / filename
+        if len(os.fsencode(socket_path.as_posix())) < 100:
+            return f"unix://{socket_path.as_posix()}"
+    raise RuntimeError("wire target cannot allocate an IPC endpoint below the Unix socket path limit")
+
+
+def _remove_wire_target_ipc_socket(
+    provider_routes: Mapping[str, NativeServerProviderRoute],
+    *,
+    platform: str = os.name,
+) -> None:
+    route = provider_routes.get("ipc")
+    if platform == "nt" or route is None or not route.provider_endpoint.startswith("unix://"):
+        return
+    Path(route.provider_endpoint.removeprefix("unix://")).unlink(missing_ok=True)
 
 
 def _wire_target_manifest_transport(bound_endpoints: Mapping[str, object], name: str) -> dict[str, object]:

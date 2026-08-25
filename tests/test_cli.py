@@ -344,3 +344,29 @@ def test_wire_target_provider_selection_is_canonical_and_rejects_invalid_sets(tm
             private_key_pkcs8_der=b"private-key",
             provider_names=("tcp", "tcp"),
         )
+
+
+def test_wire_target_posix_ipc_endpoint_stays_below_unix_socket_path_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    deeply_nested = tmp_path.joinpath(*(f"policy-{index}" for index in range(20)), "target.json")
+    monkeypatch.setattr(cli.tempfile, "gettempdir", lambda: "/" + "nested/" * 20)
+
+    endpoint = cli._wire_target_ipc_endpoint(deeply_nested, platform="posix")
+
+    assert endpoint.startswith("unix:///tmp/nnrp-vllm-")
+    assert len(os.fsencode(endpoint.removeprefix("unix://"))) < 100
+    assert str(deeply_nested.parent) not in endpoint
+
+
+def test_wire_target_removes_posix_ipc_socket(tmp_path: Path) -> None:
+    socket_path = tmp_path / "nnrp.sock"
+    socket_path.touch()
+
+    cli._remove_wire_target_ipc_socket(
+        {"ipc": cli.NativeServerProviderRoute(provider_endpoint=f"unix://{socket_path.as_posix()}")},
+        platform="posix",
+    )
+
+    assert not socket_path.exists()
