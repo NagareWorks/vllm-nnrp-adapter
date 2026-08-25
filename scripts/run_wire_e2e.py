@@ -7,13 +7,14 @@ import ipaddress
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -39,6 +40,7 @@ _FORCE_TCP_OPERATIONS = Counter(
         (151, "tcp", "completed"): 1,
     }
 )
+_FORCE_WEBSOCKET_OPERATIONS = Counter({(901, "websocket", "completed"): 1})
 
 
 def main() -> int:
@@ -70,6 +72,14 @@ def main() -> int:
         providers=("tcp",),
         expected_operations=_FORCE_TCP_OPERATIONS,
     )
+    _run_policy_case(
+        conformance_root,
+        artifacts / "policies" / "force-websocket-wss",
+        transport_policy="force_websocket",
+        providers=("websocket",),
+        expected_operations=_FORCE_WEBSOCKET_OPERATIONS,
+        secure_websocket=True,
+    )
     return 0
 
 
@@ -80,6 +90,7 @@ def _run_policy_case(
     transport_policy: str,
     providers: tuple[str, ...],
     expected_operations: Counter[tuple[int, str, str]],
+    secure_websocket: bool = False,
 ) -> None:
     artifacts.mkdir(parents=True, exist_ok=True)
     target_manifest = artifacts / "target.json"
@@ -112,6 +123,8 @@ def _run_policy_case(
     ]
     for provider in providers:
         target_command.extend(("--provider", provider))
+    if secure_websocket:
+        target_command.append("--secure-websocket")
     with target_log.open("w", encoding="utf-8") as log:
         target = subprocess.Popen(
             target_command,
@@ -123,7 +136,17 @@ def _run_policy_case(
         try:
             _wait_for_ready(target, target_manifest)
             if "websocket" in providers:
-                rejection = _assert_websocket_text_rejected(_websocket_endpoint(target_manifest))
+                websocket_endpoint = _websocket_endpoint(target_manifest)
+                if secure_websocket:
+                    tls_rejection = _assert_untrusted_wss_rejected(websocket_endpoint)
+                    (artifacts / "websocket-untrusted-tls-rejection.json").write_text(
+                        json.dumps(tls_rejection, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                rejection = _assert_websocket_text_rejected(
+                    websocket_endpoint,
+                    trusted_certificate=certificate_path if secure_websocket else None,
+                )
                 (artifacts / "websocket-text-rejection.json").write_text(
                     json.dumps(rejection, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
@@ -178,10 +201,36 @@ def _websocket_endpoint(target_manifest: Path) -> str:
     return endpoints[0]
 
 
-def _assert_websocket_text_rejected(endpoint: str) -> dict[str, object]:
+def _assert_untrusted_wss_rejected(endpoint: str) -> dict[str, object]:
     parsed = urlsplit(endpoint)
-    if parsed.scheme != "ws" or parsed.hostname is None or parsed.port is None:
-        raise RuntimeError("text-frame E2E requires a plain ws:// loopback endpoint")
+    if parsed.scheme != "wss" or parsed.hostname is None or parsed.port is None:
+        raise RuntimeError("TLS rejection E2E requires a wss:// loopback endpoint")
+    context = ssl.create_default_context()
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as raw_connection:
+        try:
+            with context.wrap_socket(raw_connection, server_hostname="localhost"):
+                pass
+        except ssl.SSLCertVerificationError as error:
+            return {
+                "endpoint": endpoint,
+                "rejection": "certificate-verification-failed",
+                "verify_code": error.verify_code,
+            }
+    raise RuntimeError("WSS carrier accepted an untrusted server certificate")
+
+
+def _assert_websocket_text_rejected(
+    endpoint: str,
+    *,
+    trusted_certificate: Path | None = None,
+) -> dict[str, object]:
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"ws", "wss"} or parsed.hostname is None or parsed.port is None:
+        raise RuntimeError("text-frame E2E requires a ws:// or wss:// loopback endpoint")
+    if parsed.scheme == "wss" and trusted_certificate is None:
+        raise RuntimeError("WSS text-frame E2E requires an explicit trusted certificate")
+    if parsed.scheme == "ws" and trusted_certificate is not None:
+        raise RuntimeError("plain WebSocket text-frame E2E must not carry TLS trust material")
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     path = parsed.path or "/"
     if parsed.query:
@@ -195,7 +244,7 @@ def _assert_websocket_text_rejected(endpoint: str) -> dict[str, object]:
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n"
     ).encode("ascii")
-    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
+    with _open_websocket_connection(parsed, trusted_certificate) as connection:
         connection.settimeout(5)
         connection.sendall(request)
         response, remainder = _read_http_upgrade_response(connection)
@@ -203,6 +252,25 @@ def _assert_websocket_text_rejected(endpoint: str) -> dict[str, object]:
         connection.sendall(_masked_websocket_text_frame(b"not-nnrp"))
         rejection = _read_websocket_rejection(connection, remainder)
     return {"endpoint": endpoint, "handshake_status": 101, "rejection": rejection}
+
+
+def _open_websocket_connection(parsed: SplitResult, trusted_certificate: Path | None) -> socket.socket:
+    hostname = parsed.hostname
+    port = parsed.port
+    scheme = parsed.scheme
+    assert hostname is not None and port is not None
+    raw_connection = socket.create_connection((hostname, port), timeout=5)
+    if scheme == "ws":
+        return raw_connection
+    assert trusted_certificate is not None
+    context = ssl.create_default_context(
+        cadata=ssl.DER_cert_to_PEM_cert(trusted_certificate.read_bytes())
+    )
+    try:
+        return context.wrap_socket(raw_connection, server_hostname="localhost")
+    except BaseException:
+        raw_connection.close()
+        raise
 
 
 def _read_http_upgrade_response(connection: socket.socket) -> tuple[bytes, bytes]:

@@ -10,6 +10,7 @@ import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from nnrp import (  # type: ignore[import-untyped]
     NativeTransportServerSecurity,
@@ -154,6 +155,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=sorted(_TRANSPORT_POLICIES),
         default="auto",
     )
+    wire_target.add_argument(
+        "--secure-websocket",
+        action="store_true",
+        help="Use WSS with the supplied wire certificate for the WebSocket provider.",
+    )
     wire_target.add_argument("--backend", default="mock")
     wire_target.add_argument("--suite-version", default="0.1.0")
 
@@ -219,6 +225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     private_key_pkcs8_der=args.wire_private_key.read_bytes(),
                     provider_names=tuple(args.providers or _WIRE_PROVIDER_ORDER),
                     transport_policy=_TRANSPORT_POLICIES[args.transport_policy],
+                    secure_websocket=args.secure_websocket,
                 )
             )
         except KeyboardInterrupt:
@@ -286,6 +293,7 @@ async def _serve_wire_target(
     private_key_pkcs8_der: bytes,
     provider_names: Sequence[str] = _WIRE_PROVIDER_ORDER,
     transport_policy: TransportPolicy = TransportPolicy.AUTO,
+    secure_websocket: bool = False,
 ) -> None:
     backend = await load_backend_async(backend_spec)
     if isinstance(backend, MockChatCompletionBackend):
@@ -295,6 +303,7 @@ async def _serve_wire_target(
         certificate_der=certificate_der,
         private_key_pkcs8_der=private_key_pkcs8_der,
         provider_names=provider_names,
+        secure_websocket=secure_websocket,
     )
     observation_sinks: tuple[ObservationSink, ...] = (StructuredLogObservationSink(),)
     if observation_output is not None:
@@ -389,6 +398,7 @@ def _wire_target_provider_routes(
     certificate_der: bytes,
     private_key_pkcs8_der: bytes,
     provider_names: Sequence[str] = _WIRE_PROVIDER_ORDER,
+    secure_websocket: bool = False,
 ) -> Mapping[str, NativeServerProviderRoute]:
     ipc_endpoint = _wire_target_ipc_endpoint(ready_output)
     routes = {
@@ -401,7 +411,19 @@ def _wire_target_provider_routes(
             ),
         ),
         "ipc": NativeServerProviderRoute(provider_endpoint=ipc_endpoint),
-        "websocket": NativeServerProviderRoute(provider_endpoint="ws://127.0.0.1:0/nnrp"),
+        "websocket": NativeServerProviderRoute(
+            provider_endpoint=(
+                "wss://127.0.0.1:0/nnrp" if secure_websocket else "ws://127.0.0.1:0/nnrp"
+            ),
+            security=(
+                NativeTransportServerSecurity(
+                    certificate_der=certificate_der,
+                    private_key_pkcs8_der=private_key_pkcs8_der,
+                )
+                if secure_websocket
+                else None
+            ),
+        ),
     }
     selected = tuple(provider_names)
     if not selected:
@@ -439,14 +461,19 @@ def _remove_wire_target_ipc_socket(
 def _wire_target_manifest_transport(bound_endpoints: Mapping[str, object], name: str) -> dict[str, object]:
     attribute = "address" if name in {"tcp", "quic"} else "uri"
     endpoint = _wire_target_endpoint(bound_endpoints, name, attribute=attribute)
-    if name != "quic":
+    if name != "quic" and not (name == "websocket" and endpoint.startswith("wss://")):
         return {"name": name, "endpoint": endpoint, "tls": False}
+    server_name = "localhost"
+    if name == "websocket":
+        server_name = urlsplit(endpoint).hostname or ""
+        if not server_name:
+            raise RuntimeError("secure WebSocket wire target did not expose an endpoint host")
     return {
-        "name": "quic",
+        "name": name,
         "endpoint": endpoint,
         "tls": True,
         "security": {
-            "server_name": "localhost",
+            "server_name": server_name,
             "trusted_certificate_der_path": "certs/server.der",
             "certificate_der_path": "certs/server.der",
             "private_key_pkcs8_der_path": "certs/server-key.der",

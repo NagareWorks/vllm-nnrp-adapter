@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import DNSName, IPAddress
 
 from scripts.run_wire_e2e import (
+    _assert_websocket_text_rejected,
     _masked_websocket_text_frame,
     _read_websocket_rejection,
     _validate_observation_evidence,
@@ -189,6 +190,16 @@ def test_websocket_text_probe_requires_a_close_outcome() -> None:
         assert _read_websocket_rejection(connection, b"\x88\x00") == "close-frame"
         with pytest.raises(RuntimeError, match="opcode 2"):
             _read_websocket_rejection(connection, b"\x82\x00")
+
+
+def test_websocket_text_probe_requires_matching_tls_trust_inputs(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="explicit trusted certificate"):
+        _assert_websocket_text_rejected("wss://127.0.0.1:7768/nnrp")
+    with pytest.raises(RuntimeError, match="must not carry TLS trust material"):
+        _assert_websocket_text_rejected(
+            "ws://127.0.0.1:7768/nnrp",
+            trusted_certificate=tmp_path / "server.der",
+        )
 
 
 def test_wire_observation_gate_accepts_force_tcp_provider_evidence(tmp_path: Path) -> None:

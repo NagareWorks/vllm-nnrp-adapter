@@ -346,6 +346,34 @@ def test_wire_target_provider_selection_is_canonical_and_rejects_invalid_sets(tm
         )
 
 
+def test_wire_target_secure_websocket_route_and_manifest_use_route_local_tls(tmp_path: Path) -> None:
+    routes = cli._wire_target_provider_routes(
+        tmp_path / "target.json",
+        certificate_der=b"certificate",
+        private_key_pkcs8_der=b"private-key",
+        provider_names=("websocket",),
+        secure_websocket=True,
+    )
+
+    route = routes["websocket"]
+    assert route.provider_endpoint == "wss://127.0.0.1:0/nnrp"
+    assert route.security is not None
+    assert route.security.certificate_der == b"certificate"
+    assert route.security.private_key_pkcs8_der == b"private-key"
+    assert cli._wire_target_manifest_transport(
+        {"websocket": SimpleNamespace(uri="wss://127.0.0.1:39124/nnrp")},
+        "websocket",
+    ) == {
+        "name": "websocket",
+        "endpoint": "wss://127.0.0.1:39124/nnrp",
+        "tls": True,
+        "security": {
+            "server_name": "127.0.0.1",
+            "trusted_certificate_der_path": "certs/server.der",
+            "certificate_der_path": "certs/server.der",
+            "private_key_pkcs8_der_path": "certs/server-key.der",
+        },
+    }
 def test_wire_target_posix_ipc_endpoint_stays_below_unix_socket_path_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

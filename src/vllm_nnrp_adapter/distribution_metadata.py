@@ -14,7 +14,7 @@ from pathlib import Path
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 
-NNRP_PY_RANGE = SpecifierSet(">=1.0.0rc4.post19,<1.0.0rc5")
+NNRP_PY_RANGE = SpecifierSet(">=1.0.0rc4.post20,<1.0.0rc5")
 VLLM_RANGE = SpecifierSet(">=0.18.0,<0.27")
 PROJECT_NAME = "vllm-nnrp-adapter"
 CONSOLE_ENTRYPOINT = "vllm_nnrp_adapter.cli:main"

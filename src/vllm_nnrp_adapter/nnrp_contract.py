@@ -8,7 +8,7 @@ from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 NNRP_PY_DISTRIBUTION = "nnrp-py"
-NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post19,<1.0.0rc5"
+NNRP_PY_REQUIRED_RANGE = ">=1.0.0rc4.post20,<1.0.0rc5"
 _NNRP_PY_REQUIRED_SPECIFIER = SpecifierSet(NNRP_PY_REQUIRED_RANGE)
 
 _REQUIRED_NNRP_SYMBOLS = {

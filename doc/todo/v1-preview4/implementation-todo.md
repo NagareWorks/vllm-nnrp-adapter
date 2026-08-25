@@ -13,7 +13,7 @@ HTTP/SSE endpoint.
 - [x] [03 - Native server and session lifecycle](03-native-server-and-session-lifecycle.md)
 - [ ] [04 - Runtime control mapping](04-runtime-control-mapping.md)
 - [ ] [05 - Runtime objects, cache, and payloads](05-runtime-objects-cache-and-payloads.md)
-- [ ] [06 - Transport provider serving](06-transport-provider-serving.md)
+- [x] [06 - Transport provider serving](06-transport-provider-serving.md)
 - [ ] [07 - OpenAI profile runtime](07-openai-profile-runtime.md)
 - [ ] [08 - Observability and exporters](08-observability-and-exporters.md)
 - [ ] [09 - Conformance and vLLM integration](09-conformance-and-vllm-integration.md)
@@ -23,7 +23,7 @@ HTTP/SSE endpoint.
 ## Frozen Delivery Rules
 
 - The protocol baseline is NNRP/1 Preview4 and the API profile is `openai-compatible/1` Level 1.
-- The adapter consumes `nnrp-py>=1.0.0rc4.post19,<1.0.0rc5`; it does not preserve Preview3 SDK entrypoints.
+- The adapter consumes `nnrp-py>=1.0.0rc4.post20,<1.0.0rc5`; it does not preserve Preview3 SDK entrypoints.
 - The declared vLLM installation range is `>=0.18.0,<0.27`; it is not a blanket support claim.
   Tested compatibility anchors are `0.18.1`, `0.22.1`, and `0.26.0`, and runtime diagnostics use
   the same binding registry as the published compatibility table.
