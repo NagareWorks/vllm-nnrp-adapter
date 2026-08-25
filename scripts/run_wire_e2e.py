@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import subprocess
 import sys
 import time
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 
 def main() -> int:
@@ -30,6 +37,7 @@ def main() -> int:
 
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    certificate_path, private_key_path = _write_self_signed_certificate(artifacts / "certs")
     target_command = [
         sys.executable,
         "-m",
@@ -39,6 +47,10 @@ def main() -> int:
         str(target_manifest),
         "--observation-output",
         str(observation_evidence),
+        "--wire-certificate",
+        str(certificate_path),
+        "--wire-private-key",
+        str(private_key_path),
     ]
     with target_log.open("w", encoding="utf-8") as log:
         target = subprocess.Popen(
@@ -134,11 +146,12 @@ def _validate_observation_evidence(path: Path) -> None:
     operation_records = [record for record in records if record.get("record_type") == "operation"]
     if len(startup_records) != 1:
         raise RuntimeError(f"wire target emitted {len(startup_records)} startup observation records")
-    if len(operation_records) != 6:
+    if len(operation_records) != 7:
         raise RuntimeError(f"wire target emitted {len(operation_records)} operation observation records")
     expected_operations = Counter(
         {
             (901, "tcp", "completed"): 1,
+            (901, "quic", "completed"): 1,
             (901, "ipc", "completed"): 1,
             (901, "websocket", "completed"): 1,
             (101, "tcp", "cancelled"): 1,
@@ -174,6 +187,48 @@ def _validate_observation_evidence(path: Path) -> None:
             for field in ("cancellation_kind", "cancellation_source", "drop_reason")
         ):
             raise RuntimeError("wire completion observation was reclassified by a late control event")
+
+
+def _write_self_signed_certificate(directory: Path) -> tuple[Path, Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    private_key = rsa.generate_private_key(public_exponent=65_537, key_size=2048)
+    subject = issuer = x509.Name(
+        [
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "NNRP conformance"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ]
+    )
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                ]
+            ),
+            critical=False,
+        )
+        .sign(private_key, hashes.SHA256())
+    )
+    certificate_path = directory / "server.der"
+    private_key_path = directory / "server-key.der"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.DER))
+    private_key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    return certificate_path, private_key_path
 
 
 if __name__ == "__main__":

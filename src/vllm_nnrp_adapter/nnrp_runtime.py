@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -165,6 +166,13 @@ def _validate_server_provider_routes(routes: Mapping[str, NativeServerProviderRo
 
         if transport_name in {"ipc", "websocket"} and resolved is None:
             raise ValueError(f"{transport_name} provider route requires an explicit provider endpoint")
+        if transport_name == "ipc":
+            assert resolved is not None
+            expected_scheme = "npipe" if os.name == "nt" else "unix"
+            if resolved.scheme != expected_scheme:
+                raise ValueError(
+                    f"ipc provider route on this platform requires a {expected_scheme}:// endpoint"
+                )
         if transport_name == "quic" and route.security is None:
             raise ValueError("quic provider route requires server security material")
         if transport_name == "ipc" and route.security is not None:

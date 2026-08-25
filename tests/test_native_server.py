@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -105,6 +106,9 @@ from vllm_nnrp_adapter.runtime_control import (
     RuntimeControlRequest,
     RuntimePriorityUpdate,
 )
+
+LOCAL_IPC_ENDPOINT = "npipe://nnrp-vllm" if os.name == "nt" else "unix:///tmp/nnrp-vllm.sock"
+LOCAL_IPC_SCHEME = "npipe" if os.name == "nt" else "unix"
 
 
 class StreamingBackend:
@@ -1093,8 +1097,8 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
             session,
             bound_provider_endpoints={
                 "ipc": NativeTransportEndpoint(
-                    uri="npipe://nnrp-vllm",
-                    scheme="npipe",
+                    uri=LOCAL_IPC_ENDPOINT,
+                    scheme=LOCAL_IPC_SCHEME,
                     transport_name="ipc",
                     transport_id=TransportId.IPC,
                     address="nnrp-vllm",
@@ -1122,7 +1126,7 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     )
     config = NnrpServerConfig(
         endpoint="nnrp://runtime.local/vllm",
-        provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm")},
+        provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint=LOCAL_IPC_ENDPOINT)},
         transports=list(bindings),
         accept_timeout_ms=10,
         receive_timeout_ms=10,
@@ -1165,11 +1169,11 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
     assert terminal_metadata.payload_frame_count == 1
     assert _decode_terminal_profile_body(terminal_metadata, terminal_body)["type"] == "response.completed"
     assert captured_options[0].endpoint.uri == "nnrp://runtime.local/vllm"
-    assert captured_options[0].provider_routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
+    assert captured_options[0].provider_routes["ipc"].provider_endpoint == LOCAL_IPC_ENDPOINT
     startup = _startup_observation_records(caplog)[0]
     assert startup == {
         "application_endpoint": "nnrp://runtime.local/vllm",
-        "bound_provider_endpoints": {"ipc": "npipe://nnrp-vllm"},
+        "bound_provider_endpoints": {"ipc": LOCAL_IPC_ENDPOINT},
         "eligible_providers": ["ipc"],
         "transport_policy": "auto",
     }
@@ -2280,7 +2284,7 @@ def test_server_config_rejects_invalid_provider_route_values(
         ("quic", "quic://127.0.0.1:7767", None, "quic provider route requires"),
         ("websocket", "wss://127.0.0.1:7768/nnrp", None, "wss provider route requires"),
         ("websocket", "ws://127.0.0.1:7768/nnrp", "server", "ws provider route must not"),
-        ("ipc", "npipe://nnrp-vllm", "server", "ipc provider route must not"),
+        ("ipc", LOCAL_IPC_ENDPOINT, "server", "ipc provider route must not"),
     ],
 )
 def test_server_config_enforces_route_local_security(
@@ -2306,6 +2310,28 @@ def test_server_config_enforces_route_local_security(
         )
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "provider_endpoint", "required_scheme"),
+    [
+        ("nt", "unix:///tmp/nnrp-vllm.sock", "npipe"),
+        ("posix", "npipe://nnrp-vllm", "unix"),
+    ],
+)
+def test_server_config_rejects_ipc_endpoint_for_another_platform(
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    provider_endpoint: str,
+    required_scheme: str,
+) -> None:
+    monkeypatch.setattr("vllm_nnrp_adapter.nnrp_runtime.os", SimpleNamespace(name=platform_name))
+
+    with pytest.raises(ValueError, match=rf"requires a {required_scheme}:// endpoint"):
+        NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint=provider_endpoint)},
+        )
+
+
 def test_native_handle_identity_preserves_available_local_identity() -> None:
     wrapped = SimpleNamespace(handle=SimpleNamespace(id=41, generation=3))
 
@@ -2320,7 +2346,7 @@ async def test_unavailable_explicit_binding_never_starts_a_provider_listener() -
             OpenAiNnrpAdapter(StreamingBackend()),
             config=NnrpServerConfig(
                 endpoint="nnrp://runtime.local/vllm",
-                provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm")},
+                provider_routes={"ipc": NativeServerProviderRoute(provider_endpoint=LOCAL_IPC_ENDPOINT)},
                 transports=[_unavailable_binding(TransportId.IPC)],
             ),
         )
@@ -2381,7 +2407,7 @@ async def test_multi_provider_listener_failure_keeps_logical_server_atomic(
 
     routes = {
         "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
-        "ipc": NativeServerProviderRoute(provider_endpoint="npipe://nnrp-vllm"),
+        "ipc": NativeServerProviderRoute(provider_endpoint=LOCAL_IPC_ENDPOINT),
     }
     with pytest.raises(OSError, match="listener failed before admission"):
         await _serve(

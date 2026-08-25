@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509 import DNSName, IPAddress
 
-from scripts.run_wire_e2e import _validate_observation_evidence
+from scripts.run_wire_e2e import _validate_observation_evidence, _write_self_signed_certificate
 
 
 def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_path: Path) -> None:
@@ -13,6 +16,7 @@ def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_
     records = [
         {"record_type": "server_startup"},
         _operation(901, "tcp", "completed"),
+        _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
         _operation(901, "websocket", "completed"),
         _operation(101, "tcp", "cancelled", cancelled=True),
@@ -29,6 +33,7 @@ def test_wire_observation_gate_rejects_cancel_without_an_in_flight_partial(tmp_p
     records = [
         {"record_type": "server_startup"},
         _operation(901, "tcp", "completed"),
+        _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
         _operation(901, "websocket", "completed"),
         _operation(101, "tcp", "cancelled", cancelled=True, output_event_count=0),
@@ -54,6 +59,7 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
     records = [
         {"record_type": "server_startup"},
         completed_with_disconnect,
+        _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
         _operation(901, "websocket", "completed"),
         _operation(101, "tcp", "cancelled", cancelled=True),
@@ -64,6 +70,19 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
 
     with pytest.raises(RuntimeError, match="late control event"):
         _validate_observation_evidence(evidence)
+
+
+def test_wire_certificate_is_self_signed_for_local_quic_endpoint(tmp_path: Path) -> None:
+    certificate_path, private_key_path = _write_self_signed_certificate(tmp_path / "certs")
+
+    certificate = x509.load_der_x509_certificate(certificate_path.read_bytes())
+    private_key = serialization.load_der_private_key(private_key_path.read_bytes(), password=None)
+    subject_alt_name = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+
+    assert certificate.issuer == certificate.subject
+    assert subject_alt_name.get_values_for_type(DNSName) == ["localhost"]
+    assert [str(value) for value in subject_alt_name.get_values_for_type(IPAddress)] == ["127.0.0.1"]
+    assert private_key.key_size == 2048
 
 
 def _operation(

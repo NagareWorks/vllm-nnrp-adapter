@@ -137,6 +137,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     wire_target.add_argument("--ready-output", type=Path, required=True)
     wire_target.add_argument("--observation-output", type=Path)
+    wire_target.add_argument("--wire-certificate", type=Path, required=True)
+    wire_target.add_argument("--wire-private-key", type=Path, required=True)
     wire_target.add_argument("--backend", default="mock")
     wire_target.add_argument("--suite-version", default="0.1.0")
 
@@ -198,6 +200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.ready_output,
                     args.suite_version,
                     observation_output=args.observation_output,
+                    certificate_der=args.wire_certificate.read_bytes(),
+                    private_key_pkcs8_der=args.wire_private_key.read_bytes(),
                 )
             )
         except KeyboardInterrupt:
@@ -261,11 +265,17 @@ async def _serve_wire_target(
     suite_version: str,
     *,
     observation_output: Path | None = None,
+    certificate_der: bytes,
+    private_key_pkcs8_der: bytes,
 ) -> None:
     backend = await load_backend_async(backend_spec)
     if isinstance(backend, MockChatCompletionBackend):
         backend = MockChatCompletionBackend(stream_inter_event_delay_s=0.5)
-    provider_routes = _wire_target_provider_routes(ready_output)
+    provider_routes = _wire_target_provider_routes(
+        ready_output,
+        certificate_der=certificate_der,
+        private_key_pkcs8_der=private_key_pkcs8_der,
+    )
     observation_sinks: tuple[ObservationSink, ...] = (StructuredLogObservationSink(),)
     if observation_output is not None:
         observation_sinks += (_WireEvidenceSink(observation_output),)
@@ -283,6 +293,7 @@ async def _serve_wire_target(
 
     def publish_ready(bound_endpoints: Mapping[str, object]) -> None:
         tcp = _wire_target_endpoint(bound_endpoints, "tcp", attribute="address")
+        quic = _wire_target_endpoint(bound_endpoints, "quic", attribute="address")
         ipc = _wire_target_endpoint(bound_endpoints, "ipc", attribute="uri")
         websocket = _wire_target_endpoint(bound_endpoints, "websocket", attribute="uri")
         document = {
@@ -294,6 +305,17 @@ async def _serve_wire_target(
                 "modes": ["suite_as_client"],
                 "transports": [
                     {"name": "tcp", "endpoint": tcp, "tls": False},
+                    {
+                        "name": "quic",
+                        "endpoint": quic,
+                        "tls": True,
+                        "security": {
+                            "server_name": "localhost",
+                            "trusted_certificate_der_path": "certs/server.der",
+                            "certificate_der_path": "certs/server.der",
+                            "private_key_pkcs8_der_path": "certs/server-key.der",
+                        },
+                    },
                     {"name": "ipc", "endpoint": ipc, "tls": False},
                     {"name": "websocket", "endpoint": websocket, "tls": False},
                 ],
@@ -356,7 +378,12 @@ class _WireEvidenceSink:
             stream.write(encoded)
 
 
-def _wire_target_provider_routes(ready_output: Path) -> Mapping[str, NativeServerProviderRoute]:
+def _wire_target_provider_routes(
+    ready_output: Path,
+    *,
+    certificate_der: bytes,
+    private_key_pkcs8_der: bytes,
+) -> Mapping[str, NativeServerProviderRoute]:
     if os.name == "nt":
         ipc_endpoint = f"npipe://nnrp-vllm-wire-{os.getpid()}"
     else:
@@ -364,6 +391,13 @@ def _wire_target_provider_routes(ready_output: Path) -> Mapping[str, NativeServe
         ipc_endpoint = f"unix://{socket_path}"
     return {
         "tcp": NativeServerProviderRoute(provider_endpoint="tcp://127.0.0.1:0"),
+        "quic": NativeServerProviderRoute(
+            provider_endpoint="quic://127.0.0.1:0",
+            security=NativeTransportServerSecurity(
+                certificate_der=certificate_der,
+                private_key_pkcs8_der=private_key_pkcs8_der,
+            ),
+        ),
         "ipc": NativeServerProviderRoute(provider_endpoint=ipc_endpoint),
         "websocket": NativeServerProviderRoute(provider_endpoint="ws://127.0.0.1:0/nnrp"),
     }

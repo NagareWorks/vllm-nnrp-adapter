@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Coroutine
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +15,8 @@ from nnrp import TransportPolicy
 from vllm_nnrp_adapter import cli
 from vllm_nnrp_adapter.adapter import OpenAiNnrpAdapter
 from vllm_nnrp_adapter.observability import PrometheusObservationSink
+
+LOCAL_IPC_ENDPOINT = "npipe://nnrp-vllm" if os.name == "nt" else "unix:///tmp/nnrp-vllm.sock"
 
 
 def test_serve_cli_builds_provider_neutral_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -48,7 +51,7 @@ def test_serve_cli_builds_provider_neutral_config(monkeypatch: pytest.MonkeyPatc
             "--provider-route",
             "quic=quic://0.0.0.0:7767",
             "--provider-route",
-            "ipc=npipe://nnrp-vllm",
+            f"ipc={LOCAL_IPC_ENDPOINT}",
             "--provider-route",
             "websocket=wss://0.0.0.0:7768/nnrp",
             "--provider-certificate",
@@ -72,7 +75,7 @@ def test_serve_cli_builds_provider_neutral_config(monkeypatch: pytest.MonkeyPatc
     assert config.endpoint == "nnrp://runtime.local/vllm"
     assert config.transport_policy is TransportPolicy.PREFER_QUIC
     assert set(routes) == {"tcp", "quic", "ipc", "websocket"}
-    assert routes["ipc"].provider_endpoint == "npipe://nnrp-vllm"
+    assert routes["ipc"].provider_endpoint == LOCAL_IPC_ENDPOINT
     assert routes["quic"].security is not None
     assert routes["quic"].security.certificate_der == b"certificate"
     assert routes["websocket"].security is not None
@@ -227,15 +230,20 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         assert adapter._backend is backend
         assert config.endpoint == "nnrp://wire-target.local/vllm"
         assert config.provider_routes["tcp"].provider_endpoint == "tcp://127.0.0.1:0"
+        assert config.provider_routes["quic"].provider_endpoint == "quic://127.0.0.1:0"
+        assert config.provider_routes["quic"].security is not None
+        assert config.provider_routes["quic"].security.certificate_der == b"certificate"
+        assert config.provider_routes["quic"].security.private_key_pkcs8_der == b"private-key"
         assert config.provider_routes["websocket"].provider_endpoint == "ws://127.0.0.1:0/nnrp"
         ipc_endpoint = config.provider_routes["ipc"].provider_endpoint
         assert ipc_endpoint.startswith(("npipe://", "unix://"))
         assert config.transports is not None
-        assert len(config.transports) == 3
+        assert len(config.transports) == 4
         assert config.accept_timeout_ms == 1_000
         on_ready(
             {
                 "tcp": SimpleNamespace(address="127.0.0.1:39123"),
+                "quic": SimpleNamespace(address="127.0.0.1:39125"),
                 "ipc": SimpleNamespace(uri=ipc_endpoint),
                 "websocket": SimpleNamespace(uri="ws://127.0.0.1:39124/nnrp"),
             }
@@ -249,6 +257,8 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         ready_output,
         "0.1.0",
         observation_output=observation_output,
+        certificate_der=b"certificate",
+        private_key_pkcs8_der=b"private-key",
     )
 
     manifest = json.loads(ready_output.read_text(encoding="utf-8"))
@@ -258,8 +268,23 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
     assert manifest["wire_conformance"]["transports"] == [
         {"name": "tcp", "endpoint": "127.0.0.1:39123", "tls": False},
         {
+            "name": "quic",
+            "endpoint": "127.0.0.1:39125",
+            "tls": True,
+            "security": {
+                "server_name": "localhost",
+                "trusted_certificate_der_path": "certs/server.der",
+                "certificate_der_path": "certs/server.der",
+                "private_key_pkcs8_der_path": "certs/server-key.der",
+            },
+        },
+        {
             "name": "ipc",
-            "endpoint": cli._wire_target_provider_routes(ready_output)["ipc"].provider_endpoint,
+            "endpoint": cli._wire_target_provider_routes(
+                ready_output,
+                certificate_der=b"certificate",
+                private_key_pkcs8_der=b"private-key",
+            )["ipc"].provider_endpoint,
             "tls": False,
         },
         {"name": "websocket", "endpoint": "ws://127.0.0.1:39124/nnrp", "tls": False},
