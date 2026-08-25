@@ -317,6 +317,7 @@ class FakeOperation:
     partial_send_gate: asyncio.Event | None = None
     partial_send_observer: Callable[[bool], None] | None = None
     terminal_send_observer: Callable[[], None] | None = None
+    drop_send_observer: Callable[[], None] | None = None
 
     def __post_init__(self, body: bytes, metadata: FrameSubmitMetadata) -> None:
         self.submit = NativeRuntimeEvent(
@@ -375,6 +376,8 @@ class FakeOperation:
         self.progress_results.append((metadata, body))
 
     async def send_result_drop(self, metadata: ResultDropReasonMetadata, diagnostic: bytes = b"") -> None:
+        if self.drop_send_observer is not None:
+            self.drop_send_observer()
         self.result_drops.append((metadata, diagnostic))
         if self.on_terminal is not None:
             self.on_terminal()
@@ -680,6 +683,21 @@ class ClosingFakeServer:
             NativeStatus(FFI_STATUS_INVALID_STATE, detail_code=self._detail_code),
             "native runtime server closed",
         )
+
+
+class ShutdownRaceFakeServer:
+    def __init__(self, session: FakeSession) -> None:
+        self._session = session
+        self.accept_started = asyncio.Event()
+        self.release_accept = asyncio.Event()
+        self.bound_provider_endpoints: dict[str, NativeTransportEndpoint] = {}
+
+    async def accept(self, options: NativeServerAcceptOptions | None = None) -> FakeSession:
+        assert options is not None
+        assert options.timeout_ms == 10
+        self.accept_started.set()
+        await self.release_accept.wait()
+        return self._session
 
 
 class FakeServerContext:
@@ -3082,6 +3100,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     _capture_observations(caplog)
+    lifecycle: list[str] = []
     stop_event = asyncio.Event()
     backend = CancellableBackend()
     operation = FakeOperation(
@@ -3090,14 +3109,26 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
         body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=102),
         terminal_results=[],
+        drop_send_observer=lambda: lifecycle.append("terminal-diagnostic"),
     )
-    session = ScriptedEventSession(
+
+    class OrderedShutdownSession(ScriptedEventSession):
+        def close(self) -> None:
+            lifecycle.append("session-close")
+            super().close()
+
+    class OrderedShutdownContext(FakeServerContext):
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            lifecycle.append("listener-close")
+            super().__exit__(exc_type, exc, traceback)
+
+    session = OrderedShutdownSession(
         [FakeServerEvent(submit=operation)],
         operation=operation,
         backend_started=backend.started,
         stop_event=stop_event,
     )
-    server_context = FakeServerContext(MultiSessionFakeServer([session]))
+    server_context = OrderedShutdownContext(MultiSessionFakeServer([session]))
     monkeypatch.setattr(
         "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
         _listen_with_context(server_context),
@@ -3105,6 +3136,7 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
 
     async def request_shutdown() -> None:
         await asyncio.to_thread(backend.started.wait, 1)
+        lifecycle.append("stop-admission")
         stop_event.set()
 
     shutdown_task = asyncio.create_task(request_shutdown())
@@ -3133,10 +3165,64 @@ async def test_server_shutdown_drops_active_operation_before_closing_session(
     assert all(metadata.stage_code != 0x000A for metadata, _body in operation.progress_results)
     assert session.closed is True
     assert server_context.exited is True
+    assert lifecycle == [
+        "stop-admission",
+        "terminal-diagnostic",
+        "session-close",
+        "listener-close",
+    ]
     observation = _observation_records(caplog)[0]
     assert observation["terminal_outcome"] == "dropped"
     assert observation["cancellation_kind"] == "server_shutdown"
     assert observation["drop_reason"] == "transport_closed"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_accept_closes_unadmitted_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=103,
+        frame_id=203,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=103),
+        terminal_results=[],
+    )
+    session = FakeSession(operation, stop_event)
+    server = ShutdownRaceFakeServer(session)
+    server_context = FakeServerContext(server)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(server_context),
+    )
+
+    async def request_shutdown() -> None:
+        await server.accept_started.wait()
+        stop_event.set()
+        server.release_accept.set()
+
+    shutdown_task = asyncio.create_task(request_shutdown())
+    try:
+        statistics = await serve(
+            OpenAiNnrpAdapter(StreamingBackend()),
+            config=NnrpServerConfig(
+                endpoint="nnrp://runtime.local/vllm",
+                accept_timeout_ms=10,
+                receive_timeout_ms=10,
+                max_active_sessions=1,
+                max_operations_per_session=1,
+                native_worker_count=2,
+            ),
+            stop_event=stop_event,
+        )
+    finally:
+        await shutdown_task
+
+    assert statistics.accepted_sessions == 0
+    assert statistics.accepted_operations == 0
+    assert session.closed is True
+    assert server_context.exited is True
 
 
 @pytest.mark.asyncio

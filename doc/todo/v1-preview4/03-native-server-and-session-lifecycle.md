@@ -35,7 +35,7 @@
 - [x] Serve multiple accepted sessions and multiple operations per session concurrently.
 - [x] Keep per-operation event order while allowing independent operations to progress.
 - [x] Bound accepted sessions, active operations, queued operations, and pending output events.
-- [ ] Apply graceful shutdown in the order: stop listeners, stop admission, cancel operations, drain
+- [x] Apply graceful shutdown in the order: stop listeners, stop admission, cancel operations, drain
   terminal diagnostics, close sessions, close the native server.
 - [x] Add lifecycle tests for peer disconnect, listener failure, backend failure, cancellation races,
   shutdown races, and restart after clean closure.

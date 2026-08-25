@@ -395,6 +395,9 @@ async def _serve(
                 if error.status.detail_code != 105:
                     raise
                 break
+            if shutdown.is_set():
+                await native.call(session.close)
+                break
             counters.accepted_sessions += 1
             task = asyncio.create_task(
                 _serve_session(adapter, session, config=config, shutdown=shutdown, native=native, counters=counters)
