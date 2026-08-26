@@ -52,15 +52,25 @@ def test_capability_evidence_gate_rejects_failed_or_incomplete_results(
         validate_runtime_capability_evidence(tmp_path)
 
 
-def test_capability_evidence_gate_rejects_missing_independent_scenario(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "scenario_id",
+    (
+        "wire.control.deadline-before-submit.client",
+        "wire.control.capability-negotiation.client",
+    ),
+)
+def test_capability_evidence_gate_rejects_missing_independent_scenario(
+    tmp_path: Path,
+    scenario_id: str,
+) -> None:
     results = [
         result
         for result in _results()
-        if result["id"] != "wire.control.deadline-before-submit.client"
+        if result["id"] != scenario_id
     ]
     _write_results(tmp_path, results)
 
-    with pytest.raises(RuntimeError, match="does not contain wire.control.deadline-before-submit.client"):
+    with pytest.raises(RuntimeError, match=f"does not contain {scenario_id}"):
         validate_runtime_capability_evidence(tmp_path)
 
 
@@ -81,6 +91,7 @@ def _results() -> list[dict[str, object]]:
         for scenario_id in (
             "wire.profile.openai-compatible.level1",
             "wire.control.cancel-abort.client",
+            "wire.control.capability-negotiation.client",
             "wire.control.deadline-before-submit.client",
         )
     ]

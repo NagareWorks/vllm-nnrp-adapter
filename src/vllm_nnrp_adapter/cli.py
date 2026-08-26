@@ -336,6 +336,7 @@ async def _serve_wire_target(
                 "capabilities": [
                     "profile.openai-compatible.level1.wire",
                     "control.cancel_abort",
+                    "control.capability_costs",
                     "control.deadline_expire",
                     "control.result_drop_reason",
                     "control.trace_context",

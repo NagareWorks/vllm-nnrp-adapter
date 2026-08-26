@@ -293,6 +293,7 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
     assert manifest["wire_conformance"]["capabilities"] == [
         "profile.openai-compatible.level1.wire",
         "control.cancel_abort",
+        "control.capability_costs",
         "control.deadline_expire",
         "control.result_drop_reason",
         "control.trace_context",

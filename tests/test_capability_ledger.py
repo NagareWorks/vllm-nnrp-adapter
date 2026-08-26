@@ -64,6 +64,7 @@ def test_core_capabilities_expose_thresholds_without_claiming_missing_evidence()
     assert {entry.token for entry in core_entries if entry.release_gate_ready} == {
         "payload.typed",
         "control.cancel_abort",
+        "control.capability_costs",
         "control.deadline_expire",
         "control.progress_partial",
         "control.trace_context",

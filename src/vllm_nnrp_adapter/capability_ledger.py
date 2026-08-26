@@ -239,11 +239,13 @@ RUNTIME_CAPABILITY_LEDGER = (
     ),
     RuntimeCapabilityEvidence(
         token="control.capability_costs",
-        classification=CapabilityClassification.CONDITIONAL,
+        classification=CapabilityClassification.CORE,
         mechanism="Intersect canonical capability offers with the adapter's mechanism-backed ledger.",
         observable_effect="The peer receives a canonical accepted subset or a typed capability mismatch.",
         benchmark_metric="semantic defect rate",
         acceptance_threshold="zero accepted tokens without a mechanism-backed ledger entry",
+        independent_scenario="wire.control.capability-negotiation.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.trace_context",
