@@ -10,6 +10,7 @@ from vllm_nnrp_adapter.capability_ledger import (
     RUNTIME_CAPABILITY_LEDGER,
     CapabilityClassification,
     ProfileAdvertisementSurface,
+    RuntimeCapabilityEvidence,
     openai_profile_extensions,
     openai_profile_operation_capabilities,
     supported_runtime_capabilities,
@@ -22,6 +23,21 @@ def test_runtime_capability_ledger_uses_only_frozen_tokens_and_complete_mechanis
     assert len(tokens) == len(set(tokens))
     assert set(tokens).issubset(PREVIEW4_CAPABILITY_TOKENS)
     assert all(entry.has_runtime_mechanism for entry in RUNTIME_CAPABILITY_LEDGER)
+
+
+def test_runtime_release_gate_requires_a_benchmark_metric() -> None:
+    entry = RuntimeCapabilityEvidence(
+        token="payload.typed",
+        classification=CapabilityClassification.CORE,
+        mechanism="mechanism",
+        observable_effect="effect",
+        benchmark_metric="",
+        acceptance_threshold="threshold",
+        independent_scenario="scenario",
+        evidence_artifact="artifact.json",
+    )
+
+    assert entry.release_gate_ready is False
 
 
 def test_runtime_capability_advertisement_is_derived_from_the_ledger() -> None:
@@ -43,9 +59,15 @@ def test_core_capabilities_expose_thresholds_without_claiming_missing_evidence()
     assert core_entries
     assert all(entry.benchmark_metric for entry in core_entries)
     assert all(entry.acceptance_threshold for entry in core_entries)
+    assert all(entry.advertised_by_default for entry in core_entries)
+    assert all(entry.release_gate_ready for entry in core_entries)
     assert {entry.token for entry in core_entries if entry.release_gate_ready} == {
         "payload.typed",
+        "control.cancel_abort",
+        "control.deadline_expire",
         "control.progress_partial",
+        "control.trace_context",
+        "control.result_drop_reason",
     }
 
 
@@ -55,6 +77,27 @@ def test_conditional_backend_capabilities_are_not_advertised_unconditionally() -
     assert priority.classification is CapabilityClassification.CONDITIONAL
     assert priority.backend_requirement is not None
     assert priority.advertised_by_default is False
+    assert priority.release_gate_ready is False
+
+
+def test_unproven_runtime_capabilities_are_not_core_release_claims() -> None:
+    unproven = {entry.token: entry for entry in RUNTIME_CAPABILITY_LEDGER if not entry.release_gate_ready}
+
+    assert unproven
+    assert all(entry.classification is not CapabilityClassification.CORE for entry in unproven.values())
+
+
+def test_runtime_advertisement_excludes_unimplemented_claims() -> None:
+    advertised = supported_runtime_capabilities(supports_runtime_priority=True)
+
+    assert advertised.isdisjoint(
+        {
+            "control.budget_update",
+            "control.route_execution_hint",
+            "object.lifecycle",
+            "cache.reference",
+        }
+    )
 
 
 def test_profile_capability_ledger_has_evidence_for_every_release_claim() -> None:

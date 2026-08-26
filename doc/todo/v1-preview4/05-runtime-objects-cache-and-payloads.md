@@ -31,7 +31,7 @@
   with the frozen miss reason on failure.
 - [ ] Apply `CACHE_INVALIDATE` to adapter-owned references and active dependent operations.
 - [x] Keep NNRP object/cache identity separate from vLLM KV-cache internals.
-- [ ] Advertise KV/prefix-cache integration only after the selected vLLM binding supplies a real,
+- [x] Advertise KV/prefix-cache integration only after the selected vLLM binding supplies a real,
   tested identity and invalidation mapping.
 - [ ] Test lease expiry, version mismatch, schema mismatch, permission denial, producer loss, and
   invalidation races.

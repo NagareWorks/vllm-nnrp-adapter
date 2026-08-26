@@ -60,6 +60,7 @@ class RuntimeCapabilityEvidence:
         return all(
             (
                 self.has_runtime_mechanism,
+                self.benchmark_metric,
                 self.acceptance_threshold,
                 self.independent_scenario,
                 self.evidence_artifact,
@@ -188,6 +189,8 @@ RUNTIME_CAPABILITY_LEDGER = (
         observable_effect="Backend generation stops and the operation reaches one typed terminal outcome.",
         benchmark_metric="cancellation effect latency and late-result rate",
         acceptance_threshold="late-result rate below 0.1% after accepted cancellation or abort",
+        independent_scenario="wire.control.cancel-abort.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.supersede",
@@ -213,6 +216,8 @@ RUNTIME_CAPABILITY_LEDGER = (
         observable_effect="Expired work emits DEADLINE_EXPIRED and later backend chunks are suppressed.",
         benchmark_metric="wasted GPU seconds and late-result rate",
         acceptance_threshold="late-result rate below 0.1% after accepted expiry",
+        independent_scenario="wire.control.deadline-before-submit.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.progress_partial",
@@ -226,7 +231,7 @@ RUNTIME_CAPABILITY_LEDGER = (
     ),
     RuntimeCapabilityEvidence(
         token="control.credit_backpressure",
-        classification=CapabilityClassification.CORE,
+        classification=CapabilityClassification.CONDITIONAL,
         mechanism="Apply peer credit windows before pulling and emitting backend output.",
         observable_effect="Output pauses at exhausted credit and resumes after CREDIT_UPDATE.",
         benchmark_metric="bounded queue depth, producer overrun, and recovery latency",
@@ -234,7 +239,7 @@ RUNTIME_CAPABILITY_LEDGER = (
     ),
     RuntimeCapabilityEvidence(
         token="control.capability_costs",
-        classification=CapabilityClassification.CORE,
+        classification=CapabilityClassification.CONDITIONAL,
         mechanism="Intersect canonical capability offers with the adapter's mechanism-backed ledger.",
         observable_effect="The peer receives a canonical accepted subset or a typed capability mismatch.",
         benchmark_metric="semantic defect rate",
@@ -247,6 +252,8 @@ RUNTIME_CAPABILITY_LEDGER = (
         observable_effect="Operation observations and supported backend requests retain the same trace identity.",
         benchmark_metric="trace correlation defect rate",
         acceptance_threshold="zero lost or mismatched trace identities on accepted trace updates",
+        independent_scenario="wire.control.cancel-abort.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.result_drop_reason",
@@ -255,6 +262,8 @@ RUNTIME_CAPABILITY_LEDGER = (
         observable_effect="Every implemented stale-result path reports one protocol-visible reason code.",
         benchmark_metric="unexplained-drop and duplicate-terminal rates",
         acceptance_threshold="zero unexplained drops and zero duplicate terminal outcomes",
+        independent_scenario="wire.control.cancel-abort.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.degrade_profile",

@@ -140,6 +140,7 @@ jobs:
           python scripts/run_wire_e2e.py \
             --conformance-root nnrp-conformance \
             --artifact-directory artifacts/wire-e2e
+          python scripts/check_runtime_capability_evidence.py
 
       - name: Build distributions
         run: |

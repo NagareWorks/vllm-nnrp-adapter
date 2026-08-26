@@ -119,6 +119,9 @@ jobs:
             --conformance-root nnrp-conformance \
             --artifact-directory artifacts/wire-e2e
 
+      - name: Validate runtime capability evidence
+        run: python scripts/check_runtime_capability_evidence.py
+
       - name: Upload wire evidence
         if: always()
         uses: actions/upload-artifact@v6

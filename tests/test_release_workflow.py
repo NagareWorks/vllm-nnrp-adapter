@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 RELEASE_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
+CI_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
 
 
 def test_release_is_manual_and_publication_is_opt_in() -> None:
@@ -52,6 +53,19 @@ def test_release_reruns_pinned_api_and_wire_conformance_before_tagging() -> None
     assert "ref: 7ea6e30ab61a76efc9ce9cf2fe6aa93312edda81" in workflow
     assert "python scripts/run_api_profile_conformance.py" in workflow
     assert "python scripts/run_wire_e2e.py" in workflow
+    assert "python scripts/check_runtime_capability_evidence.py" in workflow
     assert "artifacts/api-profile-conformance" in workflow
     assert "artifacts/wire-e2e" in workflow
     assert workflow.index("python scripts/run_wire_e2e.py") < workflow.index("Create git tag")
+    assert workflow.index("python scripts/run_wire_e2e.py") < workflow.index(
+        "python scripts/check_runtime_capability_evidence.py"
+    )
+
+
+def test_ci_validates_capability_evidence_after_wire_e2e() -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "python scripts/check_runtime_capability_evidence.py" in workflow
+    assert workflow.index("python scripts/run_wire_e2e.py") < workflow.index(
+        "python scripts/check_runtime_capability_evidence.py"
+    )

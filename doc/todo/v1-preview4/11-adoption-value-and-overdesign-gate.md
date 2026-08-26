@@ -57,9 +57,9 @@
   mechanism, observable effect, benchmark scenario, metric, threshold, and evidence artifact.
 - [x] Remove a capability from advertisements when its vLLM mechanism is absent, emulated only by a
   mock, or unable to produce the documented effect.
-- [ ] Keep optional or experimental capabilities out of mandatory release gates until their ledger
+- [x] Keep optional or experimental capabilities out of mandatory release gates until their ledger
   entries are complete.
-- [ ] Fail release validation when a core capability lacks mechanism, observation, independent
+- [x] Fail release validation when a core capability lacks mechanism, observation, independent
   scenario, threshold, or reproducible evidence.
 - [ ] Publish one concise adoption report that separates compatibility, operational control,
   resource efficiency, transport efficiency, and protocol overhead.
