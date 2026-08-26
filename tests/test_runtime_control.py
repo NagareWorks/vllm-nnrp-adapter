@@ -232,6 +232,37 @@ async def test_control_registry_terminates_every_bound_operation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_control_registry_invalidates_only_live_object_dependents() -> None:
+    registry = RuntimeControlRegistry()
+
+    async def worker() -> None:
+        await asyncio.Event().wait()
+
+    live_task = asyncio.create_task(worker())
+    completed_task = asyncio.create_task(asyncio.sleep(0))
+    live_slot = registry.register(11)
+    live_slot.bind(live_task)
+    registry.register(12).bind(completed_task)
+    await completed_task
+
+    invalidated = await registry.invalidate_dependencies((11, 12, 99), object_id=33)
+
+    await asyncio.gather(live_task, return_exceptions=True)
+    assert invalidated == (11,)
+    assert live_task.cancelled()
+    assert live_slot.terminal_request == RuntimeControlRequest(
+        kind=RuntimeControlKind.OBJECT_INVALIDATED,
+        operation_id=11,
+        control_sequence=1,
+        reason_code=5,
+        source_role=RuntimeRole.RUNTIME,
+        flags=0,
+        diagnostic=b"runtime_object_33_invalidated",
+    )
+    await registry.clear()
+
+
+@pytest.mark.asyncio
 async def test_supersede_waits_for_replacement_admission_before_cancelling_old_operation() -> None:
     registry = RuntimeControlRegistry()
 

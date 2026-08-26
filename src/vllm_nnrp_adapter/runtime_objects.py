@@ -321,7 +321,8 @@ class RuntimeObjectRegistry:
                         operation_id=operation_id,
                     ),
                 )
-        return affected
+            return affected
+        return ()
 
     def record_cache_reference(
         self,

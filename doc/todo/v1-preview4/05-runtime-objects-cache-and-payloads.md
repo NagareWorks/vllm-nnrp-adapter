@@ -22,7 +22,7 @@
   without changing profile semantics.
 - [ ] Release borrowed or transferred objects on terminal operation state according to the frozen
   ownership and release rules.
-- [ ] Stop and diagnose operations whose referenced object is invalidated mid-flight.
+- [x] Stop and diagnose operations whose referenced object is invalidated mid-flight.
 
 ## Cache References
 

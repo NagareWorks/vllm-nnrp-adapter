@@ -38,7 +38,15 @@ _KNOWN_TRANSPORT_POLICIES = frozenset(
 )
 _KNOWN_TERMINAL_OUTCOMES = frozenset({"cancelled", "completed", "dropped", "failed"})
 _KNOWN_CANCELLATION_KINDS = frozenset(
-    {"abort", "cancel", "deadline_expired", "peer_disconnect", "server_shutdown", "supersede"}
+    {
+        "abort",
+        "cancel",
+        "deadline_expired",
+        "object_invalidated",
+        "peer_disconnect",
+        "server_shutdown",
+        "supersede",
+    }
 )
 _KNOWN_DROP_REASONS = frozenset(
     {

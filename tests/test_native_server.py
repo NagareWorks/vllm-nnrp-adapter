@@ -64,6 +64,8 @@ from nnrp.runtime import (
     NativeRuntimeEvent,
     ObjectDescriptorMetadata,
     ObjectReferenceMetadata,
+    ObjectReleaseMetadata,
+    ObjectReleaseReason,
     OwnershipHint,
     PartialResultMetadata,
     PressureMetadata,
@@ -1934,6 +1936,66 @@ async def test_cache_reference_without_provider_returns_typed_cache_miss(
     assert diagnostic == b"adapter_cache_provider_unavailable"
 
 
+@pytest.mark.asyncio
+async def test_runtime_object_invalidation_stops_live_backend_and_reports_drop(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    stop_event = asyncio.Event()
+    backend = CancellableBackend()
+    operation = FakeOperation(
+        operation_id=901,
+        frame_id=902,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=901),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(submit=operation),
+            FakeServerEvent(runtime=_object_descriptor_event(), wait_for_backend=True),
+            FakeServerEvent(runtime=_object_reference_event(operation.operation_id)),
+            FakeServerEvent(runtime=_object_release_event(operation.operation_id)),
+        ],
+        operation=operation,
+        backend_started=backend.started,
+        stop_event=stop_event,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 1
+    assert backend.closed.is_set()
+    assert backend.close_calls == 1
+    assert operation.terminal_results == []
+    assert len(operation.result_drops) == 1
+    drop, diagnostic = operation.result_drops[0]
+    assert drop.drop_reason_code is ResultDropReasonCode.OBJECT_INVALIDATED
+    assert diagnostic == b"runtime_object_33_invalidated"
+    observation = _observation_records(caplog)[0]
+    assert observation["terminal_outcome"] == "dropped"
+    assert observation["cancellation_kind"] == "object_invalidated"
+    assert observation["cancellation_reason_code"] == 5
+    assert observation["drop_reason"] == "object_invalidated"
+
+
 def _object_descriptor_event() -> NativeRuntimeEvent:
     metadata = ObjectDescriptorMetadata(
         object_id=33,
@@ -1961,6 +2023,23 @@ def _object_reference_event(operation_id: int) -> NativeRuntimeEvent:
         RuntimeFrameHeader(message_type=MessageType.OBJECT_REF, session_id=1, frame_id=802),
         RuntimeEventMetadata(RuntimeEventMetadataKind.OBJECT_REFERENCE, metadata),
         RuntimeEventTail.with_body(b""),
+    )
+
+
+def _object_release_event(operation_id: int) -> NativeRuntimeEvent:
+    diagnostic = b"object_invalidated"
+    metadata = ObjectReleaseMetadata(
+        33,
+        operation_id,
+        ObjectReleaseReason.INVALIDATED,
+        RuntimeRole.CLIENT,
+        0x02,
+        len(diagnostic),
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.OBJECT_RELEASE, session_id=1, frame_id=804),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.OBJECT_RELEASE, metadata),
+        RuntimeEventTail.with_diagnostic(diagnostic),
     )
 
 

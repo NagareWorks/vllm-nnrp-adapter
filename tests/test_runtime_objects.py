@@ -125,10 +125,11 @@ def test_non_final_release_only_retires_the_named_operation_reference() -> None:
     registry.reference(_reference(operation_id=21, object_version=0))
     registry.reference(_reference(operation_id=22, object_version=0))
 
-    registry.release(
+    affected = registry.release(
         ObjectReleaseMetadata(9, 21, ObjectReleaseReason.COMPLETED, RuntimeRole.CLIENT, 0, 0)
     )
 
+    assert affected == ()
     assert registry.references_for_operation(21) == ()
     assert len(registry.references_for_operation(22)) == 1
     assert registry.object_snapshot(9).released is False

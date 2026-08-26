@@ -24,6 +24,7 @@ class RuntimeControlKind(StrEnum):
     SERVER_SHUTDOWN = "server_shutdown"
     DEADLINE_EXPIRED = "deadline_expired"
     SUPERSEDE = "supersede"
+    OBJECT_INVALIDATED = "object_invalidated"
 
 
 class RuntimeControlDisposition(StrEnum):
@@ -336,6 +337,40 @@ class RuntimeControlRegistry:
                 ),
                 terminal=False,
             )
+
+    async def invalidate_dependencies(
+        self,
+        operation_ids: tuple[int, ...],
+        *,
+        object_id: int,
+    ) -> tuple[int, ...]:
+        invalidated: list[int] = []
+        diagnostic = f"runtime_object_{object_id}_invalidated".encode("ascii")
+        for operation_id in operation_ids:
+            slot = self._slots.get(operation_id)
+            task = None if slot is None else slot.task
+            if (
+                slot is None
+                or task is None
+                or task.done()
+                or slot.terminal_request is not None
+            ):
+                continue
+            disposition = await slot.apply(
+                RuntimeControlRequest(
+                    kind=RuntimeControlKind.OBJECT_INVALIDATED,
+                    operation_id=operation_id,
+                    control_sequence=slot.last_control_sequence + 1,
+                    reason_code=5,
+                    source_role=RuntimeRole.RUNTIME,
+                    flags=0,
+                    diagnostic=diagnostic,
+                ),
+                terminal=False,
+            )
+            if disposition is RuntimeControlDisposition.APPLIED:
+                invalidated.append(operation_id)
+        return tuple(invalidated)
 
     async def clear(self) -> None:
         await asyncio.gather(*(slot.complete() for slot in self._slots.values()))

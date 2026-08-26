@@ -581,6 +581,7 @@ async def _serve_session(
                         await _handle_runtime_object_event(
                             runtime_event,
                             runtime_objects=runtime_objects,
+                            controls=controls,
                             session=session,
                             native=native,
                             counters=counters,
@@ -1099,6 +1100,7 @@ async def _handle_runtime_object_event(
     event: NativeRuntimeEvent,
     *,
     runtime_objects: RuntimeObjectRegistry,
+    controls: RuntimeControlRegistry,
     session: NativeRuntimeServerSession,
     native: _NativeCallExecutor,
     counters: _ServeCounters,
@@ -1111,7 +1113,14 @@ async def _handle_runtime_object_event(
         elif message_type is MessageType.OBJECT_REF and isinstance(metadata, ObjectReferenceMetadata):
             runtime_objects.reference(metadata, _runtime_body_tail(event))
         elif message_type is MessageType.OBJECT_RELEASE and isinstance(metadata, ObjectReleaseMetadata):
-            runtime_objects.release(metadata, _runtime_diagnostic_tail(event))
+            affected_operations = runtime_objects.release(
+                metadata,
+                _runtime_diagnostic_tail(event),
+            )
+            await controls.invalidate_dependencies(
+                affected_operations,
+                object_id=metadata.object_id,
+            )
         elif message_type in {MessageType.OBJECT_PATCH, MessageType.OBJECT_DELTA} and isinstance(
             metadata,
             ObjectDeltaMetadata,
@@ -1387,6 +1396,7 @@ async def _finalize_cancelled_operation(
         RuntimeControlKind.ABORT,
         RuntimeControlKind.DEADLINE_EXPIRED,
         RuntimeControlKind.SUPERSEDE,
+        RuntimeControlKind.OBJECT_INVALIDATED,
     }:
         await _send_terminal_trace_context(operation, session=session, native=native)
     if control_request.kind is RuntimeControlKind.CANCEL:
@@ -1404,18 +1414,21 @@ async def _finalize_cancelled_operation(
         RuntimeControlKind.SERVER_SHUTDOWN,
         RuntimeControlKind.DEADLINE_EXPIRED,
         RuntimeControlKind.SUPERSEDE,
+        RuntimeControlKind.OBJECT_INVALIDATED,
     }:
         diagnostic = control_request.diagnostic or {
             RuntimeControlKind.ABORT: b"peer_abort",
             RuntimeControlKind.SERVER_SHUTDOWN: b"server_shutdown",
             RuntimeControlKind.DEADLINE_EXPIRED: b"deadline_expired",
             RuntimeControlKind.SUPERSEDE: b"superseded",
+            RuntimeControlKind.OBJECT_INVALIDATED: b"runtime_object_invalidated",
         }[control_request.kind]
         drop_reason = {
             RuntimeControlKind.ABORT: ResultDropReasonCode.PEER_CANCELLED,
             RuntimeControlKind.SERVER_SHUTDOWN: ResultDropReasonCode.TRANSPORT_CLOSED,
             RuntimeControlKind.DEADLINE_EXPIRED: ResultDropReasonCode.DEADLINE_EXPIRED,
             RuntimeControlKind.SUPERSEDE: ResultDropReasonCode.SUPERSEDED,
+            RuntimeControlKind.OBJECT_INVALIDATED: ResultDropReasonCode.OBJECT_INVALIDATED,
         }[control_request.kind]
         observation.record_control(control_request, drop_reason=drop_reason)
         await operation.send_result_drop(
