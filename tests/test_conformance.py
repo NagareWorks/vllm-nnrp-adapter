@@ -3,10 +3,19 @@ from pathlib import Path
 
 import pytest
 
+from scripts.run_api_profile_conformance import _passed_case_ids
 from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.conformance import MockChatCompletionBackend, load_backend, run_conformance_plan
 
 FIXTURE_PLAN = Path(__file__).parent / "fixtures" / "api-profile-execution-plan.json"
+
+
+@pytest.mark.parametrize("outcome", ["failed", "skipped", None])
+def test_api_profile_release_gate_rejects_every_non_passing_outcome(outcome: object) -> None:
+    report = {"results": [{"id": "openai-compatible.mandatory", "outcome": outcome}]}
+
+    with pytest.raises(RuntimeError, match="API profile case did not pass: openai-compatible.mandatory"):
+        _passed_case_ids(report)
 
 
 def make_backend() -> MockChatCompletionBackend:
