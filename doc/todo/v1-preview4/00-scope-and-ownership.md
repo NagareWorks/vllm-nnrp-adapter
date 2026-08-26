@@ -23,9 +23,9 @@
 - [x] Add a dedicated runtime-control module owned by `04-runtime-control-mapping.md`.
 - [x] Add a dedicated runtime-object/cache module owned by
   `05-runtime-objects-cache-and-payloads.md`.
-- [ ] Assign CLI and provider composition to `embedded.py`, `cli.py`, and a provider-serving module
+- [x] Assign CLI and provider composition to `embedded.py`, `cli.py`, and a provider-serving module
   under `06-transport-provider-serving.md`.
-- [ ] Assign OpenAI envelope/event semantics to `profile.py` and `adapter.py` under
+- [x] Assign OpenAI envelope/event semantics to `profile.py` and `adapter.py` under
   `07-openai-profile-runtime.md`.
 - [x] Add a dedicated observation/export module owned by `08-observability-and-exporters.md`.
 - [ ] Assign manifests, execution-plan handling, and E2E targets to

@@ -544,6 +544,7 @@ class FakeSession:
         stop_event: asyncio.Event,
         *,
         negotiate_progress: bool = False,
+        stop_after_delivery: bool = True,
     ) -> None:
         self.active_transport_name = "ipc"
         self._operation = operation
@@ -551,6 +552,7 @@ class FakeSession:
         self._delivered = False
         self._negotiate_progress = negotiate_progress
         self._progress_negotiation_delivered = False
+        self._stop_after_delivery = stop_after_delivery
         self.partial_results = operation.partial_results
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
@@ -570,7 +572,8 @@ class FakeSession:
         if not self._delivered:
             self._delivered = True
             return (FakeServerEvent(submit=self._operation),)
-        self._stop_event.set()
+        if self._stop_after_delivery:
+            self._stop_event.set()
         return ()
 
     def close(self) -> None:
@@ -1228,8 +1231,14 @@ async def test_native_server_emits_ordered_partial_results_and_one_terminal(
         body=_typed_profile_body(_chat_request()),
         metadata=_submit_metadata(operation_id=71),
         terminal_results=[],
+        on_terminal=stop_event.set,
     )
-    session = FakeSession(operation, stop_event, negotiate_progress=True)
+    session = FakeSession(
+        operation,
+        stop_event,
+        negotiate_progress=True,
+        stop_after_delivery=False,
+    )
     server_context = FakeServerContext(
         FakeServer(
             session,

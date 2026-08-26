@@ -14,7 +14,7 @@ HTTP/SSE endpoint.
 - [ ] [04 - Runtime control mapping](04-runtime-control-mapping.md)
 - [ ] [05 - Runtime objects, cache, and payloads](05-runtime-objects-cache-and-payloads.md)
 - [x] [06 - Transport provider serving](06-transport-provider-serving.md)
-- [ ] [07 - OpenAI profile runtime](07-openai-profile-runtime.md)
+- [x] [07 - OpenAI profile runtime](07-openai-profile-runtime.md)
 - [ ] [08 - Observability and exporters](08-observability-and-exporters.md)
 - [ ] [09 - Conformance and vLLM integration](09-conformance-and-vllm-integration.md)
 - [ ] [10 - Benchmarks, packaging, and docs](10-benchmarks-packaging-and-docs.md)

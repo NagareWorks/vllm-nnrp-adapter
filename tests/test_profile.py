@@ -22,6 +22,13 @@ def test_level1_capability_document_shape() -> None:
     assert document["compatibility_levels"] == [1]
     assert document["operations"][0]["name"] == CHAT_COMPLETIONS_CREATE
     assert document["operations"][0]["cancellation"] is True
+    assert set(document["operations"][0]) == {
+        "name",
+        "streaming",
+        "non_streaming",
+        "tool_calls",
+        "cancellation",
+    }
     assert document["models"] == [{"id": "llama", "owned_by": "adapter"}]
     assert document["extensions"] == [
         {

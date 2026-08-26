@@ -34,7 +34,7 @@
   timeout, cancellation, and backend failure to frozen profile error bodies and NNRP terminal state.
 - [x] Keep application errors distinct from transport, protocol, and adapter-internal failures.
 - [x] Generate the Level 1 capability document from real backend and adapter behavior.
-- [ ] Advertise streaming, non-streaming, cancellation, usage, tool calls, diagnostics, limits, and
+- [x] Advertise streaming, non-streaming, cancellation, usage, tool calls, diagnostics, limits, and
   extensions only when tested.
 - [x] Validate provider-specific extensions as declared, non-critical, and ignorable for the Level 1
   baseline.

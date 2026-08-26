@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Any, Protocol, cast, runtime_checkable
 
+from .capability_ledger import openai_profile_extensions, openai_profile_operation_capabilities
 from .profile import (
     CHAT_COMPLETIONS_CREATE,
     VLLM_DIAGNOSTICS_EXTENSION,
@@ -498,13 +499,15 @@ def _non_negative_index(value: object, *, default: int) -> int:
 
 def _default_capabilities(backend: ChatCompletionBackend) -> OpenAiNnrpCapabilityDocument:
     document = OpenAiNnrpCapabilityDocument.level1()
-    tool_calls = getattr(backend, "supports_tool_calls", False) is True
-    operations = tuple({**operation, "tool_calls": tool_calls} for operation in document.operations)
+    operation_capabilities = openai_profile_operation_capabilities(
+        supports_tool_calls=getattr(backend, "supports_tool_calls", False) is True
+    )
+    operations = tuple({**operation, **operation_capabilities} for operation in document.operations)
     return OpenAiNnrpCapabilityDocument(
         compatibility_levels=document.compatibility_levels,
         operations=operations,
         models=document.models,
-        extensions=document.extensions,
+        extensions=openai_profile_extensions(),
     )
 
 
