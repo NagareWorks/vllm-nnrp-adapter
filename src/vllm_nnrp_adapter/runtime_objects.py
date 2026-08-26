@@ -7,11 +7,22 @@ from nnrp.core import CacheInvalidateMetadata, CacheInvalidateScope  # type: ign
 from nnrp.runtime import (  # type: ignore[import-untyped]
     CacheMissMetadata,
     CacheReferenceMetadata,
+    CacheReuseScope,
+    MemoryLocationHint,
     ObjectDeltaMetadata,
     ObjectDescriptorMetadata,
     ObjectReferenceMetadata,
     ObjectReleaseMetadata,
+    OwnershipHint,
+    RuntimeObjectKind,
+    RuntimeRole,
 )
+
+_RUNTIME_OBJECT_KINDS = frozenset(int(value) for value in RuntimeObjectKind)
+_RUNTIME_ROLES = frozenset(int(value) for value in RuntimeRole)
+_MEMORY_LOCATION_HINTS = frozenset(int(value) for value in MemoryLocationHint)
+_OWNERSHIP_HINTS = frozenset(int(value) for value in OwnershipHint)
+_CACHE_REUSE_SCOPES = frozenset(int(value) for value in CacheReuseScope)
 
 
 class RuntimeObjectFailureCode(IntEnum):
@@ -155,6 +166,51 @@ class RuntimeObjectRegistry:
 
     def declare(self, metadata: ObjectDescriptorMetadata, metadata_body: bytes = b"") -> None:
         body = bytes(metadata_body)
+        self._require_uint(metadata.object_id, 64, "object_id")
+        self._require_registry_value(
+            metadata.object_kind,
+            "object_kind",
+            _RUNTIME_OBJECT_KINDS,
+            private_minimum=0x8000,
+            maximum=0xFFFF,
+            allow_unspecified=False,
+        )
+        self._require_registry_value(
+            metadata.producer_role,
+            "producer_role",
+            _RUNTIME_ROLES,
+            private_minimum=0x80,
+            maximum=0xFF,
+            allow_unspecified=False,
+        )
+        self._require_registry_value(
+            metadata.consumer_role,
+            "consumer_role",
+            _RUNTIME_ROLES,
+            private_minimum=0x80,
+            maximum=0xFF,
+            allow_unspecified=False,
+        )
+        self._require_uint(metadata.session_id, 32, "session_id")
+        self._require_uint(metadata.byte_size, 64, "byte_size")
+        self._require_uint(metadata.compute_cost_units, 32, "compute_cost_units")
+        self._require_registry_value(
+            metadata.memory_location_hint,
+            "memory_location_hint",
+            _MEMORY_LOCATION_HINTS,
+            private_minimum=0x8000,
+            maximum=0xFFFF,
+        )
+        self._require_registry_value(
+            metadata.ownership_hint,
+            "ownership_hint",
+            _OWNERSHIP_HINTS,
+            private_minimum=0x8000,
+            maximum=0xFFFF,
+            allow_unspecified=False,
+        )
+        self._require_uint(metadata.lifetime_hint_ms, 32, "lifetime_hint_ms")
+        self._require_uint(metadata.metadata_bytes, 32, "metadata_bytes")
         self._require_declared_length(metadata.metadata_bytes, body, "object descriptor metadata")
         if metadata.object_id == 0:
             raise RuntimeObjectError(0, "object_id must be non-zero")
@@ -192,6 +248,13 @@ class RuntimeObjectRegistry:
         metadata_body: bytes = b"",
     ) -> RuntimeObjectReference:
         body = bytes(metadata_body)
+        self._require_uint(metadata.object_id, 64, "object_id")
+        self._require_uint(metadata.operation_id, 64, "operation_id")
+        self._require_uint(metadata.object_version, 64, "object_version")
+        self._require_uint(metadata.offset, 64, "offset")
+        self._require_uint(metadata.length, 64, "length")
+        self._require_mask(metadata.flags, 0x0000_0007, "object_reference.flags")
+        self._require_uint(metadata.metadata_bytes, 32, "metadata_bytes")
         self._require_declared_length(metadata.metadata_bytes, body, "object reference metadata")
         if metadata.operation_id == 0:
             raise RuntimeObjectError(
@@ -262,6 +325,13 @@ class RuntimeObjectRegistry:
     ) -> None:
         metadata_bytes = bytes(metadata_body)
         delta_bytes = bytes(delta)
+        self._require_uint(metadata.object_id, 64, "object_id")
+        self._require_uint(metadata.delta_sequence, 64, "delta_sequence")
+        self._require_uint(metadata.region_offset, 64, "region_offset")
+        self._require_uint(metadata.region_bytes, 32, "region_bytes")
+        self._require_uint(metadata.delta_bytes, 32, "delta_bytes")
+        self._require_mask(metadata.flags, 0x0000_0007, "object_delta.flags")
+        self._require_uint(metadata.metadata_bytes, 32, "metadata_bytes")
         self._require_declared_length(metadata.metadata_bytes, metadata_bytes, "object delta metadata")
         self._require_declared_length(metadata.delta_bytes, delta_bytes, "object delta payload")
         entry = self._require_active_object(metadata.object_id)
@@ -330,7 +400,28 @@ class RuntimeObjectRegistry:
         metadata_body: bytes = b"",
     ) -> RuntimeCacheKey:
         body = bytes(metadata_body)
+        self._require_uint(metadata.cache_namespace, 32, "cache_namespace")
+        self._require_uint(metadata.cache_key_hi, 64, "cache_key_hi")
+        self._require_uint(metadata.cache_key_lo, 64, "cache_key_lo")
+        self._require_uint(metadata.profile_id, 16, "profile_id")
+        self._require_registry_value(
+            metadata.reuse_scope,
+            "reuse_scope",
+            _CACHE_REUSE_SCOPES,
+            private_minimum=0x8000,
+            maximum=0xFFFF,
+        )
+        self._require_uint(metadata.lease_id, 64, "lease_id")
+        self._require_uint(metadata.producer_trace_id, 64, "producer_trace_id")
+        self._require_uint(metadata.expiration_hint_ms, 32, "expiration_hint_ms")
+        self._require_uint(metadata.metadata_bytes, 32, "metadata_bytes")
+        self._require_mask(metadata.flags, 0x0000_0003, "cache_reference.flags")
         self._require_declared_length(metadata.metadata_bytes, body, "cache reference metadata")
+        if metadata.flags & 0x0000_0001 and metadata.lease_id == 0:
+            raise RuntimeObjectError(
+                RuntimeObjectFailureCode.CACHE_MISS,
+                "cache reference requires a non-zero lease_id",
+            )
         key = RuntimeCacheKey.from_reference(metadata)
         self._cache[key] = _RuntimeCacheEntry(metadata, body)
         return key
@@ -341,12 +432,38 @@ class RuntimeObjectRegistry:
         *,
         available: bool,
         object_kind: int | None = None,
+        lease_id: int | None = None,
+        lease_live: bool | None = None,
     ) -> None:
         entry = self._cache.get(key)
         if entry is None:
             raise RuntimeObjectError(RuntimeObjectFailureCode.CACHE_MISS, "cache reference is unknown")
+        if type(available) is not bool:
+            raise ValueError("available must be a boolean")
         if object_kind is not None and (type(object_kind) is not int or not 0 <= object_kind <= 0xFFFF_FFFF):
             raise ValueError("object_kind must be an unsigned 32-bit integer")
+        if lease_id is not None:
+            self._require_uint(lease_id, 64, "lease_id")
+        if lease_live is not None and type(lease_live) is not bool:
+            raise ValueError("lease_live must be a boolean or None")
+        if available:
+            expected_lease_id = entry.metadata.lease_id
+            lease_required = bool(entry.metadata.flags & 0x0000_0001)
+            if lease_required and (lease_id != expected_lease_id or lease_live is not True):
+                raise RuntimeObjectError(
+                    RuntimeObjectFailureCode.LEASE_EXPIRED,
+                    "cache provider did not confirm the required live lease",
+                )
+            if lease_id is not None and expected_lease_id != 0 and lease_id != expected_lease_id:
+                raise RuntimeObjectError(
+                    RuntimeObjectFailureCode.LEASE_EXPIRED,
+                    "cache provider resolved a different lease_id",
+                )
+            if lease_live is False:
+                raise RuntimeObjectError(
+                    RuntimeObjectFailureCode.LEASE_EXPIRED,
+                    "cache provider reported an expired lease",
+                )
         entry.available = available
         entry.object_kind = object_kind
         if available:
@@ -436,6 +553,35 @@ class RuntimeObjectRegistry:
     def _require_declared_length(declared: int, value: bytes, name: str) -> None:
         if declared != len(value):
             raise RuntimeObjectError(0, f"{name} length does not match its declared byte count")
+
+    @staticmethod
+    def _require_uint(value: int, bits: int, name: str) -> None:
+        if type(value) is bool or not isinstance(value, int) or not 0 <= int(value) < 1 << bits:
+            raise RuntimeObjectError(0, f"{name} must be an unsigned {bits}-bit integer")
+
+    @classmethod
+    def _require_mask(cls, value: int, valid_mask: int, name: str) -> None:
+        cls._require_uint(value, 32, name)
+        if value & ~valid_mask:
+            raise RuntimeObjectError(0, f"{name} contains reserved bits")
+
+    @staticmethod
+    def _require_registry_value(
+        value: int,
+        name: str,
+        standard_values: frozenset[int],
+        *,
+        private_minimum: int,
+        maximum: int,
+        allow_unspecified: bool = True,
+    ) -> None:
+        if type(value) is bool or not isinstance(value, int):
+            raise RuntimeObjectError(0, f"{name} must be an integer registry value")
+        numeric = int(value)
+        if not allow_unspecified and numeric == 0:
+            raise RuntimeObjectError(0, f"{name} must not be unspecified")
+        if numeric not in standard_values and not private_minimum <= numeric <= maximum:
+            raise RuntimeObjectError(0, f"{name} uses a reserved registry value")
 
     @staticmethod
     def _require_region(

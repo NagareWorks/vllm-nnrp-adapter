@@ -16,7 +16,7 @@
 
 - [x] Track `OBJECT_DECLARE`, `OBJECT_REF`, `OBJECT_RELEASE`, `OBJECT_PATCH`, and `OBJECT_DELTA` by
   session and operation ownership.
-- [ ] Validate object kind, version, offset, length, memory-location hint, ownership hint, and lease.
+- [x] Validate object kind, version, offset, length, memory-location hint, ownership hint, and lease.
 - [ ] Map supported multimodal object references into vLLM multimodal request inputs.
 - [ ] Map tool-result and document-chunk references into the selected OpenAI-compatible body field
   without changing profile semantics.

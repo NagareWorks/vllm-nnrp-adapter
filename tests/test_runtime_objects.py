@@ -77,6 +77,108 @@ def test_registry_keeps_object_version_explicit_and_validates_regions() -> None:
     assert mismatch.value.code is RuntimeObjectFailureCode.VERSION_MISMATCH
 
 
+def test_object_descriptor_rejects_unspecified_and_reserved_registry_values() -> None:
+    registry = RuntimeObjectRegistry(session_id=7)
+    base = _descriptor()
+
+    invalid_descriptors = (
+        ObjectDescriptorMetadata(
+            base.object_id,
+            RuntimeObjectKind.UNSPECIFIED,
+            base.producer_role,
+            base.consumer_role,
+            base.session_id,
+            base.byte_size,
+            base.compute_cost_units,
+            base.memory_location_hint,
+            base.ownership_hint,
+            base.lifetime_hint_ms,
+            base.metadata_bytes,
+        ),
+        ObjectDescriptorMetadata(
+            base.object_id,
+            base.object_kind,
+            RuntimeRole.UNSPECIFIED,
+            base.consumer_role,
+            base.session_id,
+            base.byte_size,
+            base.compute_cost_units,
+            base.memory_location_hint,
+            base.ownership_hint,
+            base.lifetime_hint_ms,
+            base.metadata_bytes,
+        ),
+        ObjectDescriptorMetadata(
+            base.object_id,
+            base.object_kind,
+            base.producer_role,
+            base.consumer_role,
+            base.session_id,
+            base.byte_size,
+            base.compute_cost_units,
+            0x0007,
+            base.ownership_hint,
+            base.lifetime_hint_ms,
+            base.metadata_bytes,
+        ),
+        ObjectDescriptorMetadata(
+            base.object_id,
+            base.object_kind,
+            base.producer_role,
+            base.consumer_role,
+            base.session_id,
+            base.byte_size,
+            base.compute_cost_units,
+            base.memory_location_hint,
+            OwnershipHint.UNSPECIFIED,
+            base.lifetime_hint_ms,
+            base.metadata_bytes,
+        ),
+    )
+
+    for descriptor in invalid_descriptors:
+        with pytest.raises(RuntimeObjectError):
+            registry.declare(descriptor)
+
+
+def test_object_descriptor_accepts_frozen_private_registry_ranges() -> None:
+    registry = RuntimeObjectRegistry(session_id=7)
+    descriptor = ObjectDescriptorMetadata(
+        9,
+        0x8001,
+        0x80,
+        0x81,
+        7,
+        16,
+        4,
+        0x8002,
+        0x8003,
+        1_000,
+        0,
+    )
+
+    registry.declare(descriptor)
+
+    assert registry.object_snapshot(9).descriptor is descriptor
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        _reference(object_version=-1),
+        _reference(offset=-1, length=1, flags=0x04),
+        _reference(offset=0, length=-1, flags=0x04),
+        _reference(flags=0x08),
+    ],
+)
+def test_object_reference_rejects_out_of_range_fields(reference: ObjectReferenceMetadata) -> None:
+    registry = RuntimeObjectRegistry(session_id=7)
+    registry.declare(_descriptor())
+
+    with pytest.raises(RuntimeObjectError):
+        registry.reference(reference)
+
+
 def test_delta_sequence_is_independent_from_object_version() -> None:
     registry = RuntimeObjectRegistry(session_id=7)
     registry.declare(_descriptor())
@@ -169,6 +271,52 @@ def test_cache_state_is_explicit_and_invalidation_respects_scope() -> None:
     )
     assert invalidated == (first_key,)
     assert registry.cache_snapshot(first_key).available is False
+
+
+def test_required_cache_lease_must_be_present_and_confirmed_by_provider() -> None:
+    registry = RuntimeObjectRegistry(session_id=7)
+    missing_lease = CacheReferenceMetadata(
+        3,
+        11,
+        12,
+        5,
+        CacheReuseScope.SESSION,
+        0,
+        9,
+        100,
+        0,
+        0x01,
+    )
+    with pytest.raises(RuntimeObjectError) as missing:
+        registry.record_cache_reference(missing_lease)
+    assert missing.value.code is RuntimeObjectFailureCode.CACHE_MISS
+
+    reference = CacheReferenceMetadata(
+        3,
+        11,
+        12,
+        5,
+        CacheReuseScope.SESSION,
+        8,
+        9,
+        100,
+        0,
+        0x01,
+    )
+    key = registry.record_cache_reference(reference)
+    with pytest.raises(RuntimeObjectError) as unconfirmed:
+        registry.bind_cache_resolution(key, available=True)
+    assert unconfirmed.value.code is RuntimeObjectFailureCode.LEASE_EXPIRED
+    with pytest.raises(RuntimeObjectError) as mismatched:
+        registry.bind_cache_resolution(key, available=True, lease_id=7, lease_live=True)
+    assert mismatched.value.code is RuntimeObjectFailureCode.LEASE_EXPIRED
+    with pytest.raises(RuntimeObjectError) as expired:
+        registry.bind_cache_resolution(key, available=True, lease_id=8, lease_live=False)
+    assert expired.value.code is RuntimeObjectFailureCode.LEASE_EXPIRED
+
+    registry.bind_cache_resolution(key, available=True, lease_id=8, lease_live=True)
+
+    assert registry.cache_snapshot(key).available is True
 
 
 def test_object_kind_cache_invalidation_only_matches_resolved_kinds() -> None:
