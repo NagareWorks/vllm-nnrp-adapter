@@ -27,6 +27,7 @@ from nnrp import (  # type: ignore[import-untyped]
     parse_native_transport_endpoint,
 )
 from nnrp.core import (  # type: ignore[import-untyped]
+    CacheInvalidateMetadata,
     ErrorCode,
     ErrorScope,
     FrameSubmitMetadata,
@@ -41,8 +42,15 @@ from nnrp.core import (  # type: ignore[import-untyped]
     validate_frame_submit_body,
 )
 from nnrp.runtime import (  # type: ignore[import-untyped]
+    CacheMissMetadata,
+    CacheMissReason,
+    CacheReferenceMetadata,
     CapabilityMetadata,
     NativeRuntimeEvent,
+    ObjectDeltaMetadata,
+    ObjectDescriptorMetadata,
+    ObjectReferenceMetadata,
+    ObjectReleaseMetadata,
     PartialResultMetadata,
     PressureMetadata,
     RecoverableErrorMetadata,
@@ -86,6 +94,7 @@ from .runtime_control import (
     decode_operation_control,
     decode_priority_update,
 )
+from .runtime_objects import RuntimeObjectError, RuntimeObjectFailureCode, RuntimeObjectRegistry
 
 _TERMINAL_EVENT_TYPES = frozenset({"response.completed", "response.error", "response.cancelled"})
 _CAPABILITY_FLAG_HARD_REQUIREMENT = 0x0000_0001
@@ -94,6 +103,18 @@ _OPENAI_COMPATIBLE_PROFILE_ID = 0
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
 _MAX_STRUCTURED_EVENT_BYTES = 32 * 1024 * 1024
 _MAX_STRUCTURED_EVENT_DEPTH = 64
+_RUNTIME_OBJECT_MESSAGE_TYPES = frozenset(
+    {
+        MessageType.OBJECT_DECLARE,
+        MessageType.OBJECT_REF,
+        MessageType.OBJECT_RELEASE,
+        MessageType.OBJECT_PATCH,
+        MessageType.OBJECT_DELTA,
+        MessageType.CACHE_REFERENCE,
+        MessageType.CACHE_MISS,
+        MessageType.CACHE_INVALIDATE,
+    }
+)
 _T = TypeVar("_T")
 
 
@@ -437,6 +458,7 @@ async def _serve_session(
     operations: set[asyncio.Task[None]] = set()
     registry = OperationRegistry()
     controls = RuntimeControlRegistry()
+    runtime_objects: RuntimeObjectRegistry | None = None
     observations_by_frame: dict[
         int,
         tuple[OperationRecord, _OperationObservationTracker, _BackendTraceContextSlot],
@@ -551,6 +573,19 @@ async def _serve_session(
                                 )
                         counters.applied_control_events += 1
                         continue
+                    if runtime_event.header.message_type in _RUNTIME_OBJECT_MESSAGE_TYPES:
+                        runtime_objects = _ensure_runtime_object_registry(
+                            runtime_objects,
+                            runtime_event.header.session_id,
+                        )
+                        await _handle_runtime_object_event(
+                            runtime_event,
+                            runtime_objects=runtime_objects,
+                            session=session,
+                            native=native,
+                            counters=counters,
+                        )
+                        continue
                     await _handle_runtime_control(
                         runtime_event,
                         adapter=adapter,
@@ -561,6 +596,10 @@ async def _serve_session(
                         counters=counters,
                     )
                 continue
+            runtime_objects = _ensure_runtime_object_registry(
+                runtime_objects,
+                operation.submit.header.session_id,
+            )
             if len(operations) >= config.max_operations_per_session:
                 await admission_window.update(len(operations), force=True)
                 await recovery.report(
@@ -633,6 +672,7 @@ async def _serve_session(
                     emit_progress=progress_partial_negotiated,
                     session=session,
                     native=native,
+                    runtime_objects=runtime_objects,
                 )
             )
             control.bind(task)
@@ -672,6 +712,8 @@ async def _serve_session(
             finally:
                 await controls.clear()
                 registry.clear()
+                if runtime_objects is not None:
+                    runtime_objects.clear()
 
 
 async def _handle_capability_negotiation(
@@ -857,6 +899,7 @@ async def _serve_operation(
     emit_progress: bool = True,
     session: NativeRuntimeServerSession | None = None,
     native: _NativeCallExecutor | None = None,
+    runtime_objects: RuntimeObjectRegistry | None = None,
 ) -> None:
     result_sequence = 0
     terminal_sent = False
@@ -869,6 +912,18 @@ async def _serve_operation(
         try:
             await progress.emit(OperationProgressStage.QUEUED)
             await progress.emit(OperationProgressStage.INPUT_RECEIVED)
+            if runtime_objects is not None:
+                failure = runtime_objects.operation_failure(operation.operation_id)
+                if failure is not None:
+                    raise failure
+                unresolved = runtime_objects.unresolved_references_for_operation(operation.operation_id)
+                if unresolved:
+                    raise RuntimeObjectError(
+                        RuntimeObjectFailureCode.CACHE_MISS,
+                        "runtime object payload provider could not resolve the operation references",
+                        object_id=unresolved[0].metadata.object_id,
+                        operation_id=operation.operation_id,
+                    )
             request = _decode_request(operation.submit.metadata.value, operation.submit.tail.body)
             observation.record_request(request)
             request.setdefault("request_id", record.backend_request_id)
@@ -1024,7 +1079,114 @@ async def _serve_operation(
                 if record.is_terminal and not record.resources_released:
                     record.release_resources()
             finally:
+                if runtime_objects is not None:
+                    runtime_objects.retire_operation(operation.operation_id)
                 _emit_operation_observation(observation.finish(record.state), observation_sinks)
+
+
+def _ensure_runtime_object_registry(
+    registry: RuntimeObjectRegistry | None,
+    session_id: int,
+) -> RuntimeObjectRegistry:
+    if registry is None:
+        return RuntimeObjectRegistry(session_id)
+    if registry.session_id != session_id:
+        raise ValueError("native session emitted runtime object state for another session")
+    return registry
+
+
+async def _handle_runtime_object_event(
+    event: NativeRuntimeEvent,
+    *,
+    runtime_objects: RuntimeObjectRegistry,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
+    counters: _ServeCounters,
+) -> None:
+    message_type = event.header.message_type
+    metadata = event.metadata.value
+    try:
+        if message_type is MessageType.OBJECT_DECLARE and isinstance(metadata, ObjectDescriptorMetadata):
+            runtime_objects.declare(metadata, _runtime_body_tail(event))
+        elif message_type is MessageType.OBJECT_REF and isinstance(metadata, ObjectReferenceMetadata):
+            runtime_objects.reference(metadata, _runtime_body_tail(event))
+        elif message_type is MessageType.OBJECT_RELEASE and isinstance(metadata, ObjectReleaseMetadata):
+            runtime_objects.release(metadata, _runtime_diagnostic_tail(event))
+        elif message_type in {MessageType.OBJECT_PATCH, MessageType.OBJECT_DELTA} and isinstance(
+            metadata,
+            ObjectDeltaMetadata,
+        ):
+            metadata_body, delta = _runtime_delta_tail(event)
+            runtime_objects.apply_delta(metadata, metadata_body=metadata_body, delta=delta)
+        elif message_type is MessageType.CACHE_REFERENCE and isinstance(metadata, CacheReferenceMetadata):
+            runtime_objects.record_cache_reference(metadata, _runtime_body_tail(event))
+            diagnostic = b"adapter_cache_provider_unavailable"
+            miss = CacheMissMetadata(
+                metadata.cache_namespace,
+                metadata.cache_key_hi,
+                metadata.cache_key_lo,
+                CacheMissReason.NOT_FOUND,
+                metadata.profile_id,
+                len(diagnostic),
+            )
+            await native.call(session.report_cache_miss, miss, diagnostic)
+            runtime_objects.record_cache_miss(miss, diagnostic)
+        elif message_type is MessageType.CACHE_MISS and isinstance(metadata, CacheMissMetadata):
+            runtime_objects.record_cache_miss(metadata, _runtime_diagnostic_tail(event))
+        elif message_type is MessageType.CACHE_INVALIDATE and isinstance(metadata, CacheInvalidateMetadata):
+            _require_runtime_tail(event, RuntimeEventTailKind.NONE)
+            runtime_objects.invalidate_cache(metadata)
+        else:
+            raise RuntimeObjectError(0, f"{message_type.name} carries incompatible runtime object metadata")
+    except RuntimeObjectError as error:
+        runtime_objects.record_operation_failure(error)
+        await _send_runtime_object_error(event, error=error, session=session, native=native)
+        counters.rejected_control_events += 1
+        return
+    counters.applied_control_events += 1
+
+
+def _runtime_body_tail(event: NativeRuntimeEvent) -> bytes:
+    _require_runtime_tail(event, RuntimeEventTailKind.BODY)
+    return bytes(event.tail.body)
+
+
+def _runtime_diagnostic_tail(event: NativeRuntimeEvent) -> bytes:
+    _require_runtime_tail(event, RuntimeEventTailKind.DIAGNOSTIC)
+    return bytes(event.tail.diagnostic)
+
+
+def _runtime_delta_tail(event: NativeRuntimeEvent) -> tuple[bytes, bytes]:
+    _require_runtime_tail(event, RuntimeEventTailKind.METADATA_BODY_AND_DELTA)
+    return event.tail.metadata_body, event.tail.delta
+
+
+def _require_runtime_tail(event: NativeRuntimeEvent, kind: RuntimeEventTailKind) -> None:
+    if event.tail.kind is not kind:
+        raise RuntimeObjectError(0, f"{event.header.message_type.name} carries an incompatible runtime tail")
+
+
+async def _send_runtime_object_error(
+    event: NativeRuntimeEvent,
+    *,
+    error: RuntimeObjectError,
+    session: NativeRuntimeServerSession,
+    native: _NativeCallExecutor,
+) -> None:
+    diagnostic = error.diagnostic.encode("utf-8")
+    metadata = RecoverableErrorMetadata(
+        error_code=error.code or ErrorCode.MALFORMED_BODY,
+        error_scope=ErrorScope.FRAME,
+        recovery_action=0,
+        source_role=RuntimeRole.RUNTIME,
+        flags=0,
+        retry_after_ms=0,
+        related_session_id=event.header.session_id,
+        related_frame_id=event.header.frame_id,
+        related_view_id=event.header.view_id,
+        diagnostic_bytes=len(diagnostic),
+    )
+    await native.call(session.send_recoverable_error, metadata, diagnostic)
 
 
 async def _send_observed_partial_result(
@@ -1534,6 +1696,23 @@ def _status_code(event: Mapping[str, Any] | None) -> int:
 
 
 def _runtime_error_event(error: Exception) -> dict[str, Any]:
+    if isinstance(error, RuntimeObjectError):
+        object_error_codes: dict[int, str] = {
+            RuntimeObjectFailureCode.CACHE_MISS: "runtime_object_unavailable",
+            RuntimeObjectFailureCode.LEASE_EXPIRED: "runtime_object_lease_expired",
+            RuntimeObjectFailureCode.VERSION_MISMATCH: "runtime_object_version_mismatch",
+            RuntimeObjectFailureCode.DEPENDENCY_INVALID: "runtime_object_dependency_invalid",
+            RuntimeObjectFailureCode.SCHEMA_MISMATCH: "runtime_object_schema_mismatch",
+        }
+        code = object_error_codes.get(error.code, "invalid_runtime_object")
+        return {
+            "type": "response.error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": code,
+                "message": error.diagnostic,
+            },
+        }
     if isinstance(error, ValueError):
         return {
             "type": "response.error",

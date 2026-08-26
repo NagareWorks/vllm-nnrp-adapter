@@ -54,10 +54,17 @@ from nnrp.native import (
 )
 from nnrp.runtime import (
     BudgetMetadata,
+    CacheMissMetadata,
+    CacheReferenceMetadata,
+    CacheReuseScope,
     CapabilityMetadata,
     ControlRequestMetadata,
     InFlightPolicy,
+    MemoryLocationHint,
     NativeRuntimeEvent,
+    ObjectDescriptorMetadata,
+    ObjectReferenceMetadata,
+    OwnershipHint,
     PartialResultMetadata,
     PressureMetadata,
     ProgressMetadata,
@@ -70,6 +77,7 @@ from nnrp.runtime import (
     RuntimeEventMetadataKind,
     RuntimeEventTail,
     RuntimeFrameHeader,
+    RuntimeObjectKind,
     RuntimeRole,
     SchedulingMetadata,
     SessionCloseMetadata,
@@ -710,6 +718,7 @@ class ScriptedEventSession:
         self.backpressure_updates: list[PressureMetadata] = []
         self.credit_updates: list[PressureMetadata] = []
         self.trace_contexts: list[tuple[TraceContextMetadata, bytes, int | None]] = []
+        self.cache_misses: list[tuple[CacheMissMetadata, bytes]] = []
         self.closed = False
 
     def poll_events(self, *, timeout_ms: int = 0, max_events: int = 1) -> tuple[FakeServerEvent, ...]:
@@ -761,6 +770,9 @@ class ScriptedEventSession:
         operation_id: int | None = None,
     ) -> None:
         self.trace_contexts.append((metadata, body, operation_id))
+
+    def report_cache_miss(self, metadata: CacheMissMetadata, diagnostic: bytes = b"") -> None:
+        self.cache_misses.append((metadata, diagnostic))
 
 
 class FakeServer:
@@ -1826,6 +1838,139 @@ async def test_capability_negotiation_advertises_priority_only_for_supporting_ba
     assert len(session.capability_negotiations) == 1
     _metadata, body = session.capability_negotiations[0]
     assert _decode_capability_body(body) == ("control.priority_update",)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_runtime_object_is_rejected_before_vllm_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    backend = StreamingBackend()
+    operation = FakeOperation(
+        operation_id=901,
+        frame_id=902,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=901),
+        terminal_results=[],
+        on_terminal=stop_event.set,
+    )
+    session = ScriptedEventSession(
+        [
+            FakeServerEvent(runtime=_object_descriptor_event()),
+            FakeServerEvent(runtime=_object_reference_event(operation.operation_id)),
+            FakeServerEvent(submit=operation),
+        ],
+        operation=operation,
+        backend_started=threading.Event(),
+        stop_event=stop_event,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(backend),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert backend.requests == []
+    assert statistics.terminal_results == 1
+    event = _decode_terminal_profile_body(*operation.terminal_results[0])
+    assert event["error"]["code"] == "runtime_object_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_cache_reference_without_provider_returns_typed_cache_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop_event = asyncio.Event()
+    operation = FakeOperation(
+        operation_id=901,
+        frame_id=902,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=901),
+        terminal_results=[],
+    )
+    session = ScriptedEventSession(
+        [FakeServerEvent(runtime=_cache_reference_event())],
+        operation=operation,
+        backend_started=threading.Event(),
+        stop_event=stop_event,
+        stop_after_last_event=True,
+    )
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
+        _listen_with_context(FakeServerContext(MultiSessionFakeServer([session]))),
+    )
+
+    statistics = await serve(
+        OpenAiNnrpAdapter(StreamingBackend()),
+        config=NnrpServerConfig(
+            endpoint="nnrp://runtime.local/vllm",
+            accept_timeout_ms=10,
+            receive_timeout_ms=10,
+            max_active_sessions=1,
+            max_operations_per_session=1,
+            native_worker_count=2,
+        ),
+        stop_event=stop_event,
+    )
+
+    assert statistics.terminal_results == 0
+    assert len(session.cache_misses) == 1
+    miss, diagnostic = session.cache_misses[0]
+    assert miss.cache_namespace == 7
+    assert miss.cache_key_hi == 11
+    assert miss.cache_key_lo == 12
+    assert diagnostic == b"adapter_cache_provider_unavailable"
+
+
+def _object_descriptor_event() -> NativeRuntimeEvent:
+    metadata = ObjectDescriptorMetadata(
+        object_id=33,
+        object_kind=RuntimeObjectKind.IMAGE_TILE,
+        producer_role=RuntimeRole.CLIENT,
+        consumer_role=RuntimeRole.RUNTIME,
+        session_id=1,
+        byte_size=4_096,
+        compute_cost_units=8,
+        memory_location_hint=MemoryLocationHint.HOST_MEMORY,
+        ownership_hint=OwnershipHint.SESSION_OWNED,
+        lifetime_hint_ms=1_000,
+        metadata_bytes=0,
+    )
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.OBJECT_DECLARE, session_id=1, frame_id=801),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.OBJECT_DESCRIPTOR, metadata),
+        RuntimeEventTail.with_body(b""),
+    )
+
+
+def _object_reference_event(operation_id: int) -> NativeRuntimeEvent:
+    metadata = ObjectReferenceMetadata(33, operation_id, 0, 0, 0, 0, 0)
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.OBJECT_REF, session_id=1, frame_id=802),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.OBJECT_REFERENCE, metadata),
+        RuntimeEventTail.with_body(b""),
+    )
+
+
+def _cache_reference_event() -> NativeRuntimeEvent:
+    metadata = CacheReferenceMetadata(7, 11, 12, 3, CacheReuseScope.SESSION, 0, 0, 0, 0, 0)
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(message_type=MessageType.CACHE_REFERENCE, session_id=1, frame_id=803),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.CACHE_REFERENCE, metadata),
+        RuntimeEventTail.with_body(b""),
+    )
 
 
 async def _serve_capability_request(
