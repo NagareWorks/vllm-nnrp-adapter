@@ -924,7 +924,8 @@ async def _serve_operation(
                 record.mark_partial()
                 await progress.emit(OperationProgressStage.PRODUCING_PARTIAL)
                 result_sequence += 1
-                await operation.send_partial_result(
+                await _send_observed_partial_result(
+                    operation,
                     PartialResultMetadata(
                         operation_id=operation.operation_id,
                         result_sequence=result_sequence,
@@ -933,10 +934,11 @@ async def _serve_operation(
                         body_bytes=len(body),
                         flags=0,
                     ),
-                    body,
+                    body=body,
+                    event=event,
+                    observation=observation,
+                    counters=counters,
                 )
-                observation.record_event(event, body_bytes=len(body))
-                counters.partial_results += 1
         except asyncio.CancelledError:
             if not await _finalize_cancelled_operation(
                 operation,
@@ -1025,6 +1027,37 @@ async def _serve_operation(
                 _emit_operation_observation(observation.finish(record.state), observation_sinks)
 
 
+async def _send_observed_partial_result(
+    operation: NativeRuntimeServerOperation,
+    metadata: PartialResultMetadata,
+    *,
+    body: bytes,
+    event: Mapping[str, Any],
+    observation: _OperationObservationTracker,
+    counters: _ServeCounters,
+) -> None:
+    worker = asyncio.create_task(operation.send_partial_result(metadata, body))
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except BaseException:
+            break
+
+    try:
+        worker.result()
+    except BaseException:
+        if cancellation is not None:
+            raise cancellation from None
+        raise
+    observation.record_event(event, body_bytes=len(body))
+    counters.partial_results += 1
+    if cancellation is not None:
+        raise cancellation
+
+
 async def _handle_runtime_control(
     event: NativeRuntimeEvent,
     *,
@@ -1043,6 +1076,14 @@ async def _handle_runtime_control(
         else decode_priority_update(event)
     )
     if request is None and deadline is None and priority is None:
+        operation_id = _runtime_control_operation_id(event)
+        await _send_unsupported_runtime_control(
+            event,
+            operation_id=operation_id,
+            session=session,
+            native=native,
+        )
+        counters.rejected_control_events += 1
         return
     if request is not None:
         operation_id = request.operation_id
@@ -1095,11 +1136,12 @@ async def _handle_runtime_control(
                 else RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE
             )
         if disposition is RuntimeControlDisposition.UNSUPPORTED_LIVE_UPDATE:
-            await _send_unsupported_priority_update(
+            await _send_unsupported_runtime_control(
                 event,
                 operation_id=operation_id,
                 session=session,
                 native=native,
+                diagnostic=b"live_priority_update_unsupported",
             )
     if disposition is RuntimeControlDisposition.APPLIED:
         counters.applied_control_events += 1
@@ -1107,14 +1149,21 @@ async def _handle_runtime_control(
         counters.rejected_control_events += 1
 
 
-async def _send_unsupported_priority_update(
+def _runtime_control_operation_id(event: NativeRuntimeEvent) -> int:
+    operation_id = getattr(event.metadata.value, "operation_id", 0)
+    return operation_id if type(operation_id) is int and operation_id >= 0 else 0
+
+
+async def _send_unsupported_runtime_control(
     event: NativeRuntimeEvent,
     *,
     operation_id: int,
     session: NativeRuntimeServerSession,
     native: _NativeCallExecutor,
+    diagnostic: bytes | None = None,
 ) -> None:
-    diagnostic = b"live_priority_update_unsupported"
+    if diagnostic is None:
+        diagnostic = f"{event.header.message_type.name.lower()}_unsupported".encode("ascii")
     metadata = RecoverableErrorMetadata(
         error_code=ErrorCode.UNSUPPORTED_CAPABILITY,
         error_scope=ErrorScope.FRAME,
@@ -1123,7 +1172,7 @@ async def _send_unsupported_priority_update(
         flags=0,
         retry_after_ms=0,
         related_session_id=event.header.session_id,
-        related_frame_id=operation_id & 0xFFFF_FFFF,
+        related_frame_id=(operation_id or event.header.frame_id) & 0xFFFF_FFFF,
         related_view_id=event.header.view_id,
         diagnostic_bytes=len(diagnostic),
     )

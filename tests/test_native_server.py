@@ -53,6 +53,7 @@ from nnrp.native import (
     NativeStatus,
 )
 from nnrp.runtime import (
+    BudgetMetadata,
     CapabilityMetadata,
     ControlRequestMetadata,
     InFlightPolicy,
@@ -64,6 +65,7 @@ from nnrp.runtime import (
     ResultDropReasonCode,
     ResultDropReasonMetadata,
     RetryAfterMetadata,
+    RouteHintMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
@@ -90,6 +92,7 @@ from vllm_nnrp_adapter.nnrp_runtime import (
     _decode_request,
     _decode_structured_event,
     _finalize_cancelled_operation,
+    _handle_runtime_control,
     _native_handle_identity,
     _NativeCallExecutor,
     _OperationObservationTracker,
@@ -106,6 +109,7 @@ from vllm_nnrp_adapter.runtime_control import (
     OperationControlSlot,
     RuntimeControlDisposition,
     RuntimeControlKind,
+    RuntimeControlRegistry,
     RuntimeControlRequest,
     RuntimePriorityUpdate,
 )
@@ -150,6 +154,85 @@ def test_native_submit_decode_applies_structured_event_depth_limit() -> None:
 
     with pytest.raises(ValueError, match="64-level nesting limit"):
         _decode_request(_submit_metadata(operation_id=1), _typed_profile_body(request))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "diagnostic"),
+    (
+        (
+            NativeRuntimeEvent(
+                RuntimeFrameHeader(message_type=MessageType.BUDGET_UPDATE, session_id=7, frame_id=9),
+                RuntimeEventMetadata(
+                    RuntimeEventMetadataKind.BUDGET,
+                    BudgetMetadata(41, 0, 0, 0, 64, 1),
+                ),
+                RuntimeEventTail.none(),
+            ),
+            b"budget_update_unsupported",
+        ),
+        (
+            NativeRuntimeEvent(
+                RuntimeFrameHeader(message_type=MessageType.ROUTE_HINT, session_id=7, frame_id=9),
+                RuntimeEventMetadata(
+                    RuntimeEventMetadataKind.ROUTE_HINT,
+                    RouteHintMetadata(41, 3, 7, 3, 0, 0, 1),
+                ),
+                RuntimeEventTail.none(),
+            ),
+            b"route_hint_unsupported",
+        ),
+        (
+            NativeRuntimeEvent(
+                RuntimeFrameHeader(message_type=MessageType.EXECUTION_HINT, session_id=7, frame_id=9),
+                RuntimeEventMetadata(
+                    RuntimeEventMetadataKind.ROUTE_HINT,
+                    RouteHintMetadata(41, 0, 7, 0, 0, 0, 1),
+                ),
+                RuntimeEventTail.none(),
+            ),
+            b"execution_hint_unsupported",
+        ),
+    ),
+)
+async def test_unsupported_runtime_control_returns_typed_error(
+    event: NativeRuntimeEvent,
+    diagnostic: bytes,
+) -> None:
+    operation = FakeOperation(
+        operation_id=41,
+        frame_id=9,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=41),
+        terminal_results=[],
+    )
+    session = FakeSession(operation, asyncio.Event())
+    native = _NativeCallExecutor(1)
+    counters = _ServeCounters()
+    try:
+        await _handle_runtime_control(
+            event,
+            adapter=OpenAiNnrpAdapter(StreamingBackend()),
+            session=session,  # type: ignore[arg-type]
+            native=native,
+            registry=OperationRegistry(),
+            controls=RuntimeControlRegistry(),
+            counters=counters,
+        )
+    finally:
+        native.close()
+
+    assert counters.applied_control_events == 0
+    assert counters.rejected_control_events == 1
+    assert len(session.recoverable_errors) == 1
+    metadata, body = session.recoverable_errors[0]
+    assert metadata.error_code is ErrorCode.UNSUPPORTED_CAPABILITY
+    assert metadata.error_scope is ErrorScope.FRAME
+    assert metadata.related_session_id == 7
+    assert metadata.related_frame_id == 41
+    assert metadata.related_view_id == 0
+    assert metadata.diagnostic_bytes == len(diagnostic)
+    assert body == diagnostic
 
 
 class StreamingBackend:
@@ -1502,6 +1585,71 @@ async def test_terminal_send_cancellation_before_write_preserves_disconnect_drop
     assert counters.terminal_results == 0
     assert operation.terminal_results == []
     assert operation.result_drops == []
+
+
+@pytest.mark.asyncio
+async def test_partial_send_cancellation_after_write_preserves_output_observation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _capture_observations(caplog)
+    operation = FakeOperation(
+        operation_id=73,
+        frame_id=21,
+        body=_typed_profile_body(_chat_request()),
+        metadata=_submit_metadata(operation_id=73),
+        terminal_results=[],
+    )
+    registry = OperationRegistry()
+    record = registry.register(operation.operation_id, "request-73")
+    record.transition(OperationState.QUEUED)
+    control = OperationControlSlot(operation.operation_id)
+    control.terminal_request = RuntimeControlRequest(
+        kind=RuntimeControlKind.CANCEL,
+        operation_id=operation.operation_id,
+        control_sequence=1,
+        reason_code=1,
+        source_role=RuntimeRole.CLIENT,
+        flags=0,
+        diagnostic=b"cancelled",
+    )
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="tcp",
+        active_profile_id=0,
+        backend_family="StreamingBackend",
+        backend_binding=None,
+        vllm_version=None,
+    )
+    counters = _ServeCounters()
+    serving_task: asyncio.Task[None] | None = None
+
+    def cancel_after_write(active: bool) -> None:
+        if not active:
+            assert serving_task is not None
+            serving_task.cancel()
+
+    operation.partial_send_observer = cancel_after_write
+    with caplog.at_level(logging.INFO, logger="vllm_nnrp_adapter.operations"):
+        serving_task = asyncio.create_task(
+            _serve_operation(
+                OpenAiNnrpAdapter(StreamingBackend()),
+                operation,
+                record=record,
+                control=control,
+                observation=observation,
+                observation_sinks=(StructuredLogObservationSink(),),
+                counters=counters,
+            )
+        )
+        await serving_task
+
+    assert record.state is OperationState.CANCELLED
+    assert len(operation.partial_results) == 1
+    assert counters.partial_results == 1
+    emitted = _observation_records(caplog)[0]
+    assert emitted["terminal_outcome"] == "cancelled"
+    assert emitted["output_event_count"] == 1
+    assert len(operation.result_drops) == 1
 
 
 @pytest.mark.asyncio
@@ -2869,6 +3017,14 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
 ) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    terminal_count = 0
+
+    def operation_terminal() -> None:
+        nonlocal terminal_count
+        terminal_count += 1
+        if terminal_count == 2:
+            loop.call_soon_threadsafe(stop_event.set)
+
     operations = [
         FakeOperation(
             operation_id=91,
@@ -2876,18 +3032,11 @@ async def test_native_server_rejects_duplicate_operation_without_corrupting_orig
             body=_typed_profile_body(_chat_request()),
             metadata=_submit_metadata(operation_id=91),
             terminal_results=[],
+            on_terminal=operation_terminal,
         )
         for frame_id in (191, 192)
     ]
-    received = 0
-
-    def operation_received() -> None:
-        nonlocal received
-        received += 1
-        if received == len(operations):
-            loop.call_soon_threadsafe(stop_event.set)
-
-    session = MultiOperationFakeSession(operations, operation_accepted=operation_received)
+    session = MultiOperationFakeSession(operations, operation_accepted=lambda: None)
     server_context = FakeServerContext(MultiSessionFakeServer([session]))
     monkeypatch.setattr(
         "vllm_nnrp_adapter.nnrp_runtime.listen_native_server",
