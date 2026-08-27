@@ -11,7 +11,9 @@
   native event delivery; native poll-to-admission and backend result-push boundaries remain required
   before this item is complete.
 - [ ] Measure queue pressure, backpressure response, credit recovery, stale-result suppression, and
-  object-reference overhead.
+  object-reference overhead. Backpressure application, output-credit reservation, and blocked
+  producer recovery after `CREDIT_UPDATE` are measured; stale-result suppression and object-reference
+  overhead remain.
 - [ ] Re-run the 4K, 8K, 16K, and 20K prompt matrix at concurrency 1, 2, and 4.
 - [ ] Compare direct NNRP and OpenAI HTTP/SSE on the same model, engine, GPU, arrival schedule,
   cancellation schedule, prompt, output limit, warmup, and concurrency.

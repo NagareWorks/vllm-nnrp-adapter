@@ -17,6 +17,7 @@ from nnrp.core import MessageType  # type: ignore[import-untyped]
 from nnrp.runtime import (  # type: ignore[import-untyped]
     ControlRequestMetadata,
     NativeRuntimeEvent,
+    PressureMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
@@ -27,6 +28,7 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
 
 from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter, map_openai_stream_chunk
 from .conformance import load_backend_async
+from .pressure import OutboundCreditController
 from .profile import (
     CHAT_COMPLETIONS_CREATE,
     OPENAI_COMPATIBLE_SCHEMA_VERSION,
@@ -228,10 +230,12 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
 
     adapter = OpenAiNnrpAdapter(backend)
     runtime_control_scenarios = await _measure_runtime_control_processing(config)
+    runtime_pressure_scenarios = await _measure_runtime_pressure_processing(config)
     scenarios = [
         _measure_profile_validation(config),
         _measure_profile_event_mapping(config),
         *runtime_control_scenarios,
+        *runtime_pressure_scenarios,
         await _measure_non_streaming_roundtrip(adapter, config),
         await _measure_streaming_event_latency(adapter, config),
         await _measure_cancellation_latency(adapter, config),
@@ -246,6 +250,99 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
+
+
+async def _measure_runtime_pressure_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
+    backpressure = PressureMetadata(
+        scope_id=0,
+        credit_window=1,
+        pressure_level=1,
+        pressure_reason=0,
+        retry_after_ms=0,
+        flags=0,
+    )
+    credit = PressureMetadata(
+        scope_id=0,
+        credit_window=1,
+        pressure_level=0,
+        pressure_reason=0,
+        retry_after_ms=0,
+        flags=0,
+    )
+
+    controller = OutboundCreditController()
+    for _ in range(config.warmup):
+        await controller.apply(MessageType.BACKPRESSURE, backpressure)
+    apply_samples: list[float] = []
+    for _ in range(config.iterations):
+        started = time.perf_counter_ns()
+        await controller.apply(MessageType.BACKPRESSURE, backpressure)
+        apply_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+
+    reservation_samples: list[float] = []
+    for _ in range(config.warmup):
+        await controller.apply(MessageType.CREDIT_UPDATE, credit)
+        await controller.reserve(1)
+    for _ in range(config.iterations):
+        await controller.apply(MessageType.CREDIT_UPDATE, credit)
+        started = time.perf_counter_ns()
+        await controller.reserve(1)
+        reservation_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+    await controller.close()
+
+    for _ in range(config.warmup):
+        await _measure_credit_recovery_once()
+    recovery_samples = [await _measure_credit_recovery_once() for _ in range(config.iterations)]
+
+    return [
+        _latency_scenario(
+            "runtime_pressure.backpressure_apply_after_native_delivery",
+            apply_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "runtime_pressure.credit_reservation",
+            reservation_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "runtime_pressure.credit_recovery_after_native_delivery",
+            recovery_samples,
+            event_count=config.iterations,
+        ),
+    ]
+
+
+async def _measure_credit_recovery_once() -> float:
+    controller = OutboundCreditController()
+    paused = PressureMetadata(
+        scope_id=0,
+        credit_window=0,
+        pressure_level=0,
+        pressure_reason=0,
+        retry_after_ms=0,
+        flags=0,
+    )
+    resumed = PressureMetadata(
+        scope_id=0,
+        credit_window=1,
+        pressure_level=0,
+        pressure_reason=0,
+        retry_after_ms=0,
+        flags=0,
+    )
+    await controller.apply(MessageType.CREDIT_UPDATE, paused)
+    waiter = asyncio.create_task(controller.reserve(1))
+    await asyncio.sleep(0)
+    if waiter.done():
+        raise RuntimeError("zero-credit benchmark reservation did not block")
+
+    started = time.perf_counter_ns()
+    await controller.apply(MessageType.CREDIT_UPDATE, resumed)
+    await waiter
+    elapsed_us = _elapsed_us(started, time.perf_counter_ns())
+    await controller.close()
+    return elapsed_us
 
 
 async def _measure_runtime_control_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
