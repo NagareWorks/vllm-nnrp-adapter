@@ -50,7 +50,7 @@ def test_release_requires_preview4_todo_closure_before_validation() -> None:
 def test_release_reruns_pinned_api_and_wire_conformance_before_tagging() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 
-    assert "ref: 642ad7026158c5c50aaaf51ca650e53886108c1d" in workflow
+    assert "ref: 092b534e093addf6ac40bae4aa27a2dc28fc5d5b" in workflow
     assert "python scripts/run_api_profile_conformance.py" in workflow
     assert "python scripts/run_wire_e2e.py" in workflow
     assert "python scripts/check_runtime_capability_evidence.py" in workflow

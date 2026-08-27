@@ -57,6 +57,7 @@ def test_capability_evidence_gate_rejects_failed_or_incomplete_results(
     (
         "wire.control.deadline-before-submit.client",
         "wire.control.capability-negotiation.client",
+        "wire.control.credit-backpressure.client",
     ),
 )
 def test_capability_evidence_gate_rejects_missing_independent_scenario(
@@ -92,6 +93,7 @@ def _results() -> list[dict[str, object]]:
             "wire.profile.openai-compatible.level1",
             "wire.control.cancel-abort.client",
             "wire.control.capability-negotiation.client",
+            "wire.control.credit-backpressure.client",
             "wire.control.deadline-before-submit.client",
         )
     ]

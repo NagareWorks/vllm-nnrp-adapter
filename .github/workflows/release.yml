@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: NagareWorks/nnrp-conformance
-          ref: 642ad7026158c5c50aaaf51ca650e53886108c1d
+          ref: 092b534e093addf6ac40bae4aa27a2dc28fc5d5b
           path: nnrp-conformance
 
       - name: Setup Python

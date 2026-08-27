@@ -231,11 +231,13 @@ RUNTIME_CAPABILITY_LEDGER = (
     ),
     RuntimeCapabilityEvidence(
         token="control.credit_backpressure",
-        classification=CapabilityClassification.CONDITIONAL,
+        classification=CapabilityClassification.CORE,
         mechanism="Apply peer credit windows before pulling and emitting backend output.",
         observable_effect="Output pauses at exhausted credit and resumes after CREDIT_UPDATE.",
         benchmark_metric="bounded queue depth, producer overrun, and recovery latency",
         acceptance_threshold="zero output beyond the active credit window and zero producer overruns",
+        independent_scenario="wire.control.credit-backpressure.client",
+        evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(
         token="control.capability_costs",

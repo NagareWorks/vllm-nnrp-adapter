@@ -65,6 +65,7 @@ def test_core_capabilities_expose_thresholds_without_claiming_missing_evidence()
         "payload.typed",
         "control.cancel_abort",
         "control.capability_costs",
+        "control.credit_backpressure",
         "control.deadline_expire",
         "control.progress_partial",
         "control.trace_context",

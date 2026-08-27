@@ -294,6 +294,7 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         "profile.openai-compatible.level1.wire",
         "control.cancel_abort",
         "control.capability_costs",
+        "control.credit_backpressure",
         "control.deadline_expire",
         "control.result_drop_reason",
         "control.trace_context",
