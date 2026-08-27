@@ -16,12 +16,17 @@ from typing import Any
 from nnrp.core import MessageType  # type: ignore[import-untyped]
 from nnrp.runtime import (  # type: ignore[import-untyped]
     ControlRequestMetadata,
+    MemoryLocationHint,
     NativeRuntimeEvent,
+    ObjectDescriptorMetadata,
+    ObjectReferenceMetadata,
+    OwnershipHint,
     PressureMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
     RuntimeEventTail,
     RuntimeFrameHeader,
+    RuntimeObjectKind,
     RuntimeRole,
     SchedulingMetadata,
 )
@@ -42,6 +47,7 @@ from .runtime_control import (
     decode_operation_control,
     decode_priority_update,
 )
+from .runtime_objects import RuntimeObjectRegistry
 
 
 @dataclass(frozen=True)
@@ -231,11 +237,13 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
     adapter = OpenAiNnrpAdapter(backend)
     runtime_control_scenarios = await _measure_runtime_control_processing(config)
     runtime_pressure_scenarios = await _measure_runtime_pressure_processing(config)
+    runtime_object_scenarios = _measure_runtime_object_processing(config)
     scenarios = [
         _measure_profile_validation(config),
         _measure_profile_event_mapping(config),
         *runtime_control_scenarios,
         *runtime_pressure_scenarios,
+        *runtime_object_scenarios,
         await _measure_non_streaming_roundtrip(adapter, config),
         await _measure_streaming_event_latency(adapter, config),
         await _measure_cancellation_latency(adapter, config),
@@ -250,6 +258,83 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
+
+
+def _measure_runtime_object_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
+    descriptor = _benchmark_object_descriptor()
+    for _ in range(config.warmup):
+        registry = RuntimeObjectRegistry(session_id=1)
+        registry.declare(descriptor)
+    declare_samples: list[float] = []
+    for _ in range(config.iterations):
+        registry = RuntimeObjectRegistry(session_id=1)
+        started = time.perf_counter_ns()
+        registry.declare(descriptor)
+        declare_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+
+    reference = _benchmark_object_reference()
+    for _ in range(config.warmup):
+        registry = _benchmark_object_registry()
+        registry.reference(reference)
+    reference_samples: list[float] = []
+    for _ in range(config.iterations):
+        registry = _benchmark_object_registry()
+        started = time.perf_counter_ns()
+        registry.reference(reference)
+        reference_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+
+    for _ in range(config.warmup):
+        registry = _benchmark_object_registry(with_reference=True)
+        registry.bind_reference_resolution(1, 1, current_version=1)
+    resolution_samples: list[float] = []
+    for _ in range(config.iterations):
+        registry = _benchmark_object_registry(with_reference=True)
+        started = time.perf_counter_ns()
+        registry.bind_reference_resolution(1, 1, current_version=1)
+        resolution_samples.append(_elapsed_us(started, time.perf_counter_ns()))
+
+    return [
+        _latency_scenario("runtime_object.declare", declare_samples, event_count=config.iterations),
+        _latency_scenario("runtime_object.reference", reference_samples, event_count=config.iterations),
+        _latency_scenario("runtime_object.resolve_reference", resolution_samples, event_count=config.iterations),
+    ]
+
+
+def _benchmark_object_registry(*, with_reference: bool = False) -> RuntimeObjectRegistry:
+    registry = RuntimeObjectRegistry(session_id=1)
+    registry.declare(_benchmark_object_descriptor())
+    registry.bind_version(1, 1)
+    if with_reference:
+        registry.reference(_benchmark_object_reference())
+    return registry
+
+
+def _benchmark_object_descriptor() -> ObjectDescriptorMetadata:
+    return ObjectDescriptorMetadata(
+        object_id=1,
+        object_kind=RuntimeObjectKind.TENSOR,
+        producer_role=RuntimeRole.CLIENT,
+        consumer_role=RuntimeRole.RUNTIME,
+        session_id=1,
+        byte_size=1_048_576,
+        compute_cost_units=1,
+        memory_location_hint=MemoryLocationHint.HOST_MEMORY,
+        ownership_hint=OwnershipHint.SESSION_OWNED,
+        lifetime_hint_ms=1_000,
+        metadata_bytes=0,
+    )
+
+
+def _benchmark_object_reference() -> ObjectReferenceMetadata:
+    return ObjectReferenceMetadata(
+        object_id=1,
+        operation_id=1,
+        object_version=1,
+        offset=0,
+        length=0,
+        flags=0,
+        metadata_bytes=0,
+    )
 
 
 async def _measure_runtime_pressure_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
