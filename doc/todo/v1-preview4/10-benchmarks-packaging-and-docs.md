@@ -8,8 +8,9 @@
 - [ ] Measure native submit-to-admission, backend chunk-to-result, control-frame handling, and
   cancellation-to-abort latency.
   Adapter-side priority, deadline, cancellation dispatch, and registry cleanup are measured after
-  native event delivery; native poll-to-admission and backend result-push boundaries remain required
-  before this item is complete.
+  native event delivery. The production server-operation path also measures submit delivery to
+  backend dispatch and backend chunk to partial-result send with a synthetic native operation;
+  native poll-to-delivery and actual FFI send completion remain required before this item is complete.
 - [ ] Measure queue pressure, backpressure response, credit recovery, stale-result suppression, and
   object-reference overhead. Backpressure application, output-credit reservation, and blocked
   producer recovery after `CREDIT_UPDATE` are measured. Object declaration, reference validation,

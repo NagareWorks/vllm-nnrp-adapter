@@ -338,7 +338,12 @@ def _wait_for_ready(target: subprocess.Popen[str], target_manifest: Path) -> Non
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if target_manifest.is_file():
-            return
+            try:
+                json.loads(target_manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                return
         return_code = target.poll()
         if return_code is not None:
             raise RuntimeError(f"wire target exited before readiness with code {return_code}")

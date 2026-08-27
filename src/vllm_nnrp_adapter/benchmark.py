@@ -8,12 +8,21 @@ import statistics
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from nnrp.core import MessageType  # type: ignore[import-untyped]
+from nnrp import PayloadKind, StreamSemantics  # type: ignore[import-untyped]
+from nnrp.core import (  # type: ignore[import-untyped]
+    FrameSubmitMetadata,
+    InputProfile,
+    MessageType,
+    ResultPushMetadata,
+    build_typed_payload_frame,
+    pack_body,
+    pack_typed_payload_frames,
+)
 from nnrp.runtime import (  # type: ignore[import-untyped]
     ControlRequestMetadata,
     MemoryLocationHint,
@@ -21,6 +30,7 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
     ObjectDescriptorMetadata,
     ObjectReferenceMetadata,
     OwnershipHint,
+    PartialResultMetadata,
     PressureMetadata,
     RuntimeEventMetadata,
     RuntimeEventMetadataKind,
@@ -33,6 +43,9 @@ from nnrp.runtime import (  # type: ignore[import-untyped]
 
 from .adapter import ChatCompletionBackend, OpenAiNnrpAdapter, map_openai_stream_chunk
 from .conformance import load_backend_async
+from .nnrp_runtime import _serve_operation, _ServeCounters
+from .observability import _OperationObservationTracker
+from .operation_state import OperationRecord, OperationState
 from .pressure import OutboundCreditController
 from .profile import (
     CHAT_COMPLETIONS_CREATE,
@@ -41,6 +54,7 @@ from .profile import (
     validate_request,
 )
 from .runtime_control import (
+    OperationControlSlot,
     RuntimeControlDisposition,
     RuntimeControlRegistry,
     decode_deadline_update,
@@ -238,12 +252,14 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
     runtime_control_scenarios = await _measure_runtime_control_processing(config)
     runtime_pressure_scenarios = await _measure_runtime_pressure_processing(config)
     runtime_object_scenarios = _measure_runtime_object_processing(config)
+    native_runtime_scenarios = await _measure_native_runtime_processing(config)
     scenarios = [
         _measure_profile_validation(config),
         _measure_profile_event_mapping(config),
         *runtime_control_scenarios,
         *runtime_pressure_scenarios,
         *runtime_object_scenarios,
+        *native_runtime_scenarios,
         await _measure_non_streaming_roundtrip(adapter, config),
         await _measure_streaming_event_latency(adapter, config),
         await _measure_cancellation_latency(adapter, config),
@@ -258,6 +274,150 @@ async def run_benchmark(*, backend: ChatCompletionBackend, config: BenchmarkConf
         "integration": _integration_metadata(backend, config.model),
         "scenarios": scenarios,
     }
+
+
+async def _measure_native_runtime_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:
+    for _ in range(config.warmup):
+        await _measure_native_runtime_once(config.model)
+
+    admission_samples: list[float] = []
+    result_push_samples: list[float] = []
+    for _ in range(config.iterations):
+        admission_us, result_push_us = await _measure_native_runtime_once(config.model)
+        admission_samples.append(admission_us)
+        result_push_samples.append(result_push_us)
+
+    return [
+        _latency_scenario(
+            "native_runtime.submit_delivery_to_backend_dispatch",
+            admission_samples,
+            event_count=config.iterations,
+        ),
+        _latency_scenario(
+            "native_runtime.backend_chunk_to_partial_result_send",
+            result_push_samples,
+            event_count=config.iterations,
+        ),
+    ]
+
+
+async def _measure_native_runtime_once(model: str) -> tuple[float, float]:
+    operation = _BenchmarkNativeOperation(model)
+    backend = _BenchmarkNativeBackend()
+    record = OperationRecord(operation_id=1, backend_request_id="benchmark-request")
+    record.transition(OperationState.QUEUED)
+    observation = _OperationObservationTracker.from_operation(
+        operation,
+        selected_transport="benchmark",
+        active_profile_id=0,
+        backend_family=type(backend).__name__,
+    )
+
+    started = time.perf_counter_ns()
+    await _serve_operation(
+        OpenAiNnrpAdapter(backend),
+        operation,
+        record=record,
+        control=OperationControlSlot(1),
+        observation=observation,
+        observation_sinks=(),
+        counters=_ServeCounters(),
+        emit_progress=False,
+    )
+    if backend.dispatch_ns is None or backend.chunk_ready_ns is None:
+        raise RuntimeError("native runtime benchmark backend did not dispatch and stream")
+    if operation.first_partial_send_ns is None:
+        raise RuntimeError("native runtime benchmark did not send a partial result")
+    return (
+        _elapsed_us(started, backend.dispatch_ns),
+        _elapsed_us(backend.chunk_ready_ns, operation.first_partial_send_ns),
+    )
+
+
+class _BenchmarkNativeBackend:
+    def __init__(self) -> None:
+        self.dispatch_ns: int | None = None
+        self.chunk_ready_ns: int | None = None
+
+    def create_chat_completion(self, body: Mapping[str, Any]) -> AsyncIterator[Mapping[str, Any]]:
+        self.dispatch_ns = time.perf_counter_ns()
+        model = body.get("model")
+
+        async def chunks() -> AsyncIterator[Mapping[str, Any]]:
+            self.chunk_ready_ns = time.perf_counter_ns()
+            yield {
+                "id": "chatcmpl-benchmark",
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}],
+            }
+
+        return chunks()
+
+
+class _BenchmarkNativeOperation:
+    operation_id = 1
+    frame_id = 1
+
+    def __init__(self, model: str) -> None:
+        self.first_partial_send_ns: int | None = None
+        self.submit = NativeRuntimeEvent(
+            RuntimeFrameHeader(message_type=MessageType.FRAME_SUBMIT, session_id=1, frame_id=1),
+            RuntimeEventMetadata(RuntimeEventMetadataKind.FRAME_SUBMIT, _benchmark_submit_metadata()),
+            RuntimeEventTail.with_body(_benchmark_submit_body(model)),
+        )
+
+    async def send_partial_result(self, metadata: PartialResultMetadata, body: bytes = b"") -> None:
+        del metadata, body
+        if self.first_partial_send_ns is None:
+            self.first_partial_send_ns = time.perf_counter_ns()
+
+    async def send_result(self, metadata: ResultPushMetadata, body: bytes = b"") -> None:
+        del metadata, body
+
+
+def _benchmark_submit_metadata() -> FrameSubmitMetadata:
+    return FrameSubmitMetadata(
+        src_width=0,
+        src_height=0,
+        tile_width=0,
+        tile_height=0,
+        tile_count=0,
+        section_count=0,
+        frame_class=0,
+        input_profile=InputProfile.UNSPECIFIED,
+        tile_index_mode=0,
+        reserved0=0,
+        latency_budget_ms=0,
+        target_fps_x100=0,
+        retry_of_frame=0,
+        tile_base_id=0,
+        camera_bytes=0,
+        tile_index_bytes=0,
+        operation_id=1,
+        payload_kind_bitmap=PayloadKind.STRUCTURED_EVENT,
+        payload_frame_count=1,
+    )
+
+
+def _benchmark_submit_body(model: str) -> bytes:
+    payload = json.dumps(_chat_request(model, stream=True), separators=(",", ":"), sort_keys=True).encode()
+    frame = build_typed_payload_frame(
+        PayloadKind.STRUCTURED_EVENT,
+        payload,
+        profile_id=0,
+        descriptor_flags=0,
+        schema_id=0,
+        schema_version=0,
+        stream_semantics=StreamSemantics.SNAPSHOT,
+    )
+    descriptors, frames = pack_typed_payload_frames((frame,))
+    return cast(
+        bytes,
+        pack_body(
+            typed_payload_descriptor_region=descriptors,
+            typed_payload_frame_region=frames,
+        ),
+    )
 
 
 def _measure_runtime_object_processing(config: BenchmarkConfig) -> list[dict[str, Any]]:

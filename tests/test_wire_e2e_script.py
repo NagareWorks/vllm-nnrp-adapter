@@ -4,6 +4,7 @@ import json
 import socket
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography import x509
@@ -17,6 +18,7 @@ from scripts.run_wire_e2e import (
     _validate_observation_evidence,
     _validate_websocket_upgrade,
     _validate_wire_result_completeness,
+    _wait_for_ready,
     _websocket_endpoint,
     _write_self_signed_certificate,
 )
@@ -292,6 +294,30 @@ def test_websocket_upgrade_and_manifest_endpoint_validation(tmp_path: Path) -> N
     assert _websocket_endpoint(manifest) == "ws://127.0.0.1:7768/nnrp"
     with pytest.raises(RuntimeError, match="invalid Sec-WebSocket-Accept"):
         _validate_websocket_upgrade(response.replace(b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", b"invalid"), key)
+
+
+def test_wire_target_readiness_retries_a_transient_manifest_share_violation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "target.json"
+    manifest.write_text(json.dumps({"wire_conformance": {}}), encoding="utf-8")
+    original_read_text = Path.read_text
+    attempts = 0
+
+    def transient_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("manifest is still held by the writer")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", transient_read_text)
+    monkeypatch.setattr("scripts.run_wire_e2e.time.sleep", lambda _seconds: None)
+
+    _wait_for_ready(SimpleNamespace(poll=lambda: None), manifest)  # type: ignore[arg-type]
+
+    assert attempts == 2
 
 
 def test_websocket_text_probe_requires_a_close_outcome() -> None:

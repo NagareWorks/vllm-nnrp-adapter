@@ -67,6 +67,8 @@ async def test_benchmark_reports_core_latency_scenarios(monkeypatch: pytest.Monk
         "runtime_object.declare",
         "runtime_object.reference",
         "runtime_object.resolve_reference",
+        "native_runtime.submit_delivery_to_backend_dispatch",
+        "native_runtime.backend_chunk_to_partial_result_send",
         "chat.non_streaming.roundtrip",
         "chat.streaming.event_latency",
         "chat.streaming.cancellation_latency",
