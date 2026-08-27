@@ -109,6 +109,7 @@ def test_wire_observation_gate_accepts_profile_and_runtime_control_evidence(tmp_
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -127,6 +128,7 @@ def test_wire_observation_gate_rejects_cancel_without_an_in_flight_partial(tmp_p
         _operation(101, "tcp", "cancelled", cancelled=True, output_event_count=0),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -148,6 +150,7 @@ def test_wire_observation_gate_rejects_cancel_without_backend_abort_acceptance(t
         rejected_cancel,
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -175,6 +178,7 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -203,6 +207,7 @@ def test_wire_observation_gate_accepts_verified_terminal_delivery_disconnect_rac
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -229,6 +234,7 @@ def test_wire_observation_gate_rejects_disconnect_race_without_completed_stage(t
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -313,6 +319,7 @@ def test_wire_observation_gate_accepts_force_tcp_provider_evidence(tmp_path: Pat
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
+        _operation(251, "tcp", "completed"),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
 
@@ -324,6 +331,7 @@ def test_wire_observation_gate_accepts_force_tcp_provider_evidence(tmp_path: Pat
                 (101, "tcp", "cancelled"): 1,
                 (151, "tcp", "completed"): 1,
                 (201, "tcp", "completed"): 1,
+                (251, "tcp", "completed"): 1,
             }
         ),
         expected_policy="force_tcp",

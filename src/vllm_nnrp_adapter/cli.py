@@ -339,6 +339,7 @@ async def _serve_wire_target(
                     "control.capability_costs",
                     "control.credit_backpressure",
                     "control.deadline_expire",
+                    "control.progress_partial",
                     "control.result_drop_reason",
                     "control.trace_context",
                 ],

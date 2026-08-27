@@ -296,6 +296,7 @@ async def test_wire_target_publishes_bound_provider_manifest(monkeypatch: pytest
         "control.capability_costs",
         "control.credit_backpressure",
         "control.deadline_expire",
+        "control.progress_partial",
         "control.result_drop_reason",
         "control.trace_context",
     ]

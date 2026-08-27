@@ -226,7 +226,7 @@ RUNTIME_CAPABILITY_LEDGER = (
         observable_effect="The wire target observes ordered partial frames followed by exactly one terminal result.",
         benchmark_metric="semantic defect rate",
         acceptance_threshold="zero reordered, duplicate, late, or missing profile events",
-        independent_scenario=_WIRE_LEVEL1_SCENARIO,
+        independent_scenario="wire.control.progress-partial.client",
         evidence_artifact=_WIRE_LEVEL1_EVIDENCE,
     ),
     RuntimeCapabilityEvidence(

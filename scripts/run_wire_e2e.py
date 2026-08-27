@@ -32,6 +32,7 @@ _ALL_OPERATIONS = Counter(
         (101, "tcp", "cancelled"): 1,
         (151, "tcp", "completed"): 1,
         (201, "tcp", "completed"): 1,
+        (251, "tcp", "completed"): 1,
         (101, "ipc", "cancelled"): 1,
     }
 )
@@ -41,6 +42,7 @@ _FORCE_TCP_OPERATIONS = Counter(
         (101, "tcp", "cancelled"): 1,
         (151, "tcp", "completed"): 1,
         (201, "tcp", "completed"): 1,
+        (251, "tcp", "completed"): 1,
     }
 )
 _FORCE_WEBSOCKET_OPERATIONS = Counter({(901, "websocket", "completed"): 1})
