@@ -30,6 +30,7 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
                     "control_kind": None,
                     "control_scheduled_at_seconds": None,
                     "control_issued_at_seconds": None,
+                    "control_dispatched": False,
                     "control_accepted": False,
                     "control_accepted_at_seconds": None,
                     "backend_stopped_at_seconds": 1.0 + index,
@@ -55,6 +56,7 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
                     "control_kind": controls[outcome],
                     "control_scheduled_at_seconds": control_scheduled_at,
                     "control_issued_at_seconds": control_scheduled_at,
+                    "control_dispatched": accepted,
                     "control_accepted": accepted,
                     "control_accepted_at_seconds": accepted_at,
                     "backend_stopped_at_seconds": (accepted_at + 0.1) if accepted_at is not None else 9.5 + index,
@@ -183,6 +185,10 @@ def test_overlapping_device_active_time_cannot_be_summed_as_request_gpu_seconds(
         (
             lambda source: source["runs"][1]["samples"][-1].update({"control_accepted_at_seconds": None}),
             "control_accepted_at_seconds is required",
+        ),
+        (
+            lambda source: source["runs"][1]["samples"][-1].update({"control_dispatched": False}),
+            "control_accepted requires control_dispatched",
         ),
         (
             lambda source: source["runs"][2]["samples"][-1].update({"useful_result_weight": 1.0}),

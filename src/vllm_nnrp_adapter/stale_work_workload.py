@@ -45,10 +45,16 @@ class StaleWorkCase:
 @dataclass(frozen=True)
 class StaleWorkResult:
     terminal_outcome: str
-    backend_stopped_after_seconds: float
-    gpu_seconds: float
     useful_result_weight: float
     late_result_count: int
+
+
+@dataclass(frozen=True)
+class StaleWorkAccountingResult:
+    control_accepted: bool
+    control_accepted_after_seconds: float | None
+    backend_stopped_after_seconds: float
+    gpu_seconds: float
 
 
 class StaleWorkOperation(Protocol):
@@ -57,6 +63,40 @@ class StaleWorkOperation(Protocol):
     async def wait(self) -> StaleWorkResult: ...
 
     async def close(self) -> None: ...
+
+
+class StaleWorkAccountingSession(Protocol):
+    def operation_started(self, monotonic_seconds: float) -> None: ...
+
+    async def finish(
+        self,
+        result: StaleWorkResult,
+        *,
+        control_kind: str | None,
+        control_dispatched: bool,
+    ) -> StaleWorkAccountingResult: ...
+
+    async def close(self) -> None: ...
+
+
+class StaleWorkAccountingProbe(Protocol):
+    method: str
+    scope: str
+    source: str
+
+    async def begin_run(
+        self,
+        workload: Mapping[str, object],
+        schedule: Sequence[StaleWorkCase],
+    ) -> None: ...
+
+    async def start_sample(
+        self,
+        baseline: str,
+        case: StaleWorkCase,
+    ) -> StaleWorkAccountingSession: ...
+
+    async def end_run(self) -> None: ...
 
 
 class StaleWorkDriver(Protocol):
@@ -143,10 +183,27 @@ async def load_stale_work_driver_async(spec: str, *, expected_baseline: str) -> 
     return cast(StaleWorkDriver, driver)
 
 
+async def load_stale_work_accounting_probe_async(spec: str) -> StaleWorkAccountingProbe:
+    module_name, separator, factory_name = spec.partition(":")
+    if not separator or not module_name or not factory_name:
+        raise ValueError("stale-work accounting probe spec must be 'module.path:factory_name'")
+
+    module = importlib.import_module(module_name)
+    factory = getattr(module, factory_name)
+    if not callable(factory):
+        raise TypeError(f"stale-work accounting probe factory is not callable: {spec}")
+    probe = factory()
+    if inspect.isawaitable(probe):
+        probe = await probe
+    _validate_accounting_probe(probe, location=spec)
+    return cast(StaleWorkAccountingProbe, probe)
+
+
 async def run_stale_workload(
     workload: object,
     *,
     drivers: Sequence[StaleWorkDriver],
+    accounting_probe: StaleWorkAccountingProbe,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest = normalize_stale_work_manifest(workload)
     installed_adapter_version = _distribution_version("vllm-nnrp-adapter")
@@ -172,12 +229,37 @@ async def run_stale_workload(
             f"missing={missing}, extra={extra}"
         )
 
+    _validate_accounting_probe(accounting_probe, location="accounting_probe")
+    accounting_declaration = cast(Mapping[str, object], manifest["gpu_accounting"])
+    for field in ("method", "scope", "source"):
+        if getattr(accounting_probe, field) != accounting_declaration[field]:
+            raise ValueError(f"accounting_probe.{field} must match workload.gpu_accounting.{field}")
+
     execution_order = list(STALE_WORK_BASELINES)
     random.Random(f"baseline-order:{manifest['random_seed']}").shuffle(execution_order)
-    runs = [
-        await _run_driver(manifest, schedule, drivers_by_baseline[baseline])
-        for baseline in execution_order
-    ]
+    probe_manifest = deepcopy(dict(manifest))
+    try:
+        await accounting_probe.begin_run(probe_manifest, schedule)
+    except Exception as error:
+        raise StaleWorkExecutionError(phase="accounting_begin_run") from error
+    try:
+        runs = [
+            await _run_driver(manifest, schedule, drivers_by_baseline[baseline], accounting_probe)
+            for baseline in execution_order
+        ]
+    except BaseException:
+        try:
+            await accounting_probe.end_run()
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            await accounting_probe.end_run()
+        except Exception as error:
+            raise StaleWorkExecutionError(phase="accounting_end_run") from error
+    if probe_manifest != manifest:
+        raise StaleWorkExecutionError(phase="accounting_manifest_validation")
     evidence = {
         "schema_version": "nnrp-adoption-evidence/v1",
         "workload": manifest,
@@ -201,6 +283,7 @@ async def run_stale_workload_file(
     outcome_output_path: Path,
     *,
     driver_specs: Mapping[str, str],
+    accounting_probe_spec: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     _validate_output_paths(raw_output_path, report_output_path, outcome_output_path)
     try:
@@ -209,7 +292,12 @@ async def run_stale_workload_file(
             await load_stale_work_driver_async(spec, expected_baseline=baseline)
             for baseline, spec in driver_specs.items()
         ]
-        evidence, report = await run_stale_workload(workload, drivers=drivers)
+        accounting_probe = await load_stale_work_accounting_probe_async(accounting_probe_spec)
+        evidence, report = await run_stale_workload(
+            workload,
+            drivers=drivers,
+            accounting_probe=accounting_probe,
+        )
         _write_json(raw_output_path, evidence)
         _write_json(report_output_path, report)
     except Exception as error:
@@ -236,6 +324,7 @@ def run_stale_workload_file_sync(
     outcome_output_path: Path,
     *,
     driver_specs: Mapping[str, str],
+    accounting_probe_spec: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     return asyncio.run(
         run_stale_workload_file(
@@ -244,6 +333,7 @@ def run_stale_workload_file_sync(
             report_output_path,
             outcome_output_path,
             driver_specs=driver_specs,
+            accounting_probe_spec=accounting_probe_spec,
         )
     )
 
@@ -252,6 +342,7 @@ async def _run_driver(
     manifest: Mapping[str, object],
     schedule: Sequence[StaleWorkCase],
     driver: StaleWorkDriver,
+    accounting_probe: StaleWorkAccountingProbe,
 ) -> dict[str, Any]:
     driver_manifest = deepcopy(dict(manifest))
     try:
@@ -267,46 +358,66 @@ async def _run_driver(
         async def execute_case(case: StaleWorkCase) -> dict[str, object]:
             await _sleep_until(run_started_at + case.scheduled_offset_seconds)
             async with semaphore:
-                operation_started_at = time.perf_counter()
                 try:
-                    operation = await driver.start(case)
+                    accounting_session = await accounting_probe.start_sample(driver.baseline, case)
                 except Exception as error:
                     raise StaleWorkExecutionError(
-                        phase="start",
+                        phase="accounting_start_sample",
                         baseline=driver.baseline,
                         sample_id=case.sample_id,
                     ) from error
-
-                _validate_operation(operation, baseline=driver.baseline, sample_id=case.sample_id)
-                result_task = asyncio.create_task(operation.wait())
-                control_scheduled_at = (
-                    operation_started_at - run_started_at + case.control_delay_seconds
-                    if case.is_stale
-                    else None
-                )
-                control_issued_at: float | None = None
-                control_accepted = False
-                control_accepted_at: float | None = None
+                operation_started_at = time.perf_counter()
+                operation: StaleWorkOperation | None = None
+                result_task: asyncio.Task[StaleWorkResult] | None = None
                 try:
+                    _validate_accounting_session(
+                        accounting_session,
+                        baseline=driver.baseline,
+                        sample_id=case.sample_id,
+                    )
+                    try:
+                        accounting_session.operation_started(operation_started_at)
+                    except Exception as error:
+                        raise StaleWorkExecutionError(
+                            phase="accounting_operation_started",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from error
+                    try:
+                        operation = await driver.start(case)
+                    except Exception as error:
+                        raise StaleWorkExecutionError(
+                            phase="start",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from error
+
+                    _validate_operation(operation, baseline=driver.baseline, sample_id=case.sample_id)
+                    result_task = asyncio.create_task(operation.wait())
+                    control_scheduled_at = (
+                        operation_started_at - run_started_at + case.control_delay_seconds
+                        if case.is_stale
+                        else None
+                    )
+                    control_issued_at: float | None = None
+                    control_dispatched = False
                     if case.control_kind is not None:
                         await _sleep_until(operation_started_at + case.control_delay_seconds)
                         control_issued_at = time.perf_counter() - run_started_at
                         try:
-                            control_accepted = await operation.apply_control(case.control_kind)
+                            control_dispatched = await operation.apply_control(case.control_kind)
                         except Exception as error:
                             raise StaleWorkExecutionError(
                                 phase="apply_control",
                                 baseline=driver.baseline,
                                 sample_id=case.sample_id,
                             ) from error
-                        if not isinstance(control_accepted, bool):
+                        if not isinstance(control_dispatched, bool):
                             raise StaleWorkExecutionError(
                                 phase="sample_validation",
                                 baseline=driver.baseline,
                                 sample_id=case.sample_id,
                             )
-                        if control_accepted:
-                            control_accepted_at = time.perf_counter() - run_started_at
                     try:
                         result = await result_task
                     except Exception as error:
@@ -316,26 +427,70 @@ async def _run_driver(
                             sample_id=case.sample_id,
                         ) from error
                     _validate_result(result, baseline=driver.baseline, sample_id=case.sample_id)
+                    try:
+                        accounting = await accounting_session.finish(
+                            result,
+                            control_kind=case.control_kind,
+                            control_dispatched=control_dispatched,
+                        )
+                    except Exception as error:
+                        raise StaleWorkExecutionError(
+                            phase="accounting_finish",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from error
+                    _validate_accounting_result(
+                        accounting,
+                        control_kind=case.control_kind,
+                        control_dispatched=control_dispatched,
+                        baseline=driver.baseline,
+                        sample_id=case.sample_id,
+                    )
                 except BaseException:
-                    if not result_task.done():
+                    if result_task is not None and not result_task.done():
                         result_task.cancel()
                         await asyncio.gather(result_task, return_exceptions=True)
+                    if operation is not None:
+                        try:
+                            await operation.close()
+                        except Exception:
+                            pass
                     try:
-                        await operation.close()
+                        await accounting_session.close()
                     except Exception:
                         pass
                     raise
                 else:
+                    assert operation is not None
+                    operation_close_error: Exception | None = None
                     try:
                         await operation.close()
                     except Exception as error:
+                        operation_close_error = error
+                    accounting_close_error: Exception | None = None
+                    try:
+                        await accounting_session.close()
+                    except Exception as error:
+                        accounting_close_error = error
+                    if operation_close_error is not None:
                         raise StaleWorkExecutionError(
                             phase="close",
                             baseline=driver.baseline,
                             sample_id=case.sample_id,
-                        ) from error
+                        ) from operation_close_error
+                    if accounting_close_error is not None:
+                        raise StaleWorkExecutionError(
+                            phase="accounting_close",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from accounting_close_error
 
                 operation_started_at_seconds = operation_started_at - run_started_at
+                control_accepted_at = (
+                    operation_started_at_seconds + accounting.control_accepted_after_seconds
+                    if accounting.control_accepted_after_seconds is not None
+                    else None
+                )
                 return {
                     "sample_id": case.sample_id,
                     "scheduled_offset_seconds": case.scheduled_offset_seconds,
@@ -344,12 +499,13 @@ async def _run_driver(
                     "control_kind": case.control_kind,
                     "control_scheduled_at_seconds": control_scheduled_at,
                     "control_issued_at_seconds": control_issued_at,
-                    "control_accepted": control_accepted,
+                    "control_dispatched": control_dispatched,
+                    "control_accepted": accounting.control_accepted,
                     "control_accepted_at_seconds": control_accepted_at,
                     "backend_stopped_at_seconds": (
-                        operation_started_at_seconds + result.backend_stopped_after_seconds
+                        operation_started_at_seconds + accounting.backend_stopped_after_seconds
                     ),
-                    "gpu_seconds": result.gpu_seconds,
+                    "gpu_seconds": accounting.gpu_seconds,
                     "useful_result_weight": result.useful_result_weight,
                     "late_result_count": result.late_result_count,
                 }
@@ -415,6 +571,26 @@ def _validate_driver(driver: object, *, expected_baseline: object, location: str
             raise TypeError(f"{location} driver must define callable {method_name}()")
 
 
+def _validate_accounting_probe(probe: object, *, location: str) -> None:
+    for field in ("method", "scope", "source"):
+        value = getattr(probe, field, None)
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"{location} accounting probe must define non-empty {field}")
+    for method_name in ("begin_run", "start_sample", "end_run"):
+        if not callable(getattr(probe, method_name, None)):
+            raise TypeError(f"{location} accounting probe must define callable {method_name}()")
+
+
+def _validate_accounting_session(session: object, *, baseline: str, sample_id: str) -> None:
+    for method_name in ("operation_started", "finish", "close"):
+        if not callable(getattr(session, method_name, None)):
+            raise StaleWorkExecutionError(
+                phase="accounting_session_validation",
+                baseline=baseline,
+                sample_id=sample_id,
+            )
+
+
 def _validate_operation(operation: object, *, baseline: str, sample_id: str) -> None:
     for method_name in ("apply_control", "wait", "close"):
         if not callable(getattr(operation, method_name, None)):
@@ -430,23 +606,71 @@ def _validate_result(result: object, *, baseline: str, sample_id: str) -> None:
         not isinstance(result, StaleWorkResult)
         or not isinstance(result.terminal_outcome, str)
         or not result.terminal_outcome
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-            for value in (
-                result.backend_stopped_after_seconds,
-                result.gpu_seconds,
-                result.useful_result_weight,
-            )
-        )
+        or isinstance(result.useful_result_weight, bool)
+        or not isinstance(result.useful_result_weight, (int, float))
+        or not math.isfinite(result.useful_result_weight)
+        or result.useful_result_weight < 0
         or isinstance(result.late_result_count, bool)
         or not isinstance(result.late_result_count, int)
         or result.late_result_count < 0
     ):
         raise StaleWorkExecutionError(
             phase="sample_validation",
+            baseline=baseline,
+            sample_id=sample_id,
+        )
+
+
+def _validate_accounting_result(
+    accounting: object,
+    *,
+    control_kind: str | None,
+    control_dispatched: bool,
+    baseline: str,
+    sample_id: str,
+) -> None:
+    valid_numbers = (
+        isinstance(accounting, StaleWorkAccountingResult)
+        and all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+            for value in (
+                accounting.backend_stopped_after_seconds,
+                accounting.gpu_seconds,
+            )
+        )
+    )
+    if not valid_numbers:
+        raise StaleWorkExecutionError(
+            phase="accounting_result_validation",
+            baseline=baseline,
+            sample_id=sample_id,
+        )
+    assert isinstance(accounting, StaleWorkAccountingResult)
+    accepted_after = accounting.control_accepted_after_seconds
+    if (
+        not isinstance(accounting.control_accepted, bool)
+        or (
+            accepted_after is not None
+            and (
+                isinstance(accepted_after, bool)
+                or not isinstance(accepted_after, (int, float))
+                or not math.isfinite(accepted_after)
+                or accepted_after < 0
+            )
+        )
+        or accounting.control_accepted != (accepted_after is not None)
+        or (accounting.control_accepted and (control_kind is None or not control_dispatched))
+        or (control_kind is None and control_dispatched)
+        or (
+            accepted_after is not None
+            and accounting.backend_stopped_after_seconds < accepted_after
+        )
+    ):
+        raise StaleWorkExecutionError(
+            phase="accounting_result_validation",
             baseline=baseline,
             sample_id=sample_id,
         )

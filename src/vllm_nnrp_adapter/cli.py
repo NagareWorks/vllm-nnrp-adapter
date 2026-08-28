@@ -113,6 +113,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="BASELINE=MODULE:FACTORY",
         help="Driver factory for one required baseline. Repeat exactly once for each baseline.",
     )
+    stale_workload.add_argument(
+        "--accounting-probe",
+        required=True,
+        metavar="MODULE:FACTORY",
+        help="Server/GPU accounting probe factory used to verify control acceptance and GPU stop timing.",
+    )
 
     server = subcommands.add_parser(
         "serve",
@@ -225,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.report_output,
             args.outcome_output,
             driver_specs=_stale_work_driver_specs(args.driver),
+            accounting_probe_spec=args.accounting_probe,
         )
         return 0
     if args.command == "serve":

@@ -300,8 +300,9 @@ request identifiers. Use public-safe model aliases and environment labels in rep
 The stale-work runner executes raw OpenAI HTTP/SSE, equivalently orchestrated HTTP/SSE, and direct
 NNRP as separate runs in a seeded random order. All three drivers receive the same immutable sample
 ids, arrival offsets, and cancellation, abort, deadline, or supersession schedule. The runner limits
-in-flight requests but does not estimate GPU use: each driver must report GPU seconds from the
-accounting source named in the manifest.
+in-flight requests but does not estimate GPU use. A separate accounting probe must observe
+server-side control acceptance, backend stop timing, and GPU seconds from the accounting source
+named in the manifest.
 
 ```bash
 vllm-nnrp-adapter run-stale-workload \
@@ -311,7 +312,8 @@ vllm-nnrp-adapter run-stale-workload \
   --outcome-output artifacts/stale-work-30-outcome.json \
   --driver raw_openai_http_sse=deployment.benchmarks:make_raw_http_driver \
   --driver orchestrated_http_sse=deployment.benchmarks:make_orchestrated_http_driver \
-  --driver direct_nnrp=deployment.benchmarks:make_direct_nnrp_driver
+  --driver direct_nnrp=deployment.benchmarks:make_direct_nnrp_driver \
+  --accounting-probe deployment.benchmarks:make_cuda_accounting_probe
 ```
 
 The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
@@ -326,11 +328,19 @@ Each zero-argument driver factory returns an object with a canonical `baseline` 
 `begin_run`, `warmup`, `start`, and `end_run` methods. `start` returns a live operation with
 `apply_control`, `wait`, and `close`. The runner owns sample identity, arrival and control timing,
 bounded concurrency, and baseline order. Operations return `StaleWorkResult` with terminal outcome,
-operation-relative backend-stop timing, GPU seconds, useful-result weight, and late-result count;
-they cannot overwrite runner-owned identity or timing evidence. A raw baseline may complete stale
-work when it cannot accept the scheduled control; stale identity still comes from the shared
-schedule. Changed schedules, invalid terminal semantics, and sensitive evidence fail the run before
-either output is published.
+useful-result weight, and late-result count; they cannot overwrite runner-owned identity, timing, or
+GPU evidence. `apply_control` reports only whether the client dispatched the control. It is not a
+server acknowledgement.
+
+The zero-argument accounting-probe factory declares `method`, `scope`, and `source` values that must
+exactly match `gpu_accounting` in the manifest. It creates one accounting session per sample. That
+session receives the runner's monotonic operation-start timestamp and independently reports whether
+the server accepted a dispatched control, when the backend stopped, and attributed GPU seconds.
+Request duration, HTTP disconnect, and successful NNRP frame submission are not accepted as GPU-stop
+proxies. Without this probe the command refuses to run. A raw baseline may complete stale work when
+it cannot dispatch or the server does not accept the scheduled control; stale identity still comes
+from the shared schedule. Changed schedules, invalid terminal semantics, probe declaration drift,
+and sensitive evidence fail the run before either output is published.
 
 The raw and aggregate files are written atomically only after all three baselines validate. The
 outcome file is always written: successful runs record the randomized baseline order and sample

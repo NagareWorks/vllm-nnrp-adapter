@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.stale_work_workload import (
     STALE_WORK_BASELINES,
+    StaleWorkAccountingResult,
     StaleWorkCase,
     StaleWorkResult,
     build_stale_work_schedule,
@@ -144,8 +146,6 @@ class _FakeOperation:
         )
         return StaleWorkResult(
             terminal_outcome=terminal_outcome,
-            backend_stopped_after_seconds=0.05,
-            gpu_seconds=self.driver.stale_gpu_seconds if self.case.is_stale else 0.5,
             useful_result_weight=0.0 if self.case.is_stale else 1.0,
             late_result_count=0,
         )
@@ -176,11 +176,109 @@ def _drivers() -> list[_FakeDriver]:
     ]
 
 
+class _FakeAccountingProbe:
+    method = "cuda_event_attribution"
+    scope = "scheduled_batch"
+    source = "test-cuda-events"
+
+    def __init__(self) -> None:
+        self.started = False
+        self.ended = False
+
+    async def begin_run(
+        self,
+        workload: Mapping[str, object],
+        schedule: Sequence[StaleWorkCase],
+    ) -> None:
+        assert workload["scenario"] == "stale_work"
+        assert len(schedule) == workload["sample_count"]
+        self.started = True
+
+    async def start_sample(self, baseline: str, case: StaleWorkCase) -> _FakeAccountingSession:
+        assert self.started
+        return _FakeAccountingSession(baseline, case)
+
+    async def end_run(self) -> None:
+        self.ended = True
+
+
+class _FakeAccountingSession:
+    def __init__(self, baseline: str, case: StaleWorkCase) -> None:
+        self.baseline = baseline
+        self.case = case
+        self.operation_started_at: float | None = None
+
+    def operation_started(self, monotonic_seconds: float) -> None:
+        self.operation_started_at = monotonic_seconds
+
+    async def finish(
+        self,
+        result: StaleWorkResult,
+        *,
+        control_kind: str | None,
+        control_dispatched: bool,
+    ) -> StaleWorkAccountingResult:
+        assert self.operation_started_at is not None
+        assert control_kind == self.case.control_kind
+        accepted = self.case.is_stale and control_dispatched
+        accepted_after = time.perf_counter() - self.operation_started_at if accepted else None
+        gpu_seconds = (
+            {
+                "raw_openai_http_sse": 0.4,
+                "orchestrated_http_sse": 0.2,
+                "direct_nnrp": 0.1,
+            }[self.baseline]
+            if self.case.is_stale
+            else 0.5
+        )
+        return StaleWorkAccountingResult(
+            control_accepted=accepted,
+            control_accepted_after_seconds=accepted_after,
+            backend_stopped_after_seconds=accepted_after if accepted_after is not None else 0.04,
+            gpu_seconds=gpu_seconds,
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class _InvalidAcceptanceProbe(_FakeAccountingProbe):
+    async def start_sample(self, baseline: str, case: StaleWorkCase) -> _InvalidAcceptanceSession:
+        return _InvalidAcceptanceSession(baseline, case)
+
+
+class _InvalidAcceptanceSession(_FakeAccountingSession):
+    async def finish(
+        self,
+        result: StaleWorkResult,
+        *,
+        control_kind: str | None,
+        control_dispatched: bool,
+    ) -> StaleWorkAccountingResult:
+        accounting = await super().finish(
+            result,
+            control_kind=control_kind,
+            control_dispatched=control_dispatched,
+        )
+        if self.baseline == "raw_openai_http_sse" and self.case.is_stale:
+            return replace(
+                accounting,
+                control_accepted=True,
+                control_accepted_after_seconds=0.01,
+            )
+        return accounting
+
+
 @pytest.mark.asyncio
 async def test_executor_runs_identical_randomized_baselines_with_bounded_concurrency() -> None:
     drivers = _drivers()
+    accounting_probe = _FakeAccountingProbe()
 
-    evidence, report = await run_stale_workload(_executor_manifest(), drivers=drivers)
+    evidence, report = await run_stale_workload(
+        _executor_manifest(),
+        drivers=drivers,
+        accounting_probe=accounting_probe,
+    )
 
     execution_order = [run["baseline"] for run in evidence["runs"]]
     assert execution_order == report["baseline_execution_order"]
@@ -193,6 +291,7 @@ async def test_executor_runs_identical_randomized_baselines_with_bounded_concurr
     assert all(len(driver.warmup_cases) == 2 for driver in drivers)
     assert all(driver.max_active == 2 for driver in drivers)
     assert all(driver.ended for driver in drivers)
+    assert accounting_probe.ended is True
     raw = next(run for run in report["runs"] if run["baseline"] == "raw_openai_http_sse")
     assert raw["stale_sample_count"] == 5
     assert raw["wasted_gpu_seconds"] == pytest.approx(2.0)
@@ -204,11 +303,15 @@ async def test_executor_runs_identical_randomized_baselines_with_bounded_concurr
             if sample["control_kind"] is None:
                 assert sample["control_scheduled_at_seconds"] is None
                 assert sample["control_issued_at_seconds"] is None
+                assert sample["control_dispatched"] is False
             else:
                 assert sample["control_scheduled_at_seconds"] == pytest.approx(
                     sample["operation_started_at_seconds"] + 0.001
                 )
                 assert sample["control_issued_at_seconds"] >= sample["control_scheduled_at_seconds"]
+                assert sample["control_dispatched"] is (
+                    run["baseline"] != "raw_openai_http_sse"
+                )
                 if sample["control_accepted"]:
                     assert sample["control_accepted_at_seconds"] >= sample["control_issued_at_seconds"]
 
@@ -216,7 +319,11 @@ async def test_executor_runs_identical_randomized_baselines_with_bounded_concurr
 @pytest.mark.asyncio
 async def test_executor_requires_exact_driver_set() -> None:
     with pytest.raises(ValueError, match="exactly the three stale-work baselines"):
-        await run_stale_workload(_executor_manifest(), drivers=_drivers()[:2])
+        await run_stale_workload(
+            _executor_manifest(),
+            drivers=_drivers()[:2],
+            accounting_probe=_FakeAccountingProbe(),
+        )
 
 
 @pytest.mark.asyncio
@@ -225,7 +332,38 @@ async def test_executor_requires_manifest_to_name_installed_adapter_version() ->
     manifest["adapter_version"] = "9.9.9"
 
     with pytest.raises(ValueError, match="must match the installed"):
-        await run_stale_workload(manifest, drivers=_drivers())
+        await run_stale_workload(
+            manifest,
+            drivers=_drivers(),
+            accounting_probe=_FakeAccountingProbe(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_executor_requires_accounting_probe_to_match_manifest() -> None:
+    accounting_probe = _FakeAccountingProbe()
+    accounting_probe.source = "different-source"
+
+    with pytest.raises(ValueError, match="accounting_probe.source must match"):
+        await run_stale_workload(
+            _executor_manifest(),
+            drivers=_drivers(),
+            accounting_probe=accounting_probe,
+        )
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_probe_acceptance_without_control_dispatch() -> None:
+    accounting_probe = _InvalidAcceptanceProbe()
+
+    with pytest.raises(RuntimeError, match="accounting_result_validation"):
+        await run_stale_workload(
+            _executor_manifest(),
+            drivers=_drivers(),
+            accounting_probe=accounting_probe,
+        )
+
+    assert accounting_probe.ended is True
 
 
 class _BadSampleDriver(_FakeDriver):
@@ -267,7 +405,11 @@ async def test_executor_rejects_driver_schedule_drift_and_still_ends_run() -> No
     drivers[-1] = bad_driver
 
     with pytest.raises(RuntimeError, match="sample_validation"):
-        await run_stale_workload(_executor_manifest(), drivers=drivers)
+        await run_stale_workload(
+            _executor_manifest(),
+            drivers=drivers,
+            accounting_probe=_FakeAccountingProbe(),
+        )
 
     assert bad_driver.ended is True
 
@@ -278,7 +420,11 @@ async def test_executor_rejects_sensitive_driver_evidence() -> None:
     drivers[-1] = _SensitiveSampleDriver("direct_nnrp", stale_gpu_seconds=0.1)
 
     with pytest.raises(ValueError, match="Windows user path"):
-        await run_stale_workload(_executor_manifest(), drivers=drivers)
+        await run_stale_workload(
+            _executor_manifest(),
+            drivers=drivers,
+            accounting_probe=_FakeAccountingProbe(),
+        )
 
 
 _CLI_DRIVERS: list[_FakeDriver] = []
@@ -308,6 +454,10 @@ def make_bad_direct_driver() -> _FakeDriver:
     return driver
 
 
+def make_accounting_probe() -> _FakeAccountingProbe:
+    return _FakeAccountingProbe()
+
+
 def test_cli_loads_three_driver_factories_and_writes_raw_and_aggregate_evidence(tmp_path: Path) -> None:
     _CLI_DRIVERS.clear()
     manifest_path = tmp_path / "manifest.json"
@@ -333,6 +483,8 @@ def test_cli_loads_three_driver_factories_and_writes_raw_and_aggregate_evidence(
             f"orchestrated_http_sse={__name__}:make_orchestrated_driver",
             "--driver",
             f"direct_nnrp={__name__}:make_direct_driver",
+            "--accounting-probe",
+            f"{__name__}:make_accounting_probe",
         ]
     )
 
@@ -370,6 +522,8 @@ def test_cli_rejects_same_raw_and_report_output(tmp_path: Path) -> None:
                 str(tmp_path / "outcome.json"),
                 "--driver",
                 f"raw_openai_http_sse={__name__}:make_raw_driver",
+                "--accounting-probe",
+                f"{__name__}:make_accounting_probe",
             ]
         )
 
@@ -399,6 +553,8 @@ def test_cli_rejects_invalid_driver_assignment(driver_arg: str, tmp_path: Path) 
                 str(tmp_path / "outcome.json"),
                 "--driver",
                 driver_arg,
+                "--accounting-probe",
+                f"{__name__}:make_accounting_probe",
             ]
         )
 
@@ -429,6 +585,8 @@ def test_cli_persists_safe_failure_outcome_without_partial_evidence(tmp_path: Pa
                 f"orchestrated_http_sse={__name__}:make_orchestrated_driver",
                 "--driver",
                 f"direct_nnrp={__name__}:make_bad_direct_driver",
+                "--accounting-probe",
+                f"{__name__}:make_accounting_probe",
             ]
         )
 

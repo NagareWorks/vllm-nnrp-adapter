@@ -279,6 +279,7 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
     control_kind = sample.get("control_kind")
     if control_kind is not None and control_kind not in _CONTROL_KINDS:
         raise ValueError(f"{location}.control_kind must be null or one of {', '.join(_CONTROL_KINDS)}")
+    control_dispatched = _required_bool(sample, "control_dispatched", location)
     control_accepted = _required_bool(sample, "control_accepted", location)
     scheduled_offset = _required_non_negative_number(sample, "scheduled_offset_seconds", location)
     operation_started_at = _required_non_negative_number(sample, "operation_started_at_seconds", location)
@@ -294,6 +295,7 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
         if (
             control_scheduled_at is not None
             or control_issued_at is not None
+            or control_dispatched
             or control_accepted
             or control_accepted_at is not None
             or late_result_count
@@ -313,6 +315,8 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
         if useful_result_weight != 0:
             raise ValueError(f"{location}.useful_result_weight must be zero for stale work")
         if control_accepted:
+            if not control_dispatched:
+                raise ValueError(f"{location}.control_accepted requires control_dispatched")
             if control_accepted_at is None:
                 raise ValueError(f"{location}.control_accepted_at_seconds is required when control_accepted is true")
             if control_accepted_at < control_issued_at:
@@ -332,6 +336,7 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
         "control_kind": control_kind,
         "control_scheduled_at_seconds": control_scheduled_at,
         "control_issued_at_seconds": control_issued_at,
+        "control_dispatched": control_dispatched,
         "control_accepted": control_accepted,
         "control_accepted_at_seconds": control_accepted_at,
         "backend_stopped_at_seconds": backend_stopped_at,
