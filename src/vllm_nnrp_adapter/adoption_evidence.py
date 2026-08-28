@@ -23,6 +23,18 @@ _CONTROL_BY_OUTCOME = {
     "superseded": "supersede",
 }
 _STALE_WORK_RATIOS = (0.1, 0.3, 0.5)
+_GPU_ACCOUNTING_METHODS = (
+    "device_active_time",
+    "cuda_event_attribution",
+    "request_inference_interval_proxy",
+)
+_GPU_ACCOUNTING_SCOPES = ("dedicated_device", "scheduled_batch", "request")
+_ACCEPTANCE_ELIGIBLE_GPU_ACCOUNTING = frozenset(
+    {
+        ("device_active_time", "dedicated_device"),
+        ("cuda_event_attribution", "scheduled_batch"),
+    }
+)
 
 
 def aggregate_stale_work_evidence_file(input_path: Path, output_path: Path) -> dict[str, Any]:
@@ -69,7 +81,7 @@ def aggregate_stale_work_evidence(source: object) -> dict[str, Any]:
     return report
 
 
-def _workload_manifest(value: object) -> dict[str, Any]:
+def normalize_stale_work_manifest(value: object) -> dict[str, Any]:
     manifest = _mapping(value, "evidence.workload")
     if manifest.get("scenario") != "stale_work":
         raise ValueError("evidence.workload.scenario must be 'stale_work'")
@@ -77,6 +89,7 @@ def _workload_manifest(value: object) -> dict[str, Any]:
     if not any(math.isclose(stale_work_ratio, expected, abs_tol=1e-12) for expected in _STALE_WORK_RATIOS):
         raise ValueError("evidence.workload.stale_work_ratio must be one of 0.1, 0.3, or 0.5")
 
+    max_in_flight = _required_positive_int(manifest, "max_in_flight", "evidence.workload")
     normalized = {
         "scenario": "stale_work",
         "stale_work_ratio": stale_work_ratio,
@@ -84,6 +97,11 @@ def _workload_manifest(value: object) -> dict[str, Any]:
         "engine": _required_string(manifest, "engine", "evidence.workload"),
         "gpu": _required_string(manifest, "gpu", "evidence.workload"),
         "arrival_schedule": _required_string(manifest, "arrival_schedule", "evidence.workload"),
+        "arrival_interval_seconds": _required_non_negative_number(
+            manifest,
+            "arrival_interval_seconds",
+            "evidence.workload",
+        ),
         "cancellation_schedule": _required_string(manifest, "cancellation_schedule", "evidence.workload"),
         "prompt_tokens": _required_positive_int(manifest, "prompt_tokens", "evidence.workload"),
         "max_completion_tokens": _required_positive_int(
@@ -94,9 +112,40 @@ def _workload_manifest(value: object) -> dict[str, Any]:
         "warmup": _required_non_negative_int(manifest, "warmup", "evidence.workload"),
         "random_seed": _required_non_negative_int(manifest, "random_seed", "evidence.workload"),
         "sample_count": _required_positive_int(manifest, "sample_count", "evidence.workload"),
+        "max_in_flight": max_in_flight,
+        "gpu_accounting": _gpu_accounting(manifest.get("gpu_accounting"), max_in_flight=max_in_flight),
     }
     validate_benchmark_evidence(normalized)
     return normalized
+
+
+def _workload_manifest(value: object) -> dict[str, Any]:
+    return normalize_stale_work_manifest(value)
+
+
+def _gpu_accounting(value: object, *, max_in_flight: int) -> dict[str, Any]:
+    accounting = _mapping(value, "evidence.workload.gpu_accounting")
+    method = _required_choice(
+        accounting,
+        "method",
+        _GPU_ACCOUNTING_METHODS,
+        "evidence.workload.gpu_accounting",
+    )
+    scope = _required_choice(
+        accounting,
+        "scope",
+        _GPU_ACCOUNTING_SCOPES,
+        "evidence.workload.gpu_accounting",
+    )
+    acceptance_eligible = (method, scope) in _ACCEPTANCE_ELIGIBLE_GPU_ACCOUNTING
+    if method == "device_active_time" and max_in_flight != 1:
+        acceptance_eligible = False
+    return {
+        "method": method,
+        "scope": scope,
+        "source": _required_string(accounting, "source", "evidence.workload.gpu_accounting"),
+        "acceptance_eligible": acceptance_eligible,
+    }
 
 
 def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *, location: str) -> dict[str, Any]:
@@ -215,6 +264,12 @@ def _acceptance(workload: Mapping[str, object], summaries: Mapping[str, Mapping[
         return {
             "evaluated": False,
             "reason": "Preview4 stale-work acceptance thresholds apply to the 30% workload",
+        }
+    gpu_accounting = cast(Mapping[str, object], workload["gpu_accounting"])
+    if gpu_accounting.get("acceptance_eligible") is not True:
+        return {
+            "evaluated": False,
+            "reason": "GPU accounting is a request interval proxy and cannot evaluate GPU-second thresholds",
         }
 
     raw_wasted = float(summaries["raw_openai_http_sse"]["wasted_gpu_seconds"])

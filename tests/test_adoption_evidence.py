@@ -63,12 +63,19 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
             "engine": "vllm-0.26",
             "gpu": "test-gpu-class",
             "arrival_schedule": "seeded-fixed-interval",
+            "arrival_interval_seconds": 0.01,
             "cancellation_schedule": "seeded-stale-selection",
             "prompt_tokens": 4096,
             "max_completion_tokens": 128,
             "warmup": 2,
             "random_seed": 7,
             "sample_count": sample_count,
+            "max_in_flight": 1,
+            "gpu_accounting": {
+                "method": "device_active_time",
+                "scope": "dedicated_device",
+                "source": "test-device-counter",
+            },
         },
         "runs": [
             run("raw_openai_http_sse", 1.0, accepted=False),
@@ -112,6 +119,33 @@ def test_non_30_percent_workload_preserves_evidence_without_claiming_acceptance(
         "evaluated": False,
         "reason": "Preview4 stale-work acceptance thresholds apply to the 30% workload",
     }
+
+
+def test_request_interval_proxy_cannot_evaluate_gpu_acceptance() -> None:
+    source = _source()
+    source["workload"]["gpu_accounting"] = {
+        "method": "request_inference_interval_proxy",
+        "scope": "request",
+        "source": "vllm-request-stats",
+    }
+
+    report = aggregate_stale_work_evidence(source)
+
+    assert report["workload"]["gpu_accounting"]["acceptance_eligible"] is False
+    assert report["acceptance"] == {
+        "evaluated": False,
+        "reason": "GPU accounting is a request interval proxy and cannot evaluate GPU-second thresholds",
+    }
+
+
+def test_overlapping_device_active_time_cannot_be_summed_as_request_gpu_seconds() -> None:
+    source = _source()
+    source["workload"]["max_in_flight"] = 2
+
+    report = aggregate_stale_work_evidence(source)
+
+    assert report["workload"]["gpu_accounting"]["acceptance_eligible"] is False
+    assert report["acceptance"]["evaluated"] is False
 
 
 @pytest.mark.parametrize(
