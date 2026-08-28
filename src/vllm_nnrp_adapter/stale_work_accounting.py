@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
 from typing import cast
 
+from .adoption_evidence import GPU_ACCOUNTING_METHODS, GPU_ACCOUNTING_SCOPES
 from .stale_work_workload import (
     StaleWorkAccountingResult,
     StaleWorkCase,
@@ -18,8 +19,6 @@ from .stale_work_workload import (
 )
 
 _SCHEMA_VERSION = "nnrp-stale-work-accounting/v1"
-_ACCOUNTING_METHODS = frozenset(("cuda_event_attribution", "gpu_process_sampling", "request_interval_proxy"))
-_ACCOUNTING_SCOPES = frozenset(("dedicated_device", "scheduled_batch", "request"))
 
 
 @dataclass(frozen=True)
@@ -36,10 +35,10 @@ class HttpAccountingProbeConfig:
         parsed = urllib.parse.urlsplit(self.endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("endpoint must be an absolute http:// or https:// URL")
-        if self.method not in _ACCOUNTING_METHODS:
-            raise ValueError(f"method must be one of {', '.join(sorted(_ACCOUNTING_METHODS))}")
-        if self.scope not in _ACCOUNTING_SCOPES:
-            raise ValueError(f"scope must be one of {', '.join(sorted(_ACCOUNTING_SCOPES))}")
+        if self.method not in GPU_ACCOUNTING_METHODS:
+            raise ValueError(f"method must be one of {', '.join(GPU_ACCOUNTING_METHODS)}")
+        if self.scope not in GPU_ACCOUNTING_SCOPES:
+            raise ValueError(f"scope must be one of {', '.join(GPU_ACCOUNTING_SCOPES)}")
         if not isinstance(self.source, str) or not self.source:
             raise ValueError("source must be non-empty")
         if self.api_key is not None and not self.api_key:

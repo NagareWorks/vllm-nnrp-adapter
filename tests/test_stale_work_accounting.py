@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from vllm_nnrp_adapter.adoption_evidence import GPU_ACCOUNTING_METHODS, GPU_ACCOUNTING_SCOPES
 from vllm_nnrp_adapter.stale_work_accounting import (
     HttpAccountingProbeConfig,
     HttpStaleWorkAccountingProbe,
@@ -225,6 +226,20 @@ def test_http_accounting_config_rejects_ambiguous_settings(
     values.update(kwargs)
     with pytest.raises(ValueError, match=message):
         HttpAccountingProbeConfig(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("method", GPU_ACCOUNTING_METHODS)
+@pytest.mark.parametrize("scope", GPU_ACCOUNTING_SCOPES)
+def test_http_accounting_config_uses_manifest_accounting_vocabulary(method: str, scope: str) -> None:
+    config = HttpAccountingProbeConfig(
+        endpoint="https://accounting.example.invalid/v1/stale-work",
+        method=method,
+        scope=scope,
+        source="deployment-accounting",
+    )
+
+    assert config.method == method
+    assert config.scope == scope
 
 
 class _Response:

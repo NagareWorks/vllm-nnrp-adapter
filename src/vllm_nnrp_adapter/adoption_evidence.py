@@ -26,12 +26,12 @@ _CONTROL_BY_OUTCOME = {
 _OUTCOME_BY_CONTROL = {control: outcome for outcome, control in _CONTROL_BY_OUTCOME.items()}
 _CONTROL_KINDS = tuple(_OUTCOME_BY_CONTROL)
 _STALE_WORK_RATIOS = (0.1, 0.3, 0.5)
-_GPU_ACCOUNTING_METHODS = (
+GPU_ACCOUNTING_METHODS = (
     "device_active_time",
     "cuda_event_attribution",
     "request_inference_interval_proxy",
 )
-_GPU_ACCOUNTING_SCOPES = ("dedicated_device", "scheduled_batch", "request")
+GPU_ACCOUNTING_SCOPES = ("dedicated_device", "scheduled_batch", "request")
 _ACCEPTANCE_ELIGIBLE_GPU_ACCOUNTING = frozenset(
     {
         ("device_active_time", "dedicated_device"),
@@ -146,13 +146,13 @@ def _gpu_accounting(value: object, *, max_in_flight: int) -> dict[str, Any]:
     method = _required_choice(
         accounting,
         "method",
-        _GPU_ACCOUNTING_METHODS,
+        GPU_ACCOUNTING_METHODS,
         "evidence.workload.gpu_accounting",
     )
     scope = _required_choice(
         accounting,
         "scope",
-        _GPU_ACCOUNTING_SCOPES,
+        GPU_ACCOUNTING_SCOPES,
         "evidence.workload.gpu_accounting",
     )
     acceptance_eligible = (method, scope) in _ACCEPTANCE_ELIGIBLE_GPU_ACCOUNTING
