@@ -316,6 +316,16 @@ vllm-nnrp-adapter run-stale-workload \
   --accounting-probe deployment.benchmarks:make_cuda_accounting_probe
 ```
 
+The `vllm_nnrp_adapter.stale_work_drivers` module provides `OpenAiHttpSseDriverConfig` and
+`RawOpenAiHttpSseDriver` so the raw baseline does not need a deployment-specific HTTP
+implementation. A zero-argument factory supplies the endpoint, credentials, optional headers,
+timeout, and sample-correlation header from deployment configuration.
+The raw driver sends an OpenAI-compatible streaming chat request and closes the live response for
+every scheduled control. That close is only client cancellation: abort, deadline, and supersession
+are deliberately not reported as equivalent server controls. Use a deployment-owned driver for the
+orchestrated HTTP/SSE baseline because vLLM does not expose one stable, version-independent HTTP
+control endpoint for those semantics.
+
 The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
 or `0.5`, the installed adapter version and lowercase Git revision, public-safe model/engine/GPU
 labels, fixed arrival and cancellation schedule names,
