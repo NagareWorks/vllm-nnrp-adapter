@@ -2,15 +2,15 @@
 
 ## Evidence Contract
 
-- [ ] Use `doc/value-model.md` as the source of truth for value metrics, comparison baselines,
+- [x] Use `doc/value-model.md` as the source of truth for value metrics, comparison baselines,
   scenarios, and acceptance hypotheses.
-- [ ] Compare raw OpenAI HTTP/SSE, HTTP/SSE with equivalent orchestration, and direct NNRP rather
+- [x] Compare raw OpenAI HTTP/SSE, HTTP/SSE with equivalent orchestration, and direct NNRP rather
   than attributing orchestration benefits to the carrier alone.
-- [ ] Keep model, engine, GPU, arrival schedule, cancellation schedule, prompt/output limits,
+- [x] Keep model, engine, GPU, arrival schedule, cancellation schedule, prompt/output limits,
   warmup, and random seed identical across compared runs.
-- [ ] Persist machine-readable workload manifests, raw samples, aggregate results, confidence
+- [x] Persist machine-readable workload manifests, raw samples, aggregate results, confidence
   intervals, adapter/version metadata, and failure records.
-- [ ] Exclude host IPs, usernames, tokens, request content, and machine identifiers from committed
+- [x] Exclude host IPs, usernames, tokens, request content, and machine identifiers from committed
   evidence.
 
 ## Governable-Runtime Scenarios

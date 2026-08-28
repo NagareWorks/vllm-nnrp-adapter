@@ -308,13 +308,15 @@ vllm-nnrp-adapter run-stale-workload \
   --manifest artifacts/stale-work-30.json \
   --raw-output artifacts/stale-work-30-raw.json \
   --report-output artifacts/stale-work-30-report.json \
+  --outcome-output artifacts/stale-work-30-outcome.json \
   --driver raw_openai_http_sse=deployment.benchmarks:make_raw_http_driver \
   --driver orchestrated_http_sse=deployment.benchmarks:make_orchestrated_http_driver \
   --driver direct_nnrp=deployment.benchmarks:make_direct_nnrp_driver
 ```
 
 The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
-or `0.5`, public-safe model/engine/GPU labels, fixed arrival and cancellation schedule names,
+or `0.5`, the installed adapter version and lowercase Git revision, public-safe model/engine/GPU
+labels, fixed arrival and cancellation schedule names,
 `arrival_interval_seconds`, prompt and completion token limits, warmup and sample counts,
 `max_in_flight`, and a seeded `gpu_accounting` declaration. Acceptance thresholds are evaluated
 only for exact scheduled-batch CUDA attribution or non-overlapping dedicated-device active time.
@@ -327,6 +329,12 @@ seconds, useful-result weight, and late-result count. A raw baseline may complet
 cannot accept the scheduled control; stale identity still comes from the shared schedule. Changed
 sample identities, divergent control schedules, invalid terminal semantics, and sensitive evidence
 fail the run before either output is published.
+
+The raw and aggregate files are written atomically only after all three baselines validate. The
+outcome file is always written: successful runs record the randomized baseline order and sample
+count, while failed runs record only the safe phase, baseline/sample identity when known, and error
+type. Exception text is deliberately excluded so local paths, endpoints, and request content cannot
+leak into committed failure evidence.
 
 The first recorded release-readiness baseline is
 [openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).

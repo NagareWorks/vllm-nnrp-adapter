@@ -32,7 +32,7 @@
   `09-conformance-and-vllm-integration.md`.
 - [ ] Assign benchmark, workflow, README, and final export integration to
   `10-benchmarks-packaging-and-docs.md`.
-- [ ] Assign adoption experiments, value thresholds, and capability evidence to
+- [x] Assign adoption experiments, value thresholds, and capability evidence to
   `11-adoption-value-and-overdesign-gate.md`.
 
 ## Delivery Tiers

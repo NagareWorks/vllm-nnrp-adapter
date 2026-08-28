@@ -105,6 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     stale_workload.add_argument("--manifest", type=Path, required=True)
     stale_workload.add_argument("--raw-output", type=Path, required=True)
     stale_workload.add_argument("--report-output", type=Path, required=True)
+    stale_workload.add_argument("--outcome-output", type=Path, required=True)
     stale_workload.add_argument(
         "--driver",
         action="append",
@@ -222,6 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.manifest,
             args.raw_output,
             args.report_output,
+            args.outcome_output,
             driver_specs=_stale_work_driver_specs(args.driver),
         )
         return 0

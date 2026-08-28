@@ -27,6 +27,8 @@ def _manifest(*, ratio: float, sample_count: int = 100, random_seed: int = 17) -
     return {
         "scenario": "stale_work",
         "stale_work_ratio": ratio,
+        "adapter_version": "0.1.0",
+        "adapter_revision": "abcdef0",
         "model": "public-test-model",
         "engine": "vllm-0.26",
         "gpu": "test-gpu-class",
@@ -188,6 +190,15 @@ async def test_executor_requires_exact_driver_set() -> None:
         await run_stale_workload(_executor_manifest(), drivers=_drivers()[:2])
 
 
+@pytest.mark.asyncio
+async def test_executor_requires_manifest_to_name_installed_adapter_version() -> None:
+    manifest = _executor_manifest()
+    manifest["adapter_version"] = "9.9.9"
+
+    with pytest.raises(ValueError, match="must match the installed"):
+        await run_stale_workload(manifest, drivers=_drivers())
+
+
 class _BadSampleDriver(_FakeDriver):
     async def execute(self, case: StaleWorkCase) -> Mapping[str, object]:
         sample = dict(await super().execute(case))
@@ -208,7 +219,7 @@ async def test_executor_rejects_driver_schedule_drift_and_still_ends_run() -> No
     bad_driver = _BadSampleDriver("direct_nnrp", stale_gpu_seconds=0.1)
     drivers[-1] = bad_driver
 
-    with pytest.raises(ValueError, match="returned sample_id"):
+    with pytest.raises(RuntimeError, match="sample_validation"):
         await run_stale_workload(_executor_manifest(), drivers=drivers)
 
     assert bad_driver.ended is True
@@ -244,11 +255,18 @@ def make_direct_driver() -> _FakeDriver:
     return _make_cli_driver("direct_nnrp", 0.1)
 
 
+def make_bad_direct_driver() -> _FakeDriver:
+    driver = _BadSampleDriver("direct_nnrp", stale_gpu_seconds=0.1)
+    _CLI_DRIVERS.append(driver)
+    return driver
+
+
 def test_cli_loads_three_driver_factories_and_writes_raw_and_aggregate_evidence(tmp_path: Path) -> None:
     _CLI_DRIVERS.clear()
     manifest_path = tmp_path / "manifest.json"
     raw_output = tmp_path / "raw.json"
     report_output = tmp_path / "report.json"
+    outcome_output = tmp_path / "outcome.json"
     manifest_path.write_text(json.dumps(_executor_manifest()), encoding="utf-8")
 
     exit_code = main(
@@ -260,6 +278,8 @@ def test_cli_loads_three_driver_factories_and_writes_raw_and_aggregate_evidence(
             str(raw_output),
             "--report-output",
             str(report_output),
+            "--outcome-output",
+            str(outcome_output),
             "--driver",
             f"raw_openai_http_sse={__name__}:make_raw_driver",
             "--driver",
@@ -272,7 +292,14 @@ def test_cli_loads_three_driver_factories_and_writes_raw_and_aggregate_evidence(
     assert exit_code == 0
     raw = json.loads(raw_output.read_text(encoding="utf-8"))
     report = json.loads(report_output.read_text(encoding="utf-8"))
+    outcome = json.loads(outcome_output.read_text(encoding="utf-8"))
     assert report["baseline_execution_order"] == [run["baseline"] for run in raw["runs"]]
+    assert outcome == {
+        "schema_version": "nnrp-adoption-run-outcome/v1",
+        "status": "passed",
+        "baseline_execution_order": report["baseline_execution_order"],
+        "sample_count": 10,
+    }
     assert {driver.baseline for driver in _CLI_DRIVERS} == set(STALE_WORK_BASELINES)
     assert all(driver.ended for driver in _CLI_DRIVERS)
 
@@ -292,6 +319,8 @@ def test_cli_rejects_same_raw_and_report_output(tmp_path: Path) -> None:
                 str(output_path),
                 "--report-output",
                 str(output_path),
+                "--outcome-output",
+                str(tmp_path / "outcome.json"),
                 "--driver",
                 f"raw_openai_http_sse={__name__}:make_raw_driver",
             ]
@@ -319,7 +348,48 @@ def test_cli_rejects_invalid_driver_assignment(driver_arg: str, tmp_path: Path) 
                 str(tmp_path / "raw.json"),
                 "--report-output",
                 str(tmp_path / "report.json"),
+                "--outcome-output",
+                str(tmp_path / "outcome.json"),
                 "--driver",
                 driver_arg,
             ]
         )
+
+
+def test_cli_persists_safe_failure_outcome_without_partial_evidence(tmp_path: Path) -> None:
+    _CLI_DRIVERS.clear()
+    manifest_path = tmp_path / "manifest.json"
+    raw_output = tmp_path / "raw.json"
+    report_output = tmp_path / "report.json"
+    outcome_output = tmp_path / "outcome.json"
+    manifest_path.write_text(json.dumps(_executor_manifest()), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="sample_validation"):
+        main(
+            [
+                "run-stale-workload",
+                "--manifest",
+                str(manifest_path),
+                "--raw-output",
+                str(raw_output),
+                "--report-output",
+                str(report_output),
+                "--outcome-output",
+                str(outcome_output),
+                "--driver",
+                f"raw_openai_http_sse={__name__}:make_raw_driver",
+                "--driver",
+                f"orchestrated_http_sse={__name__}:make_orchestrated_driver",
+                "--driver",
+                f"direct_nnrp={__name__}:make_bad_direct_driver",
+            ]
+        )
+
+    outcome = json.loads(outcome_output.read_text(encoding="utf-8"))
+    assert outcome["status"] == "failed"
+    assert outcome["phase"] == "sample_validation"
+    assert outcome["baseline"] == "direct_nnrp"
+    assert outcome["sample_id"].startswith("sample-")
+    assert outcome["error_type"] == "StaleWorkExecutionError"
+    assert not raw_output.exists()
+    assert not report_output.exists()

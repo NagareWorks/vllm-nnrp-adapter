@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -37,6 +38,7 @@ _ACCEPTANCE_ELIGIBLE_GPU_ACCOUNTING = frozenset(
         ("cuda_event_attribution", "scheduled_batch"),
     }
 )
+_GIT_REVISION = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def aggregate_stale_work_evidence_file(input_path: Path, output_path: Path) -> dict[str, Any]:
@@ -54,6 +56,7 @@ def aggregate_stale_work_evidence(source: object) -> dict[str, Any]:
         raise ValueError(f"evidence.schema_version must be {_SCHEMA_VERSION!r}")
 
     workload = _workload_manifest(root.get("workload"))
+    provenance = _provenance(root.get("provenance"), workload=workload)
     runs = _sequence(root.get("runs"), "evidence.runs")
     summaries: dict[str, dict[str, Any]] = {}
     baseline_execution_order: list[str] = []
@@ -80,6 +83,7 @@ def aggregate_stale_work_evidence(source: object) -> dict[str, Any]:
         "benchmark_kind": "stale_work_adoption_evidence",
         "schema_version": _SCHEMA_VERSION,
         "workload": workload,
+        "provenance": provenance,
         "baseline_execution_order": baseline_execution_order,
         "runs": ordered_summaries,
         "acceptance": _acceptance(workload, summaries),
@@ -100,6 +104,8 @@ def normalize_stale_work_manifest(value: object) -> dict[str, Any]:
     normalized = {
         "scenario": "stale_work",
         "stale_work_ratio": stale_work_ratio,
+        "adapter_version": _required_string(manifest, "adapter_version", "evidence.workload"),
+        "adapter_revision": _required_git_revision(manifest, "adapter_revision", "evidence.workload"),
         "model": _required_string(manifest, "model", "evidence.workload"),
         "engine": _required_string(manifest, "engine", "evidence.workload"),
         "gpu": _required_string(manifest, "gpu", "evidence.workload"),
@@ -153,6 +159,23 @@ def _gpu_accounting(value: object, *, max_in_flight: int) -> dict[str, Any]:
         "source": _required_string(accounting, "source", "evidence.workload.gpu_accounting"),
         "acceptance_eligible": acceptance_eligible,
     }
+
+
+def _provenance(value: object, *, workload: Mapping[str, object]) -> dict[str, str]:
+    provenance = _mapping(value, "evidence.provenance")
+    normalized = {
+        "adapter_distribution": _required_string(provenance, "adapter_distribution", "evidence.provenance"),
+        "adapter_version": _required_string(provenance, "adapter_version", "evidence.provenance"),
+        "adapter_revision": _required_git_revision(provenance, "adapter_revision", "evidence.provenance"),
+        "nnrp_sdk_version": _required_string(provenance, "nnrp_sdk_version", "evidence.provenance"),
+    }
+    if normalized["adapter_distribution"] != "vllm-nnrp-adapter":
+        raise ValueError("evidence.provenance.adapter_distribution must be 'vllm-nnrp-adapter'")
+    if normalized["adapter_version"] != workload["adapter_version"]:
+        raise ValueError("evidence.provenance.adapter_version must match evidence.workload.adapter_version")
+    if normalized["adapter_revision"] != workload["adapter_revision"]:
+        raise ValueError("evidence.provenance.adapter_revision must match evidence.workload.adapter_revision")
+    return normalized
 
 
 def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *, location: str) -> dict[str, Any]:
@@ -406,6 +429,13 @@ def _required_string(value: Mapping[str, object], key: str, location: str) -> st
     item = value.get(key)
     if not isinstance(item, str) or not item:
         raise ValueError(f"{location}.{key} must be a non-empty string")
+    return item
+
+
+def _required_git_revision(value: Mapping[str, object], key: str, location: str) -> str:
+    item = _required_string(value, key, location)
+    if _GIT_REVISION.fullmatch(item) is None:
+        raise ValueError(f"{location}.{key} must be a lowercase 7-40 character Git revision")
     return item
 
 

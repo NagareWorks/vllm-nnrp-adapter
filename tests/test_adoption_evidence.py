@@ -59,6 +59,8 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
         "workload": {
             "scenario": "stale_work",
             "stale_work_ratio": ratio,
+            "adapter_version": "0.1.0",
+            "adapter_revision": "abcdef0",
             "model": "public-test-model",
             "engine": "vllm-0.26",
             "gpu": "test-gpu-class",
@@ -77,6 +79,12 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
                 "source": "test-device-counter",
             },
         },
+        "provenance": {
+            "adapter_distribution": "vllm-nnrp-adapter",
+            "adapter_version": "0.1.0",
+            "adapter_revision": "abcdef0",
+            "nnrp_sdk_version": "1.0.0rc4.post20",
+        },
         "runs": [
             run("raw_openai_http_sse", 1.0, accepted=False),
             run("orchestrated_http_sse", 0.45, accepted=True),
@@ -89,6 +97,7 @@ def test_aggregate_stale_work_evidence_reports_value_metrics_and_thresholds() ->
     report = aggregate_stale_work_evidence(_source())
 
     assert report["benchmark_kind"] == "stale_work_adoption_evidence"
+    assert report["provenance"]["adapter_revision"] == "abcdef0"
     assert [run["baseline"] for run in report["runs"]] == [
         "raw_openai_http_sse",
         "orchestrated_http_sse",
@@ -166,6 +175,14 @@ def test_overlapping_device_active_time_cannot_be_summed_as_request_gpu_seconds(
         (
             lambda source: source["runs"][2]["samples"][-1].update({"useful_result_weight": 1.0}),
             "must be zero for stale work",
+        ),
+        (
+            lambda source: source["provenance"].update({"adapter_revision": "1234567"}),
+            "adapter_revision must match",
+        ),
+        (
+            lambda source: source["workload"].update({"adapter_revision": "not-a-revision"}),
+            "lowercase 7-40 character Git revision",
         ),
     ],
 )

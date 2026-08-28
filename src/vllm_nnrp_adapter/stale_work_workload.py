@@ -6,9 +6,11 @@ import inspect
 import json
 import math
 import random
+import tempfile
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -52,6 +54,20 @@ class StaleWorkDriver(Protocol):
     async def execute(self, case: StaleWorkCase) -> Mapping[str, object]: ...
 
     async def end_run(self) -> None: ...
+
+
+class StaleWorkExecutionError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        phase: str,
+        baseline: str | None = None,
+        sample_id: str | None = None,
+    ) -> None:
+        super().__init__(f"stale-work execution failed during {phase}")
+        self.phase = phase
+        self.baseline = baseline
+        self.sample_id = sample_id
 
 
 def build_stale_work_schedule(workload: object) -> tuple[StaleWorkCase, ...]:
@@ -112,6 +128,12 @@ async def run_stale_workload(
     drivers: Sequence[StaleWorkDriver],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     manifest = normalize_stale_work_manifest(workload)
+    installed_adapter_version = _distribution_version("vllm-nnrp-adapter")
+    if manifest["adapter_version"] != installed_adapter_version:
+        raise ValueError(
+            "workload.adapter_version must match the installed vllm-nnrp-adapter distribution "
+            f"({installed_adapter_version})"
+        )
     schedule = build_stale_work_schedule(manifest)
     drivers_by_baseline: dict[str, StaleWorkDriver] = {}
     for index, driver in enumerate(drivers):
@@ -138,6 +160,12 @@ async def run_stale_workload(
     evidence = {
         "schema_version": "nnrp-adoption-evidence/v1",
         "workload": manifest,
+        "provenance": {
+            "adapter_distribution": "vllm-nnrp-adapter",
+            "adapter_version": installed_adapter_version,
+            "adapter_revision": manifest["adapter_revision"],
+            "nnrp_sdk_version": _distribution_version("nnrp-py"),
+        },
         "runs": runs,
     }
     validate_benchmark_evidence(evidence)
@@ -149,19 +177,34 @@ async def run_stale_workload_file(
     manifest_path: Path,
     raw_output_path: Path,
     report_output_path: Path,
+    outcome_output_path: Path,
     *,
     driver_specs: Mapping[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if raw_output_path.resolve() == report_output_path.resolve():
-        raise ValueError("raw-output and report-output must be different paths")
-    workload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    drivers = [
-        await load_stale_work_driver_async(spec, expected_baseline=baseline)
-        for baseline, spec in driver_specs.items()
-    ]
-    evidence, report = await run_stale_workload(workload, drivers=drivers)
-    _write_json(raw_output_path, evidence)
-    _write_json(report_output_path, report)
+    _validate_output_paths(raw_output_path, report_output_path, outcome_output_path)
+    try:
+        workload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        drivers = [
+            await load_stale_work_driver_async(spec, expected_baseline=baseline)
+            for baseline, spec in driver_specs.items()
+        ]
+        evidence, report = await run_stale_workload(workload, drivers=drivers)
+        _write_json(raw_output_path, evidence)
+        _write_json(report_output_path, report)
+    except Exception as error:
+        outcome = _failure_outcome(error)
+        validate_benchmark_evidence(outcome)
+        _write_json(outcome_output_path, outcome)
+        raise
+
+    outcome = {
+        "schema_version": "nnrp-adoption-run-outcome/v1",
+        "status": "passed",
+        "baseline_execution_order": report["baseline_execution_order"],
+        "sample_count": report["workload"]["sample_count"],
+    }
+    validate_benchmark_evidence(outcome)
+    _write_json(outcome_output_path, outcome)
     return evidence, report
 
 
@@ -169,6 +212,7 @@ def run_stale_workload_file_sync(
     manifest_path: Path,
     raw_output_path: Path,
     report_output_path: Path,
+    outcome_output_path: Path,
     *,
     driver_specs: Mapping[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -177,6 +221,7 @@ def run_stale_workload_file_sync(
             manifest_path,
             raw_output_path,
             report_output_path,
+            outcome_output_path,
             driver_specs=driver_specs,
         )
     )
@@ -188,10 +233,12 @@ async def _run_driver(
     driver: StaleWorkDriver,
 ) -> dict[str, Any]:
     driver_manifest = deepcopy(dict(manifest))
-    began = False
     try:
         await driver.begin_run(driver_manifest, schedule)
-        began = True
+    except Exception as error:
+        raise StaleWorkExecutionError(phase="begin_run", baseline=driver.baseline) from error
+
+    try:
         await _warmup_driver(driver, manifest, schedule)
         loop = asyncio.get_running_loop()
         run_started_at = loop.time()
@@ -202,27 +249,44 @@ async def _run_driver(
             if delay > 0:
                 await asyncio.sleep(delay)
             async with semaphore:
-                sample = dict(await driver.execute(case))
+                try:
+                    sample = dict(await driver.execute(case))
+                except Exception as error:
+                    raise StaleWorkExecutionError(
+                        phase="execute",
+                        baseline=driver.baseline,
+                        sample_id=case.sample_id,
+                    ) from error
             if sample.get("sample_id") != case.sample_id:
-                raise ValueError(
-                    f"{driver.baseline} driver returned sample_id {sample.get('sample_id')!r}; "
-                    f"expected {case.sample_id!r}"
+                raise StaleWorkExecutionError(
+                    phase="sample_validation",
+                    baseline=driver.baseline,
+                    sample_id=case.sample_id,
                 )
             if sample.get("control_kind") != case.control_kind:
-                raise ValueError(
-                    f"{driver.baseline} driver changed control_kind for {case.sample_id!r}: "
-                    f"expected {case.control_kind!r}, got {sample.get('control_kind')!r}"
+                raise StaleWorkExecutionError(
+                    phase="sample_validation",
+                    baseline=driver.baseline,
+                    sample_id=case.sample_id,
                 )
             return sample
 
         samples = await asyncio.gather(*(execute_case(case) for case in schedule))
         wall_clock_seconds = loop.time() - run_started_at
-    finally:
-        if began:
+    except BaseException:
+        try:
             await driver.end_run()
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            await driver.end_run()
+        except Exception as error:
+            raise StaleWorkExecutionError(phase="end_run", baseline=driver.baseline) from error
 
     if driver_manifest != manifest:
-        raise ValueError(f"{driver.baseline} driver mutated the normalized workload manifest")
+        raise StaleWorkExecutionError(phase="manifest_validation", baseline=driver.baseline)
     return {
         "baseline": driver.baseline,
         "wall_clock_seconds": wall_clock_seconds,
@@ -237,17 +301,23 @@ async def _warmup_driver(
 ) -> None:
     template = next(case for case in schedule if not case.is_stale)
     for index in range(cast(int, manifest["warmup"])):
-        await driver.warmup(
-            StaleWorkCase(
-                sample_id=f"warmup-{index:06d}",
-                ordinal=-(index + 1),
-                scheduled_offset_seconds=0.0,
-                model=template.model,
-                prompt_tokens=template.prompt_tokens,
-                max_completion_tokens=template.max_completion_tokens,
-                control_kind=None,
-            )
+        case = StaleWorkCase(
+            sample_id=f"warmup-{index:06d}",
+            ordinal=-(index + 1),
+            scheduled_offset_seconds=0.0,
+            model=template.model,
+            prompt_tokens=template.prompt_tokens,
+            max_completion_tokens=template.max_completion_tokens,
+            control_kind=None,
         )
+        try:
+            await driver.warmup(case)
+        except Exception as error:
+            raise StaleWorkExecutionError(
+                phase="warmup",
+                baseline=driver.baseline,
+                sample_id=case.sample_id,
+            ) from error
 
 
 def _validate_driver(driver: object, *, expected_baseline: object, location: str) -> None:
@@ -261,6 +331,50 @@ def _validate_driver(driver: object, *, expected_baseline: object, location: str
             raise TypeError(f"{location} driver must define callable {method_name}()")
 
 
+def _failure_outcome(error: Exception) -> dict[str, object]:
+    outcome: dict[str, object] = {
+        "schema_version": "nnrp-adoption-run-outcome/v1",
+        "status": "failed",
+        "error_type": type(error).__name__,
+        "phase": "setup_or_validation",
+    }
+    if isinstance(error, StaleWorkExecutionError):
+        outcome["phase"] = error.phase
+        if error.baseline is not None:
+            outcome["baseline"] = error.baseline
+        if error.sample_id is not None:
+            outcome["sample_id"] = error.sample_id
+    return outcome
+
+
+def _validate_output_paths(*paths: Path) -> None:
+    resolved = [path.resolve() for path in paths]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("raw-output, report-output, and outcome-output must be different paths")
+
+
+def _distribution_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError as error:
+        raise RuntimeError(f"required distribution metadata is unavailable: {distribution}") from error
+
+
 def _write_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{json.dumps(value, indent=2, sort_keys=True)}\n", encoding="utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(f"{json.dumps(value, indent=2, sort_keys=True)}\n")
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
