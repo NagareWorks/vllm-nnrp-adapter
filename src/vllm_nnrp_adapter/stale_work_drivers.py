@@ -48,12 +48,30 @@ from .profile import CHAT_COMPLETIONS_CREATE, OPENAI_COMPATIBLE_SCHEMA_VERSION
 from .stale_work_workload import StaleWorkCase, StaleWorkResult
 
 _CONTROL_KINDS = frozenset(("cancel", "abort", "deadline", "supersede"))
+_CONTROL_OUTCOME = {
+    "cancel": "cancelled",
+    "abort": "aborted",
+    "deadline": "expired",
+    "supersede": "superseded",
+}
 
 
 class _HttpResponse(Protocol):
     def __iter__(self) -> Iterator[bytes]: ...
 
     def close(self) -> None: ...
+
+
+class OrchestratedHttpController(Protocol):
+    async def begin_run(
+        self,
+        workload: Mapping[str, object],
+        schedule: Sequence[StaleWorkCase],
+    ) -> None: ...
+
+    async def dispatch(self, control: OrchestratedHttpControl) -> bool: ...
+
+    async def end_run(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -80,6 +98,47 @@ class OpenAiHttpSseDriverConfig:
                 raise ValueError("headers values must be non-empty single-line strings")
             copied_headers[name] = value
         object.__setattr__(self, "headers", MappingProxyType(copied_headers))
+
+
+@dataclass(frozen=True)
+class OrchestratedHttpControl:
+    sample_id: str
+    control_kind: str
+    replacement_sample_id: str | None = None
+    deadline_unix_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sample_id, str) or not self.sample_id:
+            raise ValueError("sample_id must be non-empty")
+        if self.control_kind not in _CONTROL_KINDS:
+            raise ValueError(f"unsupported stale-work control kind: {self.control_kind}")
+        if self.control_kind == "supersede":
+            if not isinstance(self.replacement_sample_id, str) or not self.replacement_sample_id:
+                raise ValueError("supersede control requires replacement_sample_id")
+        elif self.replacement_sample_id is not None:
+            raise ValueError("replacement_sample_id is only valid for supersede")
+        if self.control_kind == "deadline":
+            if (
+                isinstance(self.deadline_unix_ms, bool)
+                or not isinstance(self.deadline_unix_ms, int)
+                or self.deadline_unix_ms <= 0
+            ):
+                raise ValueError("deadline control requires a positive deadline_unix_ms")
+        elif self.deadline_unix_ms is not None:
+            raise ValueError("deadline_unix_ms is only valid for deadline")
+
+
+@dataclass(frozen=True)
+class OrchestratedHttpSseDriverConfig:
+    request: OpenAiHttpSseDriverConfig
+    controller: OrchestratedHttpController
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, OpenAiHttpSseDriverConfig):
+            raise TypeError("request must be OpenAiHttpSseDriverConfig")
+        for method_name in ("begin_run", "dispatch", "end_run"):
+            if not callable(getattr(self.controller, method_name, None)):
+                raise TypeError(f"controller must define callable {method_name}()")
 
 
 class RawOpenAiHttpSseDriver:
@@ -124,6 +183,147 @@ class RawOpenAiHttpSseDriver:
         if operations:
             await asyncio.gather(*(operation.close() for operation in operations))
         self._begun = False
+
+
+class OrchestratedHttpSseDriver:
+    """HTTP/SSE baseline whose controls are supplied by deployment orchestration."""
+
+    baseline = "orchestrated_http_sse"
+
+    def __init__(self, config: OrchestratedHttpSseDriverConfig) -> None:
+        self._config = config
+        self._active: set[_OrchestratedHttpSseOperation] = set()
+        self._replacement_tasks: set[asyncio.Task[None]] = set()
+        self._begun = False
+
+    async def begin_run(
+        self,
+        workload: Mapping[str, object],
+        schedule: Sequence[StaleWorkCase],
+    ) -> None:
+        if self._begun or self._active or self._replacement_tasks:
+            raise RuntimeError("orchestrated HTTP/SSE driver run is already active")
+        if not schedule or len(schedule) != workload.get("sample_count"):
+            raise ValueError("orchestrated HTTP/SSE driver requires the complete workload schedule")
+        await self._config.controller.begin_run(workload, schedule)
+        self._begun = True
+
+    async def warmup(self, case: StaleWorkCase) -> None:
+        operation = await self.start(case)
+        try:
+            result = await operation.wait()
+            if result.terminal_outcome != "completed":
+                raise RuntimeError("orchestrated HTTP/SSE warmup request did not complete")
+        finally:
+            await operation.close()
+
+    async def start(self, case: StaleWorkCase) -> _OrchestratedHttpSseOperation:
+        if not self._begun:
+            raise RuntimeError("orchestrated HTTP/SSE driver has not begun a run")
+        operation = _OrchestratedHttpSseOperation(self, case)
+        self._active.add(operation)
+        return operation
+
+    async def end_run(self) -> None:
+        cleanup_errors: list[BaseException] = []
+        if self._replacement_tasks:
+            replacement_results = await asyncio.gather(*tuple(self._replacement_tasks), return_exceptions=True)
+            cleanup_errors.extend(result for result in replacement_results if isinstance(result, BaseException))
+        operations = tuple(self._active)
+        if operations:
+            close_results = await asyncio.gather(
+                *(operation.close() for operation in operations),
+                return_exceptions=True,
+            )
+            cleanup_errors.extend(result for result in close_results if isinstance(result, BaseException))
+        try:
+            await self._config.controller.end_run()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        self._active.clear()
+        self._replacement_tasks.clear()
+        self._begun = False
+        if cleanup_errors:
+            raise RuntimeError("orchestrated HTTP/SSE driver cleanup failed") from cleanup_errors[0]
+
+    async def _start_replacement(self, case: StaleWorkCase, replacement_sample_id: str) -> None:
+        replacement = await self.start(
+            replace(
+                case,
+                sample_id=replacement_sample_id,
+                control_kind=None,
+            )
+        )
+        task = asyncio.create_task(self._drain_replacement(replacement))
+        self._replacement_tasks.add(task)
+        task.add_done_callback(self._replacement_tasks.discard)
+
+    async def _drain_replacement(self, replacement: _OrchestratedHttpSseOperation) -> None:
+        try:
+            result = await replacement.wait()
+            if result.terminal_outcome != "completed":
+                raise RuntimeError("orchestrated HTTP/SSE supersede replacement did not complete")
+        finally:
+            await replacement.close()
+
+    def _release(self, operation: _OrchestratedHttpSseOperation) -> None:
+        self._active.discard(operation)
+
+
+class _OrchestratedHttpSseOperation:
+    def __init__(self, driver: OrchestratedHttpSseDriver, case: StaleWorkCase) -> None:
+        self._driver = driver
+        self._case = case
+        self._control_lock = asyncio.Lock()
+        self._inner = _RawOpenAiHttpSseOperation(
+            driver._config.request,
+            case,
+            lambda _operation: driver._release(self),
+            close_response_on_control=False,
+        )
+
+    async def apply_control(self, control_kind: str) -> bool:
+        if control_kind not in _CONTROL_KINDS:
+            raise ValueError(f"unsupported stale-work control kind: {control_kind}")
+        async with self._control_lock:
+            with self._inner._state_lock:
+                if (
+                    self._inner._finished
+                    or self._inner._closed
+                    or self._inner._control_kind is not None
+                ):
+                    return False
+            replacement_sample_id = (
+                f"{self._case.sample_id}:replacement" if control_kind == "supersede" else None
+            )
+            control = OrchestratedHttpControl(
+                sample_id=self._case.sample_id,
+                control_kind=control_kind,
+                replacement_sample_id=replacement_sample_id,
+                deadline_unix_ms=(
+                    max(1, time.time_ns() // 1_000_000) if control_kind == "deadline" else None
+                ),
+            )
+            dispatched = await self._driver._config.controller.dispatch(control)
+            if not isinstance(dispatched, bool):
+                raise TypeError("orchestrated HTTP/SSE controller dispatch() must return bool")
+            if not dispatched:
+                return False
+            with self._inner._state_lock:
+                self._inner._control_kind = control_kind
+            if replacement_sample_id is not None:
+                await self._driver._start_replacement(self._case, replacement_sample_id)
+            return True
+
+    async def wait(self) -> StaleWorkResult:
+        result = await self._inner.wait()
+        control_kind = self._inner._control_kind
+        if result.terminal_outcome == "cancelled" and control_kind is not None:
+            return replace(result, terminal_outcome=_CONTROL_OUTCOME[control_kind])
+        return result
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 @dataclass(frozen=True)
@@ -571,10 +771,13 @@ class _RawOpenAiHttpSseOperation:
         config: OpenAiHttpSseDriverConfig,
         case: StaleWorkCase,
         release: Callable[[_RawOpenAiHttpSseOperation], None],
+        *,
+        close_response_on_control: bool = True,
     ) -> None:
         self._config = config
         self._case = case
         self._release = release
+        self._close_response_on_control = close_response_on_control
         self._state_lock = threading.Lock()
         self._wait_lock = asyncio.Lock()
         self._response: _HttpResponse | None = None
@@ -591,7 +794,7 @@ class _RawOpenAiHttpSseOperation:
                 return False
             self._control_kind = control_kind
             response = self._response
-        if response is not None:
+        if response is not None and self._close_response_on_control:
             await asyncio.to_thread(_close_response, response)
         return True
 
@@ -625,7 +828,11 @@ class _RawOpenAiHttpSseOperation:
             response = _urlopen(request, self._config.timeout_seconds)
             with self._state_lock:
                 self._response = response
-                close_immediately = self._control_kind is not None or self._closed
+                close_immediately = (
+                    self._closed
+                    or self._control_kind is not None
+                    and self._close_response_on_control
+                )
             if close_immediately:
                 _close_response(response)
             for raw_line in response:
@@ -641,7 +848,9 @@ class _RawOpenAiHttpSseOperation:
                 with self._state_lock:
                     if self._control_kind is not None:
                         late_result_count += 1
-        except (OSError, urllib.error.URLError, UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError):
+            terminal_outcome = "failed"
+        except (OSError, urllib.error.URLError):
             terminal_outcome = "cancelled" if self._control_requested() else "failed"
         else:
             terminal_outcome = "completed" if stream_completed or not self._control_requested() else "cancelled"

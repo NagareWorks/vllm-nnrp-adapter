@@ -27,6 +27,9 @@ from vllm_nnrp_adapter.stale_work_drivers import (
     DirectNnrpDriver,
     DirectNnrpDriverConfig,
     OpenAiHttpSseDriverConfig,
+    OrchestratedHttpControl,
+    OrchestratedHttpSseDriver,
+    OrchestratedHttpSseDriverConfig,
     RawOpenAiHttpSseDriver,
 )
 from vllm_nnrp_adapter.stale_work_workload import StaleWorkCase
@@ -239,6 +242,221 @@ def test_raw_http_driver_config_rejects_ambiguous_network_settings(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         OpenAiHttpSseDriverConfig(**kwargs)  # type: ignore[arg-type]
+
+
+class _FakeOrchestrationController:
+    def __init__(self, *, dispatch_result: bool = True) -> None:
+        self.dispatch_result = dispatch_result
+        self.begun = 0
+        self.ended = 0
+        self.controls: list[OrchestratedHttpControl] = []
+
+    async def begin_run(
+        self,
+        workload: dict[str, object],
+        schedule: tuple[StaleWorkCase, ...],
+    ) -> None:
+        assert workload["sample_count"] == len(schedule)
+        self.begun += 1
+
+    async def dispatch(self, control: OrchestratedHttpControl) -> bool:
+        self.controls.append(control)
+        return self.dispatch_result
+
+    async def end_run(self) -> None:
+        self.ended += 1
+
+
+class _ControlledHttpResponse:
+    def __init__(self) -> None:
+        self.iterating = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+
+    def __iter__(self) -> Iterator[bytes]:
+        self.iterating.set()
+        if not self.release.wait(2.0):
+            raise AssertionError("orchestrated response was not released")
+        raise OSError("server ended controlled stream")
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+async def _start_orchestrated(
+    monkeypatch: pytest.MonkeyPatch,
+    case: StaleWorkCase,
+    response_factory: Any,
+    *,
+    dispatch_result: bool = True,
+) -> tuple[OrchestratedHttpSseDriver, Any, _FakeOrchestrationController]:
+    monkeypatch.setattr("vllm_nnrp_adapter.stale_work_drivers._urlopen", response_factory)
+    controller = _FakeOrchestrationController(dispatch_result=dispatch_result)
+    driver = OrchestratedHttpSseDriver(
+        OrchestratedHttpSseDriverConfig(
+            request=OpenAiHttpSseDriverConfig("https://example.invalid/v1/chat/completions"),
+            controller=controller,
+        )
+    )
+    await driver.begin_run({"sample_count": 1}, (case,))
+    return driver, await driver.start(case), controller
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control_kind", "expected_outcome"),
+    [
+        ("cancel", "cancelled"),
+        ("abort", "aborted"),
+        ("deadline", "expired"),
+    ],
+)
+async def test_orchestrated_http_dispatches_without_client_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    control_kind: str,
+    expected_outcome: str,
+) -> None:
+    case = _case(control_kind=control_kind)
+    response = _ControlledHttpResponse()
+    driver, operation, controller = await _start_orchestrated(
+        monkeypatch,
+        case,
+        lambda _request, _timeout: response,
+    )
+    wait_task = asyncio.create_task(operation.wait())
+    assert await asyncio.to_thread(response.iterating.wait, 1.0)
+
+    assert await operation.apply_control(control_kind) is True
+    assert not response.closed.is_set()
+    assert controller.controls[0].sample_id == case.sample_id
+    assert controller.controls[0].control_kind == control_kind
+    if control_kind == "deadline":
+        assert controller.controls[0].deadline_unix_ms is not None
+    response.release.set()
+    result = await wait_task
+    await operation.close()
+    await driver.end_run()
+
+    assert result.terminal_outcome == expected_outcome
+    assert result.useful_result_weight == 0.0
+    assert controller.begun == 1
+    assert controller.ended == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_http_supersede_submits_real_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(control_kind="supersede")
+    original = _ControlledHttpResponse()
+    requests: list[str] = []
+
+    def response_for_request(request: urllib.request.Request, _timeout: float) -> object:
+        headers = {name.lower(): value for name, value in request.header_items()}
+        request_id = headers["x-nnrp-benchmark-sample-id"]
+        requests.append(request_id)
+        if request_id == case.sample_id:
+            return original
+        return _StaticResponse(b"data: [DONE]\n")
+
+    driver, operation, controller = await _start_orchestrated(monkeypatch, case, response_for_request)
+    wait_task = asyncio.create_task(operation.wait())
+    assert await asyncio.to_thread(original.iterating.wait, 1.0)
+
+    assert await operation.apply_control("supersede") is True
+    original.release.set()
+    result = await wait_task
+    await operation.close()
+    await driver.end_run()
+
+    replacement_id = f"{case.sample_id}:replacement"
+    assert controller.controls == [
+        OrchestratedHttpControl(case.sample_id, "supersede", replacement_sample_id=replacement_id)
+    ]
+    assert requests == [case.sample_id, replacement_id]
+    assert result.terminal_outcome == "superseded"
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_http_rejected_dispatch_does_not_claim_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(control_kind="abort")
+    response = _ControlledHttpResponse()
+    driver, operation, controller = await _start_orchestrated(
+        monkeypatch,
+        case,
+        lambda _request, _timeout: response,
+        dispatch_result=False,
+    )
+    wait_task = asyncio.create_task(operation.wait())
+    assert await asyncio.to_thread(response.iterating.wait, 1.0)
+
+    assert await operation.apply_control("abort") is False
+    response.release.set()
+    result = await wait_task
+    await operation.close()
+    await driver.end_run()
+
+    assert result.terminal_outcome == "failed"
+    assert controller.controls[0].control_kind == "abort"
+
+
+@pytest.mark.asyncio
+async def test_orchestrated_http_malformed_sse_remains_failed_after_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedResponse:
+        def __init__(self) -> None:
+            self.iterating = threading.Event()
+            self.release = threading.Event()
+
+        def __iter__(self) -> Iterator[bytes]:
+            self.iterating.set()
+            if not self.release.wait(2.0):
+                raise AssertionError("malformed response was not released")
+            yield b"data: {not-json}\n"
+
+        def close(self) -> None:
+            pass
+
+    case = _case(control_kind="cancel")
+    response = MalformedResponse()
+    driver, operation, _controller = await _start_orchestrated(
+        monkeypatch,
+        case,
+        lambda _request, _timeout: response,
+    )
+    wait_task = asyncio.create_task(operation.wait())
+    assert await asyncio.to_thread(response.iterating.wait, 1.0)
+    assert await operation.apply_control("cancel") is True
+    response.release.set()
+    result = await wait_task
+    await operation.close()
+    await driver.end_run()
+
+    assert result.terminal_outcome == "failed"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"sample_id": "", "control_kind": "cancel"}, "sample_id"),
+        ({"sample_id": "sample", "control_kind": "supersede"}, "replacement"),
+        (
+            {"sample_id": "sample", "control_kind": "cancel", "replacement_sample_id": "other"},
+            "only valid",
+        ),
+        ({"sample_id": "sample", "control_kind": "deadline"}, "deadline_unix_ms"),
+    ],
+)
+def test_orchestrated_http_control_rejects_ambiguous_plan(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        OrchestratedHttpControl(**kwargs)  # type: ignore[arg-type]
 
 
 class _FakeNativeOperation:

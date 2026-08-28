@@ -316,17 +316,25 @@ vllm-nnrp-adapter run-stale-workload \
   --accounting-probe deployment.benchmarks:make_cuda_accounting_probe
 ```
 
-The `vllm_nnrp_adapter.stale_work_drivers` module provides `OpenAiHttpSseDriverConfig`,
-`RawOpenAiHttpSseDriver`, `DirectNnrpDriverConfig`, and `DirectNnrpDriver`. A zero-argument factory
-supplies deployment endpoints, credentials, provider routes, transport policy, and timeouts without
-placing those values in benchmark evidence. The direct driver opens one native NNRP connection and
-one multiplexed session for the run, submits the frozen OpenAI NNRP typed-payload envelope, and uses
-the runner-owned sample id as `request_id` for server-side accounting correlation.
+The `vllm_nnrp_adapter.stale_work_drivers` module provides the raw, equivalently orchestrated, and
+direct-NNRP driver implementations. A zero-argument factory supplies deployment endpoints,
+credentials, provider routes, transport policy, controllers, and timeouts without placing those
+values in benchmark evidence. The direct driver opens one native NNRP connection and one
+multiplexed session for the run, submits the frozen OpenAI NNRP typed-payload envelope, and uses the
+runner-owned sample id as `request_id` for server-side accounting correlation.
 The raw driver sends an OpenAI-compatible streaming chat request and closes the live response for
 every scheduled control. That close is only client cancellation: abort, deadline, and supersession
-are deliberately not reported as equivalent server controls. Use a deployment-owned driver for the
-orchestrated HTTP/SSE baseline because vLLM does not expose one stable, version-independent HTTP
-control endpoint for those semantics.
+are deliberately not reported as equivalent server controls.
+
+`OrchestratedHttpSseDriver` sends the same HTTP/SSE request but delegates actual control dispatch to
+a deployment-owned `OrchestratedHttpController`. This boundary is required because vLLM does not
+expose one stable, version-independent HTTP control endpoint for cancellation, abort, deadline, and
+supersession. The controller receives an `OrchestratedHttpControl` containing the runner sample id,
+control kind, absolute deadline when applicable, and the replacement sample id for supersession.
+It implements async `begin_run`, `dispatch`, and `end_run`; `dispatch` returns only whether the
+deployment sent the control. The driver keeps the original response open to observe late results
+and submits a real `<sample-id>:replacement` HTTP request for supersession. Controller code must not
+report server acceptance or GPU accounting through that boolean.
 
 The direct driver dispatches native `CANCEL`, `ABORT`, `DEADLINE`, and `SUPERSEDE` controls on the
 same session as the request. Supersession also submits a real replacement request whose correlation
