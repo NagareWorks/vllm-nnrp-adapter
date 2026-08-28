@@ -435,17 +435,7 @@ def _validate_observation_evidence(
             if not isinstance(record.get("output_event_count"), int) or record["output_event_count"] < 1:
                 raise RuntimeError("wire cancellation observation did not preserve its in-flight partial result")
         elif terminal_outcome == "dropped":
-            if (
-                record.get("operation_id") != 901
-                or record.get("cancellation_kind") != "peer_disconnect"
-                or record.get("cancellation_source") != "client"
-                or record.get("drop_reason") is not None
-                or not any(
-                    transition.get("stage_name") == "completed"
-                    for transition in record["stage_transitions"]
-                    if isinstance(transition, dict)
-                )
-            ):
+            if not _is_verified_terminal_delivery_disconnect(record):
                 raise RuntimeError("wire terminal-delivery race lacks completed-stage disconnect evidence")
         elif any(
             record.get(field) is not None
@@ -509,14 +499,31 @@ def _load_json_object(path: Path) -> dict[str, object]:
 
 
 def _normalized_operation_outcome(record: dict[str, object]) -> object:
-    if (
-        record.get("operation_id") == 901
-        and record.get("terminal_outcome") == "dropped"
-        and record.get("cancellation_kind") == "peer_disconnect"
-        and record.get("cancellation_source") == "client"
-    ):
+    if _is_terminal_delivery_disconnect_candidate(record):
         return "completed"
     return record.get("terminal_outcome")
+
+
+def _is_terminal_delivery_disconnect_candidate(record: Mapping[str, object]) -> bool:
+    return bool(
+        record.get("terminal_outcome") == "dropped"
+        and record.get("cancellation_kind") == "peer_disconnect"
+        and record.get("cancellation_source") == "client"
+    )
+
+
+def _is_verified_terminal_delivery_disconnect(record: Mapping[str, object]) -> bool:
+    transitions = record.get("stage_transitions")
+    return bool(
+        _is_terminal_delivery_disconnect_candidate(record)
+        and record.get("drop_reason") is None
+        and isinstance(transitions, list)
+        and any(
+            transition.get("stage_name") == "completed"
+            for transition in transitions
+            if isinstance(transition, dict)
+        )
+    )
 
 
 def _write_self_signed_certificate(directory: Path) -> tuple[Path, Path]:

@@ -189,10 +189,15 @@ def test_wire_observation_gate_rejects_completed_operation_with_disconnect_metad
         _validate_observation_evidence(evidence)
 
 
-def test_wire_observation_gate_accepts_verified_terminal_delivery_disconnect_race(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("operation_id", "transport"), [(901, "websocket"), (251, "tcp")])
+def test_wire_observation_gate_accepts_verified_terminal_delivery_disconnect_race(
+    tmp_path: Path,
+    operation_id: int,
+    transport: str,
+) -> None:
     evidence = tmp_path / "observations.jsonl"
-    websocket_delivery = _operation(901, "websocket", "dropped")
-    websocket_delivery.update(
+    raced_delivery = _operation(operation_id, transport, "dropped")
+    raced_delivery.update(
         {
             "cancellation_kind": "peer_disconnect",
             "cancellation_source": "client",
@@ -202,14 +207,16 @@ def test_wire_observation_gate_accepts_verified_terminal_delivery_disconnect_rac
     )
     records = [
         _startup("auto", "tcp", "quic", "ipc", "websocket"),
-        _operation(901, "tcp", "completed"),
+        raced_delivery if (operation_id, transport) == (901, "tcp") else _operation(901, "tcp", "completed"),
         _operation(901, "quic", "completed"),
         _operation(901, "ipc", "completed"),
-        websocket_delivery,
+        raced_delivery
+        if (operation_id, transport) == (901, "websocket")
+        else _operation(901, "websocket", "completed"),
         _operation(101, "tcp", "cancelled", cancelled=True),
         _operation(151, "tcp", "completed"),
         _operation(201, "tcp", "completed"),
-        _operation(251, "tcp", "completed"),
+        raced_delivery if (operation_id, transport) == (251, "tcp") else _operation(251, "tcp", "completed"),
         _operation(101, "ipc", "cancelled", cancelled=True),
     ]
     evidence.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
