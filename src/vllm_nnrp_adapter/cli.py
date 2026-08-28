@@ -31,6 +31,7 @@ from .observability import (
     ServerStartupObservation,
     StructuredLogObservationSink,
 )
+from .stale_work_workload import STALE_WORK_BASELINES, run_stale_workload_file_sync
 
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
 _WIRE_PROVIDER_ORDER = ("tcp", "quic", "ipc", "websocket")
@@ -96,6 +97,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     adoption_evidence.add_argument("--input", type=Path, required=True)
     adoption_evidence.add_argument("--output", type=Path, required=True)
+
+    stale_workload = subcommands.add_parser(
+        "run-stale-workload",
+        help="Execute the randomized three-baseline stale-work workload and aggregate its evidence.",
+    )
+    stale_workload.add_argument("--manifest", type=Path, required=True)
+    stale_workload.add_argument("--raw-output", type=Path, required=True)
+    stale_workload.add_argument("--report-output", type=Path, required=True)
+    stale_workload.add_argument(
+        "--driver",
+        action="append",
+        required=True,
+        metavar="BASELINE=MODULE:FACTORY",
+        help="Driver factory for one required baseline. Repeat exactly once for each baseline.",
+    )
 
     server = subcommands.add_parser(
         "serve",
@@ -200,6 +216,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "aggregate-stale-work-evidence":
         aggregate_stale_work_evidence_file(args.input, args.output)
+        return 0
+    if args.command == "run-stale-workload":
+        run_stale_workload_file_sync(
+            args.manifest,
+            args.raw_output,
+            args.report_output,
+            driver_specs=_stale_work_driver_specs(args.driver),
+        )
         return 0
     if args.command == "serve":
         try:
@@ -540,6 +564,19 @@ def _named_values(values: Sequence[str], *, option_name: str) -> dict[str, str]:
         if name in parsed:
             raise ValueError(f"duplicate {option_name} for {name}")
         parsed[name] = item
+    return parsed
+
+
+def _stale_work_driver_specs(values: Sequence[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values:
+        baseline, separator, spec = value.partition("=")
+        if not separator or baseline not in STALE_WORK_BASELINES or not spec:
+            choices = ", ".join(STALE_WORK_BASELINES)
+            raise ValueError(f"--driver must use BASELINE=MODULE:FACTORY with one of {choices}")
+        if baseline in parsed:
+            raise ValueError(f"duplicate --driver for {baseline}")
+        parsed[baseline] = spec
     return parsed
 
 

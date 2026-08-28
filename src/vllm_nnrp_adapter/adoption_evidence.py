@@ -22,6 +22,8 @@ _CONTROL_BY_OUTCOME = {
     "expired": "deadline",
     "superseded": "supersede",
 }
+_OUTCOME_BY_CONTROL = {control: outcome for outcome, control in _CONTROL_BY_OUTCOME.items()}
+_CONTROL_KINDS = tuple(_OUTCOME_BY_CONTROL)
 _STALE_WORK_RATIOS = (0.1, 0.3, 0.5)
 _GPU_ACCOUNTING_METHODS = (
     "device_active_time",
@@ -54,12 +56,14 @@ def aggregate_stale_work_evidence(source: object) -> dict[str, Any]:
     workload = _workload_manifest(root.get("workload"))
     runs = _sequence(root.get("runs"), "evidence.runs")
     summaries: dict[str, dict[str, Any]] = {}
+    baseline_execution_order: list[str] = []
     for index, run_value in enumerate(runs):
         run = _mapping(run_value, f"evidence.runs[{index}]")
         baseline = _required_choice(run, "baseline", _BASELINES, f"evidence.runs[{index}]")
         if baseline in summaries:
             raise ValueError(f"evidence.runs contains duplicate baseline {baseline!r}")
         summaries[baseline] = _aggregate_run(run, workload, location=f"evidence.runs[{index}]")
+        baseline_execution_order.append(baseline)
 
     missing = sorted(set(_BASELINES) - summaries.keys())
     extra = sorted(summaries.keys() - set(_BASELINES))
@@ -69,11 +73,14 @@ def aggregate_stale_work_evidence(source: object) -> dict[str, Any]:
             f"missing={missing}, extra={extra}"
         )
 
+    _validate_schedule_identity(summaries)
+
     ordered_summaries = [summaries[baseline] for baseline in _BASELINES]
     report = {
         "benchmark_kind": "stale_work_adoption_evidence",
         "schema_version": _SCHEMA_VERSION,
         "workload": workload,
+        "baseline_execution_order": baseline_execution_order,
         "runs": ordered_summaries,
         "acceptance": _acceptance(workload, summaries),
     }
@@ -168,7 +175,7 @@ def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *,
             raise ValueError(f"{location}.samples[{index}].backend_stopped_at_seconds exceeds wall_clock_seconds")
         normalized_samples.append(sample)
 
-    stale_samples = [sample for sample in normalized_samples if sample["terminal_outcome"] in _STALE_OUTCOMES]
+    stale_samples = [sample for sample in normalized_samples if sample["control_kind"] is not None]
     observed_ratio = len(stale_samples) / len(normalized_samples)
     expected_ratio = cast(float, workload["stale_work_ratio"])
     if not math.isclose(observed_ratio, expected_ratio, abs_tol=1e-12):
@@ -188,6 +195,7 @@ def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *,
     ]
     late_result_operations = sum(int(sample["late_result_count"]) > 0 for sample in accepted_samples)
     useful_result_weight = sum(float(sample["useful_result_weight"]) for sample in normalized_samples)
+    semantic_defects = sum(_is_semantic_defect(sample) for sample in normalized_samples)
 
     return {
         "baseline": baseline,
@@ -203,6 +211,8 @@ def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *,
         "cancellation_effect_latency_seconds": _distribution(effect_latencies),
         "late_result_operation_count": late_result_operations,
         "late_result_rate": late_result_operations / len(accepted_samples) if accepted_samples else None,
+        "semantic_defect_count": semantic_defects,
+        "semantic_defect_rate": semantic_defects / len(normalized_samples),
         "gpu_seconds_90ci": {
             "total": _mean_confidence_interval([float(sample["gpu_seconds"]) for sample in normalized_samples]),
             "wasted": _mean_confidence_interval(wasted_gpu_samples),
@@ -216,10 +226,12 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
     terminal_outcome = _required_choice(
         sample,
         "terminal_outcome",
-        ("completed", *sorted(_STALE_OUTCOMES)),
+        ("completed", "failed", *sorted(_STALE_OUTCOMES)),
         location,
     )
     control_kind = sample.get("control_kind")
+    if control_kind is not None and control_kind not in _CONTROL_KINDS:
+        raise ValueError(f"{location}.control_kind must be null or one of {', '.join(_CONTROL_KINDS)}")
     control_accepted = _required_bool(sample, "control_accepted", location)
     control_accepted_at = _optional_non_negative_number(sample, "control_accepted_at_seconds", location)
     backend_stopped_at = _required_non_negative_number(sample, "backend_stopped_at_seconds", location)
@@ -227,13 +239,14 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
     useful_result_weight = _required_non_negative_number(sample, "useful_result_weight", location)
     late_result_count = _required_non_negative_int(sample, "late_result_count", location)
 
-    if terminal_outcome == "completed":
-        if control_kind is not None or control_accepted or control_accepted_at is not None or late_result_count:
-            raise ValueError(f"{location} completed samples must not contain accepted stale-work control evidence")
+    if control_kind is None:
+        if control_accepted or control_accepted_at is not None or late_result_count:
+            raise ValueError(f"{location} non-stale samples must not contain stale-work control evidence")
+        if terminal_outcome == "failed" and useful_result_weight != 0:
+            raise ValueError(f"{location}.useful_result_weight must be zero for failed work")
+        if terminal_outcome in _STALE_OUTCOMES:
+            raise ValueError(f"{location}.control_kind is required for stale terminal outcomes")
     else:
-        expected_control = _CONTROL_BY_OUTCOME[terminal_outcome]
-        if control_kind != expected_control:
-            raise ValueError(f"{location}.control_kind must be {expected_control!r} for {terminal_outcome!r}")
         if useful_result_weight != 0:
             raise ValueError(f"{location}.useful_result_weight must be zero for stale work")
         if control_accepted:
@@ -257,6 +270,35 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
         "useful_result_weight": useful_result_weight,
         "late_result_count": late_result_count,
     }
+
+
+def _validate_schedule_identity(summaries: Mapping[str, Mapping[str, Any]]) -> None:
+    expected: tuple[tuple[str, object], ...] | None = None
+    expected_baseline: str | None = None
+    for baseline in _BASELINES:
+        samples = cast(Sequence[Mapping[str, object]], summaries[baseline]["samples"])
+        signature = tuple((str(sample["sample_id"]), sample["control_kind"]) for sample in samples)
+        if expected is None:
+            expected = signature
+            expected_baseline = baseline
+        elif signature != expected:
+            raise ValueError(
+                "evidence.runs must use the same ordered sample IDs and control schedule across baselines; "
+                f"{baseline!r} differs from {expected_baseline!r}"
+            )
+
+
+def _is_semantic_defect(sample: Mapping[str, object]) -> int:
+    control_kind = sample["control_kind"]
+    terminal_outcome = sample["terminal_outcome"]
+    if control_kind is None:
+        return int(terminal_outcome == "failed")
+    if sample["control_accepted"] is not True:
+        return 0
+    return int(
+        terminal_outcome != _OUTCOME_BY_CONTROL[cast(str, control_kind)]
+        or cast(int, sample["late_result_count"]) > 0
+    )
 
 
 def _acceptance(workload: Mapping[str, object], summaries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:

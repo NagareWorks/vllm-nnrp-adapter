@@ -295,6 +295,39 @@ configured endpoint. Model-dominated chat parity is compatibility evidence, not 
 Evidence writing rejects endpoint URLs, IP addresses, user-directory paths, bearer/API tokens, and UUID-style machine or
 request identifiers. Use public-safe model aliases and environment labels in reports intended for publication.
 
+### Stale-Work Adoption Workload
+
+The stale-work runner executes raw OpenAI HTTP/SSE, equivalently orchestrated HTTP/SSE, and direct
+NNRP as separate runs in a seeded random order. All three drivers receive the same immutable sample
+ids, arrival offsets, and cancellation, abort, deadline, or supersession schedule. The runner limits
+in-flight requests but does not estimate GPU use: each driver must report GPU seconds from the
+accounting source named in the manifest.
+
+```bash
+vllm-nnrp-adapter run-stale-workload \
+  --manifest artifacts/stale-work-30.json \
+  --raw-output artifacts/stale-work-30-raw.json \
+  --report-output artifacts/stale-work-30-report.json \
+  --driver raw_openai_http_sse=deployment.benchmarks:make_raw_http_driver \
+  --driver orchestrated_http_sse=deployment.benchmarks:make_orchestrated_http_driver \
+  --driver direct_nnrp=deployment.benchmarks:make_direct_nnrp_driver
+```
+
+The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
+or `0.5`, public-safe model/engine/GPU labels, fixed arrival and cancellation schedule names,
+`arrival_interval_seconds`, prompt and completion token limits, warmup and sample counts,
+`max_in_flight`, and a seeded `gpu_accounting` declaration. Acceptance thresholds are evaluated
+only for exact scheduled-batch CUDA attribution or non-overlapping dedicated-device active time.
+Per-request inference intervals remain a named proxy and cannot substantiate GPU-second claims.
+
+Each zero-argument driver factory returns an object with a canonical `baseline` and async
+`begin_run`, `warmup`, `execute`, and `end_run` methods. `execute` returns one raw sample containing
+the scheduled `sample_id` and `control_kind`, terminal/control timing, backend stop time, GPU
+seconds, useful-result weight, and late-result count. A raw baseline may complete stale work when it
+cannot accept the scheduled control; stale identity still comes from the shared schedule. Changed
+sample identities, divergent control schedules, invalid terminal semantics, and sensitive evidence
+fail the run before either output is published.
+
 The first recorded release-readiness baseline is
 [openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).
 It should be treated as the current NNRP direct-path baseline. HTTP/SSE-to-NNRP relay data is useful only as smoke

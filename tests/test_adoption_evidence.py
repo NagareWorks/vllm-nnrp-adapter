@@ -23,7 +23,7 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
         for index in range(sample_count - stale_count):
             samples.append(
                 {
-                    "sample_id": f"{baseline}-completed-{index}",
+                    "sample_id": f"sample-{index:06d}",
                     "terminal_outcome": "completed",
                     "control_kind": None,
                     "control_accepted": False,
@@ -41,8 +41,8 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
             accepted_at = 7.0 + index if accepted else None
             samples.append(
                 {
-                    "sample_id": f"{baseline}-stale-{index}",
-                    "terminal_outcome": outcome,
+                    "sample_id": f"sample-{sample_count - stale_count + index:06d}",
+                    "terminal_outcome": outcome if accepted else "completed",
                     "control_kind": controls[outcome],
                     "control_accepted": accepted,
                     "control_accepted_at_seconds": accepted_at,
@@ -94,6 +94,11 @@ def test_aggregate_stale_work_evidence_reports_value_metrics_and_thresholds() ->
         "orchestrated_http_sse",
         "direct_nnrp",
     ]
+    assert report["baseline_execution_order"] == [
+        "raw_openai_http_sse",
+        "orchestrated_http_sse",
+        "direct_nnrp",
+    ]
     direct = report["runs"][2]
     assert direct["sample_count"] == 10
     assert direct["stale_sample_count"] == 3
@@ -103,6 +108,7 @@ def test_aggregate_stale_work_evidence_reports_value_metrics_and_thresholds() ->
     assert direct["deadline_weighted_useful_goodput"] == pytest.approx(0.35)
     assert direct["cancellation_effect_latency_seconds"]["p95_seconds"] == pytest.approx(0.1)
     assert direct["late_result_rate"] == 0.0
+    assert direct["semantic_defect_rate"] == 0.0
     assert direct["gpu_seconds_90ci"]["wasted"]["sample_count"] == 3
     assert report["acceptance"]["wasted_gpu_reduction_vs_raw"] == pytest.approx(0.6)
     assert report["acceptance"]["hypotheses"] == {
@@ -213,4 +219,25 @@ def test_late_results_are_counted_per_accepted_operation() -> None:
 
     assert direct["late_result_operation_count"] == 1
     assert direct["late_result_rate"] == pytest.approx(1 / 3)
+    assert direct["semantic_defect_count"] == 1
     assert report["acceptance"]["hypotheses"]["late_result_rate_below_0_1_percent"] == "fail"
+
+
+def test_accepted_control_with_wrong_terminal_outcome_is_a_semantic_defect() -> None:
+    source = deepcopy(_source())
+    source["runs"][2]["samples"][-1]["terminal_outcome"] = "completed"
+
+    report = aggregate_stale_work_evidence(source)
+    direct = report["runs"][2]
+
+    assert direct["stale_sample_count"] == 3
+    assert direct["semantic_defect_count"] == 1
+    assert direct["semantic_defect_rate"] == pytest.approx(0.1)
+
+
+def test_baselines_must_share_the_same_sample_and_control_schedule() -> None:
+    source = deepcopy(_source())
+    source["runs"][2]["samples"][-1]["control_kind"] = "abort"
+
+    with pytest.raises(ValueError, match="same ordered sample IDs and control schedule"):
+        aggregate_stale_work_evidence(source)
