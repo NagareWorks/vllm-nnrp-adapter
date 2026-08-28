@@ -316,15 +316,27 @@ vllm-nnrp-adapter run-stale-workload \
   --accounting-probe deployment.benchmarks:make_cuda_accounting_probe
 ```
 
-The `vllm_nnrp_adapter.stale_work_drivers` module provides `OpenAiHttpSseDriverConfig` and
-`RawOpenAiHttpSseDriver` so the raw baseline does not need a deployment-specific HTTP
-implementation. A zero-argument factory supplies the endpoint, credentials, optional headers,
-timeout, and sample-correlation header from deployment configuration.
+The `vllm_nnrp_adapter.stale_work_drivers` module provides `OpenAiHttpSseDriverConfig`,
+`RawOpenAiHttpSseDriver`, `DirectNnrpDriverConfig`, and `DirectNnrpDriver`. A zero-argument factory
+supplies deployment endpoints, credentials, provider routes, transport policy, and timeouts without
+placing those values in benchmark evidence. The direct driver opens one native NNRP connection and
+one multiplexed session for the run, submits the frozen OpenAI NNRP typed-payload envelope, and uses
+the runner-owned sample id as `request_id` for server-side accounting correlation.
 The raw driver sends an OpenAI-compatible streaming chat request and closes the live response for
 every scheduled control. That close is only client cancellation: abort, deadline, and supersession
 are deliberately not reported as equivalent server controls. Use a deployment-owned driver for the
 orchestrated HTTP/SSE baseline because vLLM does not expose one stable, version-independent HTTP
 control endpoint for those semantics.
+
+The direct driver dispatches native `CANCEL`, `ABORT`, `DEADLINE`, and `SUPERSEDE` controls on the
+same session as the request. Supersession also submits a real replacement request whose correlation
+id is `<sample-id>:replacement`; it does not model replacement as a local flag. A single event pump
+routes concurrent progress, partial-result, terminal-result, and lifecycle events by operation and
+frame identity. Terminal outcomes come from received lifecycle or `RESULT_DROP_REASON` evidence,
+while post-dispatch progress, partial results, and successful result pushes are retained as late
+result observations. The driver's boolean control result still means dispatch only. Server
+acceptance, backend stop time, and GPU attribution remain exclusively owned by the independent
+accounting probe.
 
 The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
 or `0.5`, the installed adapter version and lowercase Git revision, public-safe model/engine/GPU

@@ -5,10 +5,30 @@ import json
 import threading
 import urllib.request
 from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from nnrp import PayloadKind
+from nnrp.core import MessageType, unpack_typed_payload_frames, validate_frame_submit_body
+from nnrp.runtime import (
+    NativeRuntimeEvent,
+    ProgressMetadata,
+    ResultDropReasonCode,
+    ResultDropReasonMetadata,
+    RuntimeEventMetadata,
+    RuntimeEventMetadataKind,
+    RuntimeEventTail,
+    RuntimeFrameHeader,
+    RuntimeRole,
+)
 
-from vllm_nnrp_adapter.stale_work_drivers import OpenAiHttpSseDriverConfig, RawOpenAiHttpSseDriver
+from vllm_nnrp_adapter.stale_work_drivers import (
+    DirectNnrpDriver,
+    DirectNnrpDriverConfig,
+    OpenAiHttpSseDriverConfig,
+    RawOpenAiHttpSseDriver,
+)
 from vllm_nnrp_adapter.stale_work_workload import StaleWorkCase
 
 
@@ -219,3 +239,282 @@ def test_raw_http_driver_config_rejects_ambiguous_network_settings(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         OpenAiHttpSseDriverConfig(**kwargs)  # type: ignore[arg-type]
+
+
+class _FakeNativeOperation:
+    def __init__(self, operation_id: int, frame_id: int) -> None:
+        self.operation_id = operation_id
+        self.frame_id = frame_id
+        self.cancel_count = 0
+
+    def cancel(self) -> None:
+        self.cancel_count += 1
+
+
+class _FakeNativeSession:
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+        self.operations: list[_FakeNativeOperation] = []
+        self.events: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def async_submit_operation(self, request: Any) -> _FakeNativeOperation:
+        self.requests.append(request)
+        operation = _FakeNativeOperation(request.operation_id, request.frame_id)
+        self.operations.append(operation)
+        return operation
+
+    async def next_event(self, timeout: float | None = None) -> Any:
+        del timeout
+        return await self.events.get()
+
+
+class _FakeNativeConnection:
+    def __init__(self, session: _FakeNativeSession) -> None:
+        self.session = session
+        self.control_calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def open_session(self) -> _FakeNativeSession:
+        return self.session
+
+    def cancel_runtime_operation(self, *args: Any, **kwargs: Any) -> None:
+        self.control_calls.append(("cancel", args, kwargs))
+
+    def abort_runtime_operation(self, *args: Any, **kwargs: Any) -> None:
+        self.control_calls.append(("abort", args, kwargs))
+
+    def update_runtime_deadline(self, *args: Any, **kwargs: Any) -> None:
+        self.control_calls.append(("deadline", args, kwargs))
+
+    def supersede_runtime_operation(self, *args: Any, **kwargs: Any) -> None:
+        self.control_calls.append(("supersede", args, kwargs))
+
+
+class _FakeNativeConnectionContext:
+    def __init__(self, connection: _FakeNativeConnection) -> None:
+        self.connection = connection
+        self.exit_count = 0
+
+    def __enter__(self) -> _FakeNativeConnection:
+        return self.connection
+
+    def __exit__(self, *args: Any) -> None:
+        self.exit_count += 1
+
+
+async def _start_direct(
+    monkeypatch: pytest.MonkeyPatch,
+    case: StaleWorkCase,
+) -> tuple[DirectNnrpDriver, Any, _FakeNativeSession, _FakeNativeConnection, _FakeNativeConnectionContext]:
+    session = _FakeNativeSession()
+    connection = _FakeNativeConnection(session)
+    context = _FakeNativeConnectionContext(connection)
+    monkeypatch.setattr(
+        "vllm_nnrp_adapter.stale_work_drivers.connect_native_client_connection",
+        lambda _options: context,
+    )
+    driver = DirectNnrpDriver(
+        DirectNnrpDriverConfig(
+            "nnrp://benchmark-service",
+            timeout_seconds=2.0,
+            event_poll_seconds=0.01,
+        )
+    )
+    await driver.begin_run({"sample_count": 1, "max_in_flight": 4}, (case,))
+    return driver, await driver.start(case), session, connection, context
+
+
+def _progress_event(operation_id: int, frame_id: int) -> NativeRuntimeEvent:
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(MessageType.PROGRESS, session_id=1, frame_id=frame_id),
+        RuntimeEventMetadata(
+            RuntimeEventMetadataKind.PROGRESS,
+            ProgressMetadata(operation_id, 1, 1, 5_000, 0, 0),
+        ),
+        RuntimeEventTail.with_body(b"progress"),
+    )
+
+
+def _result_event(operation_id: int, frame_id: int) -> NativeRuntimeEvent:
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(MessageType.RESULT_PUSH, session_id=1, frame_id=frame_id),
+        RuntimeEventMetadata(RuntimeEventMetadataKind.RESULT_PUSH, SimpleNamespace(operation_id=operation_id)),
+        RuntimeEventTail.with_body(b"result"),
+    )
+
+
+def _drop_event(
+    operation_id: int,
+    frame_id: int,
+    reason: ResultDropReasonCode,
+) -> NativeRuntimeEvent:
+    return NativeRuntimeEvent(
+        RuntimeFrameHeader(MessageType.RESULT_DROP_REASON, session_id=1, frame_id=frame_id),
+        RuntimeEventMetadata(
+            RuntimeEventMetadataKind.RESULT_DROP_REASON,
+            ResultDropReasonMetadata(operation_id, 1, reason, RuntimeRole.RUNTIME, 0, 0),
+        ),
+        RuntimeEventTail.with_diagnostic(b""),
+    )
+
+
+def _submit_envelope(request: Any) -> dict[str, Any]:
+    body = validate_frame_submit_body(request.metadata, request.body)
+    frames = unpack_typed_payload_frames(
+        body.typed_payload_descriptor_region,
+        body.typed_payload_frame_region,
+        payload_kind_bitmap=request.metadata.payload_kind_bitmap,
+    )
+    assert len(frames) == 1
+    assert frames[0].payload_kind is PayloadKind.STRUCTURED_EVENT
+    return json.loads(frames[0].payload)
+
+
+@pytest.mark.asyncio
+async def test_direct_nnrp_driver_reuses_session_and_sends_correlated_profile_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case()
+    driver, operation, session, _connection, context = await _start_direct(monkeypatch, case)
+    await session.events.put(_result_event(operation.operation_id, operation.frame_id))
+
+    result = await operation.wait()
+    await operation.close()
+    await driver.end_run()
+
+    assert result.terminal_outcome == "completed"
+    assert result.useful_result_weight == 1.0
+    assert len(session.requests) == 1
+    envelope = _submit_envelope(session.requests[0])
+    assert envelope["request_id"] == case.sample_id
+    assert envelope["operation"] == "chat.completions.create"
+    assert envelope["body"]["stream"] is True
+    assert envelope["body"]["messages"][0]["content"].split() == ["a"] * case.prompt_tokens
+    assert context.exit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_nnrp_event_pump_routes_concurrent_operations_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_case = _case()
+    second_case = StaleWorkCase(
+        sample_id="sample-000008",
+        ordinal=8,
+        scheduled_offset_seconds=0.0,
+        model=first_case.model,
+        prompt_tokens=first_case.prompt_tokens,
+        max_completion_tokens=first_case.max_completion_tokens,
+        control_kind=None,
+        control_delay_seconds=first_case.control_delay_seconds,
+    )
+    driver, first, session, _connection, _context = await _start_direct(monkeypatch, first_case)
+    second = await driver.start(second_case)
+
+    await session.events.put(_result_event(second.operation_id, second.frame_id))
+    await session.events.put(_result_event(first.operation_id, first.frame_id))
+    second_result, first_result = await asyncio.gather(second.wait(), first.wait())
+    await asyncio.gather(first.close(), second.close())
+    await driver.end_run()
+
+    assert first_result.terminal_outcome == "completed"
+    assert second_result.terminal_outcome == "completed"
+    assert [_submit_envelope(request)["request_id"] for request in session.requests] == [
+        first_case.sample_id,
+        second_case.sample_id,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control_kind", "drop_reason", "expected_outcome"),
+    [
+        ("cancel", ResultDropReasonCode.PEER_CANCELLED, "cancelled"),
+        ("abort", ResultDropReasonCode.PEER_CANCELLED, "aborted"),
+        ("deadline", ResultDropReasonCode.DEADLINE_EXPIRED, "expired"),
+    ],
+)
+async def test_direct_nnrp_controls_use_server_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    control_kind: str,
+    drop_reason: ResultDropReasonCode,
+    expected_outcome: str,
+) -> None:
+    case = _case(control_kind=control_kind)
+    driver, operation, session, connection, _context = await _start_direct(monkeypatch, case)
+
+    assert await operation.apply_control(control_kind) is True
+    await session.events.put(_progress_event(operation.operation_id, operation.frame_id))
+    await session.events.put(_drop_event(operation.operation_id, operation.frame_id, drop_reason))
+    result = await operation.wait()
+    await operation.close()
+    await driver.end_run()
+
+    assert [call[0] for call in connection.control_calls] == [control_kind]
+    assert result.terminal_outcome == expected_outcome
+    assert result.useful_result_weight == 0.0
+    assert result.late_result_count == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_nnrp_does_not_infer_control_semantics_from_unrelated_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(control_kind="deadline")
+    driver, operation, session, _connection, _context = await _start_direct(monkeypatch, case)
+
+    assert await operation.apply_control("deadline") is True
+    await session.events.put(
+        _drop_event(operation.operation_id, operation.frame_id, ResultDropReasonCode.BACKPRESSURE)
+    )
+    result = await operation.wait()
+    await operation.close()
+    await driver.end_run()
+
+    assert result.terminal_outcome == "failed"
+    assert result.useful_result_weight == 0.0
+
+
+@pytest.mark.asyncio
+async def test_direct_nnrp_supersede_submits_and_drains_real_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _case(control_kind="supersede")
+    driver, operation, session, connection, _context = await _start_direct(monkeypatch, case)
+
+    assert await operation.apply_control("supersede") is True
+    assert len(session.requests) == 2
+    replacement = session.operations[1]
+    control = connection.control_calls[0]
+    assert control[0] == "supersede"
+    assert control[2]["old_operation_id"] == operation.operation_id
+    assert control[2]["new_operation_id"] == replacement.operation_id
+    assert _submit_envelope(session.requests[1])["request_id"] == f"{case.sample_id}:replacement"
+
+    await session.events.put(
+        _drop_event(operation.operation_id, operation.frame_id, ResultDropReasonCode.SUPERSEDED)
+    )
+    await session.events.put(_result_event(replacement.operation_id, replacement.frame_id))
+    result = await operation.wait()
+    await operation.close()
+    await asyncio.sleep(0)
+    await driver.end_run()
+
+    assert result.terminal_outcome == "superseded"
+    assert result.useful_result_weight == 0.0
+    assert replacement.cancel_count == 0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"endpoint": ""}, "non-empty"),
+        ({"endpoint": "nnrp://service", "timeout_seconds": float("inf")}, "finite"),
+        ({"endpoint": "nnrp://service", "event_poll_seconds": 0}, "positive"),
+    ],
+)
+def test_direct_nnrp_driver_config_rejects_unbounded_runtime_settings(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        DirectNnrpDriverConfig(**kwargs)  # type: ignore[arg-type]
