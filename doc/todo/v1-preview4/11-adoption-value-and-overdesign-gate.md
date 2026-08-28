@@ -19,6 +19,9 @@
   superseding requests.
 - [ ] Measure useful GPU seconds, wasted GPU seconds, cancellation effect latency, late-result rate,
   and deadline-weighted useful goodput.
+  The runner includes a correlated HTTP accounting-sidecar bridge with strict run, sample,
+  accounting-source, and lifecycle validation. This item remains open until real CUDA-attributed
+  10%, 30%, and 50% workload evidence is recorded.
 - [ ] Run priority-burst scenarios under queue saturation and measure high-priority p95/p99,
   low-priority starvation, throughput, and scheduler fairness.
 - [ ] Run backpressure and credit-exhaustion scenarios and measure bounded queue depth, recovery

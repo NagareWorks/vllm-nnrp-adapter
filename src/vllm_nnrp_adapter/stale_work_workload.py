@@ -66,7 +66,7 @@ class StaleWorkOperation(Protocol):
 
 
 class StaleWorkAccountingSession(Protocol):
-    def operation_started(self, monotonic_seconds: float) -> None: ...
+    async def operation_started(self, monotonic_seconds: float) -> None: ...
 
     async def finish(
         self,
@@ -376,7 +376,7 @@ async def _run_driver(
                         sample_id=case.sample_id,
                     )
                     try:
-                        accounting_session.operation_started(operation_started_at)
+                        await accounting_session.operation_started(operation_started_at)
                     except Exception as error:
                         raise StaleWorkExecutionError(
                             phase="accounting_operation_started",

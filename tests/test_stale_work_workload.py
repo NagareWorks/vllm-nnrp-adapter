@@ -208,7 +208,7 @@ class _FakeAccountingSession:
         self.case = case
         self.operation_started_at: float | None = None
 
-    def operation_started(self, monotonic_seconds: float) -> None:
+    async def operation_started(self, monotonic_seconds: float) -> None:
         self.operation_started_at = monotonic_seconds
 
     async def finish(

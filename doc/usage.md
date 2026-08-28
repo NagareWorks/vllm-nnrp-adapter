@@ -375,6 +375,42 @@ it cannot dispatch or the server does not accept the scheduled control; stale id
 from the shared schedule. Changed schedules, invalid terminal semantics, probe declaration drift,
 and sensitive evidence fail the run before either output is published.
 
+For deployments that expose request-correlated CUDA accounting through a sidecar, the adapter
+provides `HttpStaleWorkAccountingProbe` and `HttpAccountingProbeConfig` in
+`vllm_nnrp_adapter.stale_work_accounting`. This is benchmark infrastructure, not an NNRP control
+surface. The factory can configure the sidecar endpoint and credentials without putting either in
+the committed manifest:
+
+```python
+from vllm_nnrp_adapter.stale_work_accounting import (
+    HttpAccountingProbeConfig,
+    HttpStaleWorkAccountingProbe,
+)
+
+
+def make_cuda_accounting_probe() -> HttpStaleWorkAccountingProbe:
+    return HttpStaleWorkAccountingProbe(
+        HttpAccountingProbeConfig(
+            endpoint="https://accounting.internal.example/v1/stale-work",
+            method="cuda_event_attribution",
+            scope="scheduled_batch",
+            source="deployment-cuda-events",
+            api_key="read-from-deployment-secret-store",
+        )
+    )
+```
+
+The sidecar accepts JSON objects with schema version `nnrp-stale-work-accounting/v1` and an `action`
+of `begin_run`, `start_sample`, `operation_started`, `finish_sample`, `close_sample`, or `end_run`.
+The adapter supplies the immutable workload schedule and correlation identity. `finish_sample` must
+return the active `baseline`, `sample_id`, `method`, `scope`, and `source`, plus
+`control_accepted`, optional `control_accepted_after_seconds`, `backend_stopped_after_seconds`, and
+`gpu_seconds`. All durations are non-negative offsets from that sample's operation start. The probe
+rejects mismatched identity or accounting declarations, so telemetry from another request, run, or
+measurement source cannot silently enter the evidence artifact. The sidecar must derive acceptance
+and backend stop from server-side observation; it must not infer them from client disconnect or the
+adapter's control-dispatch result.
+
 The raw and aggregate files are written atomically only after all three baselines validate. The
 outcome file is always written: successful runs record the randomized baseline order and sample
 count, while failed runs record only the safe phase, baseline/sample identity when known, and error
