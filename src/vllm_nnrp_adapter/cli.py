@@ -20,6 +20,7 @@ from nnrp import (  # type: ignore[import-untyped]
 from nnrp.server import NativeServerProviderRoute  # type: ignore[import-untyped]
 
 from .adapter import OpenAiNnrpAdapter
+from .adoption_evidence import aggregate_stale_work_evidence_file
 from .benchmark import BenchmarkConfig, run_benchmark_sync, run_comparison_benchmark_sync
 from .conformance import MockChatCompletionBackend, load_backend_async, run_conformance_plan_sync
 from .nnrp_runtime import NnrpServerConfig, _serve_with_ready, serve
@@ -88,6 +89,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="Write a generated combined comparison table beside the raw JSON evidence.",
     )
+
+    adoption_evidence = subcommands.add_parser(
+        "aggregate-stale-work-evidence",
+        help="Validate and aggregate three-baseline stale-work GPU evidence.",
+    )
+    adoption_evidence.add_argument("--input", type=Path, required=True)
+    adoption_evidence.add_argument("--output", type=Path, required=True)
 
     server = subcommands.add_parser(
         "serve",
@@ -189,6 +197,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.markdown_output is not None:
                 parser.error("--markdown-output requires --comparison")
             run_benchmark_sync(args.output, args.backend, benchmark_config)
+        return 0
+    if args.command == "aggregate-stale-work-evidence":
+        aggregate_stale_work_evidence_file(args.input, args.output)
         return 0
     if args.command == "serve":
         try:
