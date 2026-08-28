@@ -328,9 +328,12 @@ Each zero-argument driver factory returns an object with a canonical `baseline` 
 `begin_run`, `warmup`, `start`, and `end_run` methods. `start` returns a live operation with
 `apply_control`, `wait`, and `close`. The runner owns sample identity, arrival and control timing,
 bounded concurrency, and baseline order. Operations return `StaleWorkResult` with terminal outcome,
-useful-result weight, and late-result count; they cannot overwrite runner-owned identity, timing, or
-GPU evidence. `apply_control` reports only whether the client dispatched the control. It is not a
-server acknowledgement.
+useful-result weight, and the number of result events observed after control dispatch; they cannot
+overwrite runner-owned identity, timing, or GPU evidence. `apply_control` reports only whether the
+client dispatched the control. It is not a server acknowledgement. The aggregate report classifies
+post-dispatch events as late results only when the independent accounting probe confirms that the
+server accepted the control. This preserves raw HTTP observations without claiming that a client
+disconnect was accepted as cancellation, abort, expiry, or supersession.
 
 The zero-argument accounting-probe factory declares `method`, `scope`, and `source` values that must
 exactly match `gpu_accounting` in the manifest. It creates one accounting session per sample. That

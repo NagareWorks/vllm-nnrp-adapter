@@ -323,9 +323,9 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
                 raise ValueError(f"{location}.control_accepted_at_seconds precedes issued control")
             if backend_stopped_at < control_accepted_at:
                 raise ValueError(f"{location}.backend_stopped_at_seconds precedes accepted control")
-        elif control_accepted_at is not None or late_result_count:
+        elif control_accepted_at is not None:
             raise ValueError(
-                f"{location} cannot report accepted-control timing or late results when control_accepted is false"
+                f"{location} cannot report accepted-control timing when control_accepted is false"
             )
 
     return {

@@ -270,6 +270,20 @@ def test_late_results_are_counted_per_accepted_operation() -> None:
     assert report["acceptance"]["hypotheses"]["late_result_rate_below_0_1_percent"] == "fail"
 
 
+def test_post_dispatch_results_are_not_late_until_control_acceptance_is_observed() -> None:
+    source = deepcopy(_source())
+    source["runs"][0]["samples"][-1]["late_result_count"] = 2
+
+    report = aggregate_stale_work_evidence(source)
+    raw = report["runs"][0]
+
+    assert raw["samples"][-1]["late_result_count"] == 2
+    assert raw["accepted_control_count"] == 0
+    assert raw["late_result_operation_count"] == 0
+    assert raw["late_result_rate"] is None
+    assert raw["semantic_defect_count"] == 0
+
+
 def test_accepted_control_with_wrong_terminal_outcome_is_a_semantic_defect() -> None:
     source = deepcopy(_source())
     source["runs"][2]["samples"][-1]["terminal_outcome"] = "completed"
