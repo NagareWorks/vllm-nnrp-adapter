@@ -317,18 +317,20 @@ vllm-nnrp-adapter run-stale-workload \
 The manifest is a JSON object with `scenario: "stale_work"`, a `stale_work_ratio` of `0.1`, `0.3`,
 or `0.5`, the installed adapter version and lowercase Git revision, public-safe model/engine/GPU
 labels, fixed arrival and cancellation schedule names,
-`arrival_interval_seconds`, prompt and completion token limits, warmup and sample counts,
+`arrival_interval_seconds`, `control_delay_seconds`, prompt and completion token limits, warmup and sample counts,
 `max_in_flight`, and a seeded `gpu_accounting` declaration. Acceptance thresholds are evaluated
 only for exact scheduled-batch CUDA attribution or non-overlapping dedicated-device active time.
 Per-request inference intervals remain a named proxy and cannot substantiate GPU-second claims.
 
 Each zero-argument driver factory returns an object with a canonical `baseline` and async
-`begin_run`, `warmup`, `execute`, and `end_run` methods. `execute` returns one raw sample containing
-the scheduled `sample_id` and `control_kind`, terminal/control timing, backend stop time, GPU
-seconds, useful-result weight, and late-result count. A raw baseline may complete stale work when it
-cannot accept the scheduled control; stale identity still comes from the shared schedule. Changed
-sample identities, divergent control schedules, invalid terminal semantics, and sensitive evidence
-fail the run before either output is published.
+`begin_run`, `warmup`, `start`, and `end_run` methods. `start` returns a live operation with
+`apply_control`, `wait`, and `close`. The runner owns sample identity, arrival and control timing,
+bounded concurrency, and baseline order. Operations return `StaleWorkResult` with terminal outcome,
+operation-relative backend-stop timing, GPU seconds, useful-result weight, and late-result count;
+they cannot overwrite runner-owned identity or timing evidence. A raw baseline may complete stale
+work when it cannot accept the scheduled control; stale identity still comes from the shared
+schedule. Changed schedules, invalid terminal semantics, and sensitive evidence fail the run before
+either output is published.
 
 The raw and aggregate files are written atomically only after all three baselines validate. The
 outcome file is always written: successful runs record the randomized baseline order and sample

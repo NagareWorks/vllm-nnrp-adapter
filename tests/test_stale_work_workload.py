@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from vllm_nnrp_adapter.cli import main
 from vllm_nnrp_adapter.stale_work_workload import (
     STALE_WORK_BASELINES,
     StaleWorkCase,
+    StaleWorkResult,
     build_stale_work_schedule,
     run_stale_workload,
 )
@@ -35,6 +37,7 @@ def _manifest(*, ratio: float, sample_count: int = 100, random_seed: int = 17) -
         "arrival_schedule": "seeded-fixed-interval",
         "arrival_interval_seconds": 0.025,
         "cancellation_schedule": "seeded-stale-selection",
+        "control_delay_seconds": 0.001,
         "prompt_tokens": 4096,
         "max_completion_tokens": 128,
         "warmup": 2,
@@ -109,35 +112,48 @@ class _FakeDriver:
     async def warmup(self, case: StaleWorkCase) -> None:
         self.warmup_cases.append(case)
 
-    async def execute(self, case: StaleWorkCase) -> Mapping[str, object]:
+    async def start(self, case: StaleWorkCase) -> _FakeOperation:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
-        try:
-            await asyncio.sleep(0.001)
-            self.executed_cases.append(case)
-        finally:
-            self.active -= 1
-
-        accepted = case.is_stale and self.baseline != "raw_openai_http_sse"
-        terminal_outcome = (
-            _OUTCOME_BY_CONTROL[case.control_kind]
-            if accepted and case.control_kind is not None
-            else "completed"
-        )
-        return {
-            "sample_id": case.sample_id,
-            "terminal_outcome": terminal_outcome,
-            "control_kind": case.control_kind,
-            "control_accepted": accepted,
-            "control_accepted_at_seconds": 0.0 if accepted else None,
-            "backend_stopped_at_seconds": 0.0,
-            "gpu_seconds": self.stale_gpu_seconds if case.is_stale else 0.5,
-            "useful_result_weight": 0.0 if case.is_stale else 1.0,
-            "late_result_count": 0,
-        }
+        self.executed_cases.append(case)
+        return _FakeOperation(self, case)
 
     async def end_run(self) -> None:
         self.ended = True
+
+
+class _FakeOperation:
+    def __init__(self, driver: _FakeDriver, case: StaleWorkCase) -> None:
+        self.driver = driver
+        self.case = case
+        self.accepted_control: str | None = None
+        self.closed = False
+
+    async def apply_control(self, control_kind: str) -> bool:
+        accepted = self.driver.baseline != "raw_openai_http_sse"
+        if accepted:
+            self.accepted_control = control_kind
+        return accepted
+
+    async def wait(self) -> StaleWorkResult:
+        await asyncio.sleep(0.05)
+        terminal_outcome = (
+            _OUTCOME_BY_CONTROL[self.accepted_control]
+            if self.accepted_control is not None
+            else "completed"
+        )
+        return StaleWorkResult(
+            terminal_outcome=terminal_outcome,
+            backend_stopped_after_seconds=0.05,
+            gpu_seconds=self.driver.stale_gpu_seconds if self.case.is_stale else 0.5,
+            useful_result_weight=0.0 if self.case.is_stale else 1.0,
+            late_result_count=0,
+        )
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.driver.active -= 1
+            self.closed = True
 
 
 def _executor_manifest() -> dict[str, object]:
@@ -182,6 +198,19 @@ async def test_executor_runs_identical_randomized_baselines_with_bounded_concurr
     assert raw["wasted_gpu_seconds"] == pytest.approx(2.0)
     assert raw["semantic_defect_count"] == 0
     assert all(sample["terminal_outcome"] == "completed" for sample in raw["samples"])
+    for run in report["runs"]:
+        for sample in run["samples"]:
+            assert sample["operation_started_at_seconds"] >= sample["scheduled_offset_seconds"]
+            if sample["control_kind"] is None:
+                assert sample["control_scheduled_at_seconds"] is None
+                assert sample["control_issued_at_seconds"] is None
+            else:
+                assert sample["control_scheduled_at_seconds"] == pytest.approx(
+                    sample["operation_started_at_seconds"] + 0.001
+                )
+                assert sample["control_issued_at_seconds"] >= sample["control_scheduled_at_seconds"]
+                if sample["control_accepted"]:
+                    assert sample["control_accepted_at_seconds"] >= sample["control_issued_at_seconds"]
 
 
 @pytest.mark.asyncio
@@ -200,17 +229,35 @@ async def test_executor_requires_manifest_to_name_installed_adapter_version() ->
 
 
 class _BadSampleDriver(_FakeDriver):
-    async def execute(self, case: StaleWorkCase) -> Mapping[str, object]:
-        sample = dict(await super().execute(case))
-        sample["sample_id"] = "wrong-sample"
-        return sample
+    async def start(self, case: StaleWorkCase) -> _BadResultOperation:
+        operation = await super().start(case)
+        return _BadResultOperation(operation)
 
 
 class _SensitiveSampleDriver(_FakeDriver):
-    async def execute(self, case: StaleWorkCase) -> Mapping[str, object]:
-        sample = dict(await super().execute(case))
-        sample["debug_path"] = r"C:\Users\operator\private-run"
-        return sample
+    async def start(self, case: StaleWorkCase) -> _SensitiveResultOperation:
+        operation = await super().start(case)
+        return _SensitiveResultOperation(operation)
+
+
+class _BadResultOperation:
+    def __init__(self, operation: _FakeOperation) -> None:
+        self.operation = operation
+
+    async def apply_control(self, control_kind: str) -> bool:
+        return await self.operation.apply_control(control_kind)
+
+    async def wait(self) -> Mapping[str, object]:
+        return {"sample_id": "wrong-sample"}
+
+    async def close(self) -> None:
+        await self.operation.close()
+
+
+class _SensitiveResultOperation(_BadResultOperation):
+    async def wait(self) -> StaleWorkResult:
+        result = await self.operation.wait()
+        return replace(result, terminal_outcome=r"C:\Users\operator\private-run")
 
 
 @pytest.mark.asyncio

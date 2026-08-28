@@ -7,6 +7,7 @@ import json
 import math
 import random
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -34,10 +35,28 @@ class StaleWorkCase:
     prompt_tokens: int
     max_completion_tokens: int
     control_kind: str | None
+    control_delay_seconds: float
 
     @property
     def is_stale(self) -> bool:
         return self.control_kind is not None
+
+
+@dataclass(frozen=True)
+class StaleWorkResult:
+    terminal_outcome: str
+    backend_stopped_after_seconds: float
+    gpu_seconds: float
+    useful_result_weight: float
+    late_result_count: int
+
+
+class StaleWorkOperation(Protocol):
+    async def apply_control(self, control_kind: str) -> bool: ...
+
+    async def wait(self) -> StaleWorkResult: ...
+
+    async def close(self) -> None: ...
 
 
 class StaleWorkDriver(Protocol):
@@ -51,7 +70,7 @@ class StaleWorkDriver(Protocol):
 
     async def warmup(self, case: StaleWorkCase) -> None: ...
 
-    async def execute(self, case: StaleWorkCase) -> Mapping[str, object]: ...
+    async def start(self, case: StaleWorkCase) -> StaleWorkOperation: ...
 
     async def end_run(self) -> None: ...
 
@@ -91,6 +110,7 @@ def build_stale_work_schedule(workload: object) -> tuple[StaleWorkCase, ...]:
     model = str(manifest["model"])
     prompt_tokens = int(manifest["prompt_tokens"])
     max_completion_tokens = int(manifest["max_completion_tokens"])
+    control_delay_seconds = float(manifest["control_delay_seconds"])
 
     return tuple(
         StaleWorkCase(
@@ -101,6 +121,7 @@ def build_stale_work_schedule(workload: object) -> tuple[StaleWorkCase, ...]:
             prompt_tokens=prompt_tokens,
             max_completion_tokens=max_completion_tokens,
             control_kind=next(control_iterator) if ordinal in stale_ordinals else None,
+            control_delay_seconds=control_delay_seconds,
         )
         for ordinal in range(sample_count)
     )
@@ -240,39 +261,101 @@ async def _run_driver(
 
     try:
         await _warmup_driver(driver, manifest, schedule)
-        loop = asyncio.get_running_loop()
-        run_started_at = loop.time()
+        run_started_at = time.perf_counter()
         semaphore = asyncio.Semaphore(cast(int, manifest["max_in_flight"]))
 
         async def execute_case(case: StaleWorkCase) -> dict[str, object]:
-            delay = run_started_at + case.scheduled_offset_seconds - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
+            await _sleep_until(run_started_at + case.scheduled_offset_seconds)
             async with semaphore:
+                operation_started_at = time.perf_counter()
                 try:
-                    sample = dict(await driver.execute(case))
+                    operation = await driver.start(case)
                 except Exception as error:
                     raise StaleWorkExecutionError(
-                        phase="execute",
+                        phase="start",
                         baseline=driver.baseline,
                         sample_id=case.sample_id,
                     ) from error
-            if sample.get("sample_id") != case.sample_id:
-                raise StaleWorkExecutionError(
-                    phase="sample_validation",
-                    baseline=driver.baseline,
-                    sample_id=case.sample_id,
+
+                _validate_operation(operation, baseline=driver.baseline, sample_id=case.sample_id)
+                result_task = asyncio.create_task(operation.wait())
+                control_scheduled_at = (
+                    operation_started_at - run_started_at + case.control_delay_seconds
+                    if case.is_stale
+                    else None
                 )
-            if sample.get("control_kind") != case.control_kind:
-                raise StaleWorkExecutionError(
-                    phase="sample_validation",
-                    baseline=driver.baseline,
-                    sample_id=case.sample_id,
-                )
-            return sample
+                control_issued_at: float | None = None
+                control_accepted = False
+                control_accepted_at: float | None = None
+                try:
+                    if case.control_kind is not None:
+                        await _sleep_until(operation_started_at + case.control_delay_seconds)
+                        control_issued_at = time.perf_counter() - run_started_at
+                        try:
+                            control_accepted = await operation.apply_control(case.control_kind)
+                        except Exception as error:
+                            raise StaleWorkExecutionError(
+                                phase="apply_control",
+                                baseline=driver.baseline,
+                                sample_id=case.sample_id,
+                            ) from error
+                        if not isinstance(control_accepted, bool):
+                            raise StaleWorkExecutionError(
+                                phase="sample_validation",
+                                baseline=driver.baseline,
+                                sample_id=case.sample_id,
+                            )
+                        if control_accepted:
+                            control_accepted_at = time.perf_counter() - run_started_at
+                    try:
+                        result = await result_task
+                    except Exception as error:
+                        raise StaleWorkExecutionError(
+                            phase="wait",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from error
+                    _validate_result(result, baseline=driver.baseline, sample_id=case.sample_id)
+                except BaseException:
+                    if not result_task.done():
+                        result_task.cancel()
+                        await asyncio.gather(result_task, return_exceptions=True)
+                    try:
+                        await operation.close()
+                    except Exception:
+                        pass
+                    raise
+                else:
+                    try:
+                        await operation.close()
+                    except Exception as error:
+                        raise StaleWorkExecutionError(
+                            phase="close",
+                            baseline=driver.baseline,
+                            sample_id=case.sample_id,
+                        ) from error
+
+                operation_started_at_seconds = operation_started_at - run_started_at
+                return {
+                    "sample_id": case.sample_id,
+                    "scheduled_offset_seconds": case.scheduled_offset_seconds,
+                    "operation_started_at_seconds": operation_started_at_seconds,
+                    "terminal_outcome": result.terminal_outcome,
+                    "control_kind": case.control_kind,
+                    "control_scheduled_at_seconds": control_scheduled_at,
+                    "control_issued_at_seconds": control_issued_at,
+                    "control_accepted": control_accepted,
+                    "control_accepted_at_seconds": control_accepted_at,
+                    "backend_stopped_at_seconds": (
+                        operation_started_at_seconds + result.backend_stopped_after_seconds
+                    ),
+                    "gpu_seconds": result.gpu_seconds,
+                    "useful_result_weight": result.useful_result_weight,
+                    "late_result_count": result.late_result_count,
+                }
 
         samples = await asyncio.gather(*(execute_case(case) for case in schedule))
-        wall_clock_seconds = loop.time() - run_started_at
+        wall_clock_seconds = time.perf_counter() - run_started_at
     except BaseException:
         try:
             await driver.end_run()
@@ -309,6 +392,7 @@ async def _warmup_driver(
             prompt_tokens=template.prompt_tokens,
             max_completion_tokens=template.max_completion_tokens,
             control_kind=None,
+            control_delay_seconds=template.control_delay_seconds,
         )
         try:
             await driver.warmup(case)
@@ -326,9 +410,54 @@ def _validate_driver(driver: object, *, expected_baseline: object, location: str
         raise ValueError(f"{location} driver baseline must be one of {', '.join(STALE_WORK_BASELINES)}")
     if baseline != expected_baseline:
         raise ValueError(f"{location} created baseline {baseline!r}; expected {expected_baseline!r}")
-    for method_name in ("begin_run", "warmup", "execute", "end_run"):
+    for method_name in ("begin_run", "warmup", "start", "end_run"):
         if not callable(getattr(driver, method_name, None)):
             raise TypeError(f"{location} driver must define callable {method_name}()")
+
+
+def _validate_operation(operation: object, *, baseline: str, sample_id: str) -> None:
+    for method_name in ("apply_control", "wait", "close"):
+        if not callable(getattr(operation, method_name, None)):
+            raise StaleWorkExecutionError(
+                phase="operation_validation",
+                baseline=baseline,
+                sample_id=sample_id,
+            )
+
+
+def _validate_result(result: object, *, baseline: str, sample_id: str) -> None:
+    if (
+        not isinstance(result, StaleWorkResult)
+        or not isinstance(result.terminal_outcome, str)
+        or not result.terminal_outcome
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            for value in (
+                result.backend_stopped_after_seconds,
+                result.gpu_seconds,
+                result.useful_result_weight,
+            )
+        )
+        or isinstance(result.late_result_count, bool)
+        or not isinstance(result.late_result_count, int)
+        or result.late_result_count < 0
+    ):
+        raise StaleWorkExecutionError(
+            phase="sample_validation",
+            baseline=baseline,
+            sample_id=sample_id,
+        )
+
+
+async def _sleep_until(target: float) -> None:
+    while True:
+        remaining = target - time.perf_counter()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(remaining)
 
 
 def _failure_outcome(error: Exception) -> dict[str, object]:

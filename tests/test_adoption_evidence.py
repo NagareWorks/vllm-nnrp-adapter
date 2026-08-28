@@ -24,8 +24,12 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
             samples.append(
                 {
                     "sample_id": f"sample-{index:06d}",
+                    "scheduled_offset_seconds": index * 0.01,
+                    "operation_started_at_seconds": index * 0.01,
                     "terminal_outcome": "completed",
                     "control_kind": None,
+                    "control_scheduled_at_seconds": None,
+                    "control_issued_at_seconds": None,
                     "control_accepted": False,
                     "control_accepted_at_seconds": None,
                     "backend_stopped_at_seconds": 1.0 + index,
@@ -38,12 +42,19 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
         controls = {"cancelled": "cancel", "aborted": "abort", "expired": "deadline", "superseded": "supersede"}
         for index in range(stale_count):
             outcome = outcomes[index % len(outcomes)]
+            ordinal = sample_count - stale_count + index
+            operation_started_at = ordinal * 0.01
+            control_scheduled_at = operation_started_at + 0.001
             accepted_at = 7.0 + index if accepted else None
             samples.append(
                 {
-                    "sample_id": f"sample-{sample_count - stale_count + index:06d}",
+                    "sample_id": f"sample-{ordinal:06d}",
+                    "scheduled_offset_seconds": operation_started_at,
+                    "operation_started_at_seconds": operation_started_at,
                     "terminal_outcome": outcome if accepted else "completed",
                     "control_kind": controls[outcome],
+                    "control_scheduled_at_seconds": control_scheduled_at,
+                    "control_issued_at_seconds": control_scheduled_at,
                     "control_accepted": accepted,
                     "control_accepted_at_seconds": accepted_at,
                     "backend_stopped_at_seconds": (accepted_at + 0.1) if accepted_at is not None else 9.5 + index,
@@ -67,6 +78,7 @@ def _source(*, ratio: float = 0.3) -> dict[str, Any]:
             "arrival_schedule": "seeded-fixed-interval",
             "arrival_interval_seconds": 0.01,
             "cancellation_schedule": "seeded-stale-selection",
+            "control_delay_seconds": 0.001,
             "prompt_tokens": 4096,
             "max_completion_tokens": 128,
             "warmup": 2,
@@ -183,6 +195,18 @@ def test_overlapping_device_active_time_cannot_be_summed_as_request_gpu_seconds(
         (
             lambda source: source["workload"].update({"adapter_revision": "not-a-revision"}),
             "lowercase 7-40 character Git revision",
+        ),
+        (
+            lambda source: source["runs"][0]["samples"][0].update({"sample_id": "sample-999999"}),
+            "sample_id must be",
+        ),
+        (
+            lambda source: source["runs"][0]["samples"][1].update({"scheduled_offset_seconds": 0.5}),
+            "differs from workload schedule",
+        ),
+        (
+            lambda source: source["runs"][0]["samples"][-1].update({"control_issued_at_seconds": 0.0}),
+            "precedes scheduled control",
         ),
     ],
 )

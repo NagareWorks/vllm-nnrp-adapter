@@ -116,6 +116,11 @@ def normalize_stale_work_manifest(value: object) -> dict[str, Any]:
             "evidence.workload",
         ),
         "cancellation_schedule": _required_string(manifest, "cancellation_schedule", "evidence.workload"),
+        "control_delay_seconds": _required_non_negative_number(
+            manifest,
+            "control_delay_seconds",
+            "evidence.workload",
+        ),
         "prompt_tokens": _required_positive_int(manifest, "prompt_tokens", "evidence.workload"),
         "max_completion_tokens": _required_positive_int(
             manifest,
@@ -191,9 +196,28 @@ def _aggregate_run(run: Mapping[str, object], workload: Mapping[str, object], *,
     for index, sample_value in enumerate(samples):
         sample = _normalize_sample(sample_value, location=f"{location}.samples[{index}]")
         sample_id = str(sample["sample_id"])
+        expected_sample_id = f"sample-{index:06d}"
+        if sample_id != expected_sample_id:
+            raise ValueError(f"{location}.samples[{index}].sample_id must be {expected_sample_id!r}")
         if sample_id in sample_ids:
             raise ValueError(f"{location}.samples contains duplicate sample_id {sample_id!r}")
         sample_ids.add(sample_id)
+        expected_offset = index * cast(float, workload["arrival_interval_seconds"])
+        if not math.isclose(float(sample["scheduled_offset_seconds"]), expected_offset, abs_tol=1e-12):
+            raise ValueError(f"{location}.samples[{index}].scheduled_offset_seconds differs from workload schedule")
+        if float(sample["operation_started_at_seconds"]) < expected_offset:
+            raise ValueError(f"{location}.samples[{index}].operation_started_at_seconds precedes scheduled arrival")
+        if sample["control_kind"] is not None:
+            expected_control_at = (
+                float(sample["operation_started_at_seconds"])
+                + cast(float, workload["control_delay_seconds"])
+            )
+            if not math.isclose(
+                float(sample["control_scheduled_at_seconds"]),
+                expected_control_at,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(f"{location}.samples[{index}].control_scheduled_at_seconds differs from workload")
         if float(sample["backend_stopped_at_seconds"]) > wall_clock_seconds:
             raise ValueError(f"{location}.samples[{index}].backend_stopped_at_seconds exceeds wall_clock_seconds")
         normalized_samples.append(sample)
@@ -256,6 +280,10 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
     if control_kind is not None and control_kind not in _CONTROL_KINDS:
         raise ValueError(f"{location}.control_kind must be null or one of {', '.join(_CONTROL_KINDS)}")
     control_accepted = _required_bool(sample, "control_accepted", location)
+    scheduled_offset = _required_non_negative_number(sample, "scheduled_offset_seconds", location)
+    operation_started_at = _required_non_negative_number(sample, "operation_started_at_seconds", location)
+    control_scheduled_at = _optional_non_negative_number(sample, "control_scheduled_at_seconds", location)
+    control_issued_at = _optional_non_negative_number(sample, "control_issued_at_seconds", location)
     control_accepted_at = _optional_non_negative_number(sample, "control_accepted_at_seconds", location)
     backend_stopped_at = _required_non_negative_number(sample, "backend_stopped_at_seconds", location)
     gpu_seconds = _required_non_negative_number(sample, "gpu_seconds", location)
@@ -263,18 +291,32 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
     late_result_count = _required_non_negative_int(sample, "late_result_count", location)
 
     if control_kind is None:
-        if control_accepted or control_accepted_at is not None or late_result_count:
+        if (
+            control_scheduled_at is not None
+            or control_issued_at is not None
+            or control_accepted
+            or control_accepted_at is not None
+            or late_result_count
+        ):
             raise ValueError(f"{location} non-stale samples must not contain stale-work control evidence")
         if terminal_outcome == "failed" and useful_result_weight != 0:
             raise ValueError(f"{location}.useful_result_weight must be zero for failed work")
         if terminal_outcome in _STALE_OUTCOMES:
             raise ValueError(f"{location}.control_kind is required for stale terminal outcomes")
     else:
+        if control_scheduled_at is None or control_issued_at is None:
+            raise ValueError(f"{location} stale samples require scheduled and issued control timing")
+        if control_scheduled_at < operation_started_at:
+            raise ValueError(f"{location}.control_scheduled_at_seconds precedes operation start")
+        if control_issued_at < control_scheduled_at:
+            raise ValueError(f"{location}.control_issued_at_seconds precedes scheduled control")
         if useful_result_weight != 0:
             raise ValueError(f"{location}.useful_result_weight must be zero for stale work")
         if control_accepted:
             if control_accepted_at is None:
                 raise ValueError(f"{location}.control_accepted_at_seconds is required when control_accepted is true")
+            if control_accepted_at < control_issued_at:
+                raise ValueError(f"{location}.control_accepted_at_seconds precedes issued control")
             if backend_stopped_at < control_accepted_at:
                 raise ValueError(f"{location}.backend_stopped_at_seconds precedes accepted control")
         elif control_accepted_at is not None or late_result_count:
@@ -284,8 +326,12 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
 
     return {
         "sample_id": _required_string(sample, "sample_id", location),
+        "scheduled_offset_seconds": scheduled_offset,
+        "operation_started_at_seconds": operation_started_at,
         "terminal_outcome": terminal_outcome,
         "control_kind": control_kind,
+        "control_scheduled_at_seconds": control_scheduled_at,
+        "control_issued_at_seconds": control_issued_at,
         "control_accepted": control_accepted,
         "control_accepted_at_seconds": control_accepted_at,
         "backend_stopped_at_seconds": backend_stopped_at,
@@ -296,11 +342,18 @@ def _normalize_sample(value: object, *, location: str) -> dict[str, Any]:
 
 
 def _validate_schedule_identity(summaries: Mapping[str, Mapping[str, Any]]) -> None:
-    expected: tuple[tuple[str, object], ...] | None = None
+    expected: tuple[tuple[str, object, object], ...] | None = None
     expected_baseline: str | None = None
     for baseline in _BASELINES:
         samples = cast(Sequence[Mapping[str, object]], summaries[baseline]["samples"])
-        signature = tuple((str(sample["sample_id"]), sample["control_kind"]) for sample in samples)
+        signature = tuple(
+            (
+                str(sample["sample_id"]),
+                sample["control_kind"],
+                sample["scheduled_offset_seconds"],
+            )
+            for sample in samples
+        )
         if expected is None:
             expected = signature
             expected_baseline = baseline
