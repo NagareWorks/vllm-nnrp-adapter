@@ -417,6 +417,55 @@ count, while failed runs record only the safe phase, baseline/sample identity wh
 type. Exception text is deliberately excluded so local paths, endpoints, and request content cannot
 leak into committed failure evidence.
 
+## Priority-Burst Adoption Workload
+
+`run-priority-burst-workload` measures whether urgent requests receive useful scheduler treatment
+while an existing normal-priority queue remains runnable. It executes raw OpenAI HTTP/SSE,
+HTTP/SSE with equivalent external orchestration, and direct NNRP in seeded order against one fixed
+arrival schedule. Every baseline receives the same request ids, prompt/output limits, normal
+traffic, and contiguous urgent burst.
+
+```bash
+vllm-nnrp-adapter run-priority-burst-workload \
+  --manifest artifacts/priority-burst.json \
+  --raw-output artifacts/priority-burst-raw.json \
+  --report-output artifacts/priority-burst-report.json \
+  --outcome-output artifacts/priority-burst-outcome.json \
+  --driver raw_openai_http_sse=deployment.benchmarks:make_raw_priority_driver \
+  --driver orchestrated_http_sse=deployment.benchmarks:make_orchestrated_priority_driver \
+  --driver direct_nnrp=deployment.benchmarks:make_direct_priority_driver \
+  --observation-probe deployment.benchmarks:make_scheduler_probe
+```
+
+The manifest uses `scenario: "priority_burst"`,
+`arrival_schedule: "fixed_interval_contiguous_burst"`, and
+`priority_application: "pre_backend_dispatch"`. It fixes `burst_start_ordinal`, `burst_size`,
+`normal_priority`, `urgent_priority`, `minimum_queue_depth`, total samples, bounded client
+concurrency, warmup, seed, model, engine, GPU class, and request sizes. vLLM schedules lower
+integer values before higher values, so `urgent_priority` must be lower than `normal_priority`.
+Normal traffic is required on both sides of the burst; a manifest cannot manufacture an urgent-only
+comparison.
+
+Drivers implement async `begin_run`, `warmup`, `start`, and `end_run`; each live operation implements
+`wait` and `close`. The raw driver must not inject priority. The equivalently orchestrated and direct
+NNRP drivers must apply the case's requested backend priority before vLLM dispatch. A live
+`PRIORITY_UPDATE` after dispatch is a separate conditional capability and is not silently used as a
+substitute for admission priority.
+
+The scheduler observation probe is independent of all three drivers and declares a `method`,
+`scope`, and public-safe `source` that exactly match the manifest. Per sample it reports queue,
+backend-start, backend-completion, observed-priority, queue-depth, and continuously-runnable state.
+Only dedicated-engine vLLM scheduler traces or engine request events can evaluate acceptance.
+Shared-engine measurements and request-duration proxies are retained as diagnostics but cannot
+substantiate the priority claim. Every urgent sample must observe the declared minimum queue depth,
+and direct NNRP must expose the requested backend priority.
+
+The aggregate report publishes urgent p50/p95/p99 latency, normal latency, completed-request
+throughput, continuously-runnable normal-request starvation, queue-saturation evidence, and
+priority evidence. The Preview4 hypothesis passes only when direct NNRP reduces urgent p95 by at
+least 30% versus raw HTTP/SSE, leaves no runnable normal request incomplete after drain, and loses
+no more than 5% total throughput. Failed and non-evaluable hypotheses remain in the report.
+
 The first recorded release-readiness baseline is
 [openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04](benchmarks/openai-nnrp-direct-vllm-0.18.1-t4-2026-06-04.md).
 It should be treated as the current NNRP direct-path baseline. HTTP/SSE-to-NNRP relay data is useful only as smoke

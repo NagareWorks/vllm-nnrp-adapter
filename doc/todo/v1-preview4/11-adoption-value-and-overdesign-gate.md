@@ -24,6 +24,9 @@
   10%, 30%, and 50% workload evidence is recorded.
 - [ ] Run priority-burst scenarios under queue saturation and measure high-priority p95/p99,
   low-priority starvation, throughput, and scheduler fairness.
+  The adapter now provides a deterministic three-baseline runner, independent scheduler-observation
+  contract, strict aggregation, and acceptance evaluator. This item remains open until a dedicated
+  vLLM/GPU run records queue-saturation and observed-priority evidence.
 - [ ] Run backpressure and credit-exhaustion scenarios and measure bounded queue depth, recovery
   latency, producer overrun, and dropped-result diagnostics.
 - [ ] Run 1 MiB, 16 MiB, and 64 MiB payload scenarios and measure transport amplification, copy

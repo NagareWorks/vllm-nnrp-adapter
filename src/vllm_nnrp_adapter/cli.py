@@ -31,6 +31,11 @@ from .observability import (
     ServerStartupObservation,
     StructuredLogObservationSink,
 )
+from .priority_burst_workload import (
+    PRIORITY_BURST_BASELINES,
+    aggregate_priority_burst_evidence_file,
+    run_priority_burst_workload_file_sync,
+)
 from .stale_work_workload import STALE_WORK_BASELINES, run_stale_workload_file_sync
 
 _PROVIDER_NAMES = frozenset({"tcp", "quic", "ipc", "websocket"})
@@ -118,6 +123,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
         metavar="MODULE:FACTORY",
         help="Server/GPU accounting probe factory used to verify control acceptance and GPU stop timing.",
+    )
+
+    priority_evidence = subcommands.add_parser(
+        "aggregate-priority-burst-evidence",
+        help="Validate and aggregate three-baseline priority-burst scheduler evidence.",
+    )
+    priority_evidence.add_argument("--input", type=Path, required=True)
+    priority_evidence.add_argument("--output", type=Path, required=True)
+
+    priority_workload = subcommands.add_parser(
+        "run-priority-burst-workload",
+        help="Execute the three-baseline priority-burst workload and aggregate its evidence.",
+    )
+    priority_workload.add_argument("--manifest", type=Path, required=True)
+    priority_workload.add_argument("--raw-output", type=Path, required=True)
+    priority_workload.add_argument("--report-output", type=Path, required=True)
+    priority_workload.add_argument("--outcome-output", type=Path, required=True)
+    priority_workload.add_argument(
+        "--driver",
+        action="append",
+        required=True,
+        metavar="BASELINE=MODULE:FACTORY",
+        help="Driver factory for one required baseline. Repeat exactly once for each baseline.",
+    )
+    priority_workload.add_argument(
+        "--observation-probe",
+        required=True,
+        metavar="MODULE:FACTORY",
+        help="Independent scheduler observation probe for queue, execution, and priority evidence.",
     )
 
     server = subcommands.add_parser(
@@ -232,6 +266,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.outcome_output,
             driver_specs=_stale_work_driver_specs(args.driver),
             accounting_probe_spec=args.accounting_probe,
+        )
+        return 0
+    if args.command == "aggregate-priority-burst-evidence":
+        aggregate_priority_burst_evidence_file(args.input, args.output)
+        return 0
+    if args.command == "run-priority-burst-workload":
+        run_priority_burst_workload_file_sync(
+            args.manifest,
+            args.raw_output,
+            args.report_output,
+            args.outcome_output,
+            driver_specs=_priority_burst_driver_specs(args.driver),
+            observation_probe_spec=args.observation_probe,
         )
         return 0
     if args.command == "serve":
@@ -582,6 +629,19 @@ def _stale_work_driver_specs(values: Sequence[str]) -> dict[str, str]:
         baseline, separator, spec = value.partition("=")
         if not separator or baseline not in STALE_WORK_BASELINES or not spec:
             choices = ", ".join(STALE_WORK_BASELINES)
+            raise ValueError(f"--driver must use BASELINE=MODULE:FACTORY with one of {choices}")
+        if baseline in parsed:
+            raise ValueError(f"duplicate --driver for {baseline}")
+        parsed[baseline] = spec
+    return parsed
+
+
+def _priority_burst_driver_specs(values: Sequence[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values:
+        baseline, separator, spec = value.partition("=")
+        if not separator or baseline not in PRIORITY_BURST_BASELINES or not spec:
+            choices = ", ".join(PRIORITY_BURST_BASELINES)
             raise ValueError(f"--driver must use BASELINE=MODULE:FACTORY with one of {choices}")
         if baseline in parsed:
             raise ValueError(f"duplicate --driver for {baseline}")
