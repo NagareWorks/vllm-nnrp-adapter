@@ -452,6 +452,38 @@ NNRP drivers must apply the case's requested backend priority before vLLM dispat
 `PRIORITY_UPDATE` after dispatch is a separate conditional capability and is not silently used as a
 substitute for admission priority.
 
+The package provides concrete HTTP drivers for the first two baselines. A deployment factory can
+bind them to one endpoint without implementing request or SSE lifecycle code:
+
+```python
+import os
+
+from vllm_nnrp_adapter.priority_burst_drivers import (
+    OrchestratedPriorityHttpSseDriver,
+    RawPriorityHttpSseDriver,
+)
+from vllm_nnrp_adapter.openai_http_sse import OpenAiHttpSseDriverConfig
+
+
+def _request_config() -> OpenAiHttpSseDriverConfig:
+    return OpenAiHttpSseDriverConfig(
+        endpoint=os.environ["VLLM_OPENAI_CHAT_COMPLETIONS_URL"],
+        api_key=os.environ.get("VLLM_API_KEY"),
+    )
+
+
+def make_raw_priority_driver() -> RawPriorityHttpSseDriver:
+    return RawPriorityHttpSseDriver(_request_config())
+
+
+def make_orchestrated_priority_driver() -> OrchestratedPriorityHttpSseDriver:
+    return OrchestratedPriorityHttpSseDriver(_request_config())
+```
+
+`RawPriorityHttpSseDriver` deliberately omits the vLLM `priority` request field.
+`OrchestratedPriorityHttpSseDriver` writes `case.backend_priority` into that field before HTTP
+admission. This is the equivalent-orchestration comparison, not an NNRP claim.
+
 The scheduler observation probe is independent of all three drivers and declares a `method`,
 `scope`, and public-safe `source` that exactly match the manifest. Per sample it reports queue,
 backend-start, backend-completion, observed-priority, queue-depth, and continuously-runnable state.
@@ -459,6 +491,36 @@ Only dedicated-engine vLLM scheduler traces or engine request events can evaluat
 Shared-engine measurements and request-duration proxies are retained as diagnostics but cannot
 substantiate the priority claim. Every urgent sample must observe the declared minimum queue depth,
 and direct NNRP must expose the requested backend priority.
+
+`HttpPriorityBurstObservationProbe` supplies the deployment-owned observation lifecycle. Its
+sidecar must obtain queue and scheduler facts from vLLM traces or engine request events; it must not
+derive backend start, completion, priority, or queue depth from client request timing.
+
+```python
+import os
+
+from vllm_nnrp_adapter.priority_burst_observation import (
+    HttpPriorityBurstObservationConfig,
+    HttpPriorityBurstObservationProbe,
+)
+
+
+def make_scheduler_probe() -> HttpPriorityBurstObservationProbe:
+    return HttpPriorityBurstObservationProbe(
+        HttpPriorityBurstObservationConfig(
+            endpoint=os.environ["VLLM_SCHEDULER_OBSERVATION_URL"],
+            method="vllm_scheduler_trace",
+            scope="dedicated_engine",
+            source="deployment-scheduler-events",
+            api_key=os.environ.get("VLLM_SCHEDULER_OBSERVATION_TOKEN"),
+        )
+    )
+```
+
+The sidecar protocol uses `nnrp-priority-burst-observation/v1` and the ordered actions
+`begin_run`, `start_sample`, `operation_submitted`, `finish_sample`, `close_sample`, and `end_run`.
+Every `finish_sample` response must echo baseline, sample id, method, scope, and source before its
+observation is accepted.
 
 The aggregate report publishes urgent p50/p95/p99 latency, normal latency, completed-request
 throughput, continuously-runnable normal-request starvation, queue-saturation evidence, and

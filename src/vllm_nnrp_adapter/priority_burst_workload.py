@@ -23,8 +23,12 @@ PRIORITY_BURST_BASELINES = (
 )
 _TRAFFIC_CLASSES = ("normal", "urgent")
 _TERMINAL_OUTCOMES = ("completed", "failed", "timed_out")
-_SCHEDULER_METHODS = ("vllm_scheduler_trace", "engine_request_events", "request_interval_proxy")
-_SCHEDULER_SCOPES = ("dedicated_engine", "shared_engine")
+PRIORITY_BURST_SCHEDULER_METHODS = (
+    "vllm_scheduler_trace",
+    "engine_request_events",
+    "request_interval_proxy",
+)
+PRIORITY_BURST_SCHEDULER_SCOPES = ("dedicated_engine", "shared_engine")
 _ACCEPTANCE_ELIGIBLE_ACCOUNTING = {
     ("vllm_scheduler_trace", "dedicated_engine"),
     ("engine_request_events", "dedicated_engine"),
@@ -738,9 +742,9 @@ def _validate_driver(value: object, *, expected_baseline: object, location: str)
 
 
 def _validate_probe(value: object, *, location: str) -> None:
-    if getattr(value, "method", None) not in _SCHEDULER_METHODS:
+    if getattr(value, "method", None) not in PRIORITY_BURST_SCHEDULER_METHODS:
         raise ValueError(f"{location}.method is not a supported scheduler accounting method")
-    if getattr(value, "scope", None) not in _SCHEDULER_SCOPES:
+    if getattr(value, "scope", None) not in PRIORITY_BURST_SCHEDULER_SCOPES:
         raise ValueError(f"{location}.scope is not a supported scheduler accounting scope")
     source = getattr(value, "source", None)
     if not isinstance(source, str) or not source:
@@ -785,8 +789,18 @@ def _validate_observation(value: object, baseline: str, sample_id: str) -> None:
 
 def _scheduler_accounting(value: object) -> dict[str, Any]:
     accounting = _mapping(value, "workload.scheduler_accounting")
-    method = _required_choice(accounting, "method", _SCHEDULER_METHODS, "workload.scheduler_accounting")
-    scope = _required_choice(accounting, "scope", _SCHEDULER_SCOPES, "workload.scheduler_accounting")
+    method = _required_choice(
+        accounting,
+        "method",
+        PRIORITY_BURST_SCHEDULER_METHODS,
+        "workload.scheduler_accounting",
+    )
+    scope = _required_choice(
+        accounting,
+        "scope",
+        PRIORITY_BURST_SCHEDULER_SCOPES,
+        "workload.scheduler_accounting",
+    )
     return {
         "method": method,
         "scope": scope,
